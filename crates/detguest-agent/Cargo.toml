@@ -1,0 +1,10 @@
+[package]
+name = "detguest-agent"
+description = "In-guest PID 1 agent: channel setup, workload supervision, host command handling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+detguest-wire = { path = "../detguest-wire" }
