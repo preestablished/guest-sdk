@@ -33,9 +33,11 @@ pub const fn used(prod: u32, cons: u32) -> u32 {
     prod.wrapping_sub(cons)
 }
 
-/// Free bytes in the ring.
+/// Free bytes in the ring. Saturates (instead of underflowing) on a
+/// corrupt/forged index pair where `used > size` — consistent with the
+/// crate's posture that arbitrary bytes never cause a panic.
 pub const fn free(prod: u32, cons: u32, size: u32) -> u32 {
-    size - used(prod, cons)
+    size.saturating_sub(used(prod, cons))
 }
 
 /// Contiguous bytes from the producer position to the ring end.
@@ -63,6 +65,10 @@ pub struct RingFull;
 
 /// Producer half of one ring. Single-owner: exactly one `Producer` may exist
 /// per ring side (the SPSC contract is the caller's to uphold via ownership).
+///
+/// Deliberately `Send` but **not** `Sync`: a half may move to another thread,
+/// but `&Producer` must never be shared across threads — all mutation goes
+/// through `&mut self`.
 pub struct Producer<'a> {
     data: *mut u8,
     size: u32,
@@ -86,6 +92,11 @@ impl<'a> Producer<'a> {
     ///   live for `'a`), shared with the consumer side only.
     /// - At most one `Producer` per ring; the caller owns the SPSC contract.
     /// - `next_seq` must continue the ring's record sequence (0 on a fresh ring).
+    ///
+    /// # Panics
+    /// If `size` is not a power of two at least [`MAX_RECORD_LEN`]. This is a
+    /// real assert (not debug-only) because the invariant guards the pointer
+    /// arithmetic behind every slice this type hands out.
     pub unsafe fn from_raw(
         data: *mut u8,
         size: u32,
@@ -93,10 +104,12 @@ impl<'a> Producer<'a> {
         cons: *mut u32,
         next_seq: u32,
     ) -> Producer<'a> {
-        debug_assert!(size.is_power_of_two() && size as usize >= MAX_RECORD_LEN);
+        assert!(size.is_power_of_two() && size as usize >= MAX_RECORD_LEN);
         Producer {
             data,
             size,
+            // prod is this side's cell (load + store); cons is the peer's
+            // cell: load-only here, never stored.
             prod: AtomicU32::from_ptr(prod),
             cons: AtomicU32::from_ptr(cons),
             next_seq,
@@ -134,9 +147,7 @@ impl<'a> Producer<'a> {
         encode: impl FnOnce(&mut [u8], u32) -> Result<usize, EncodeError>,
     ) -> Result<u32, RingFull> {
         debug_assert!(
-            total_len % RECORD_ALIGN == 0
-                && total_len >= PAD_MIN_LEN
-                && total_len <= MAX_RECORD_LEN
+            total_len % RECORD_ALIGN == 0 && (PAD_MIN_LEN..=MAX_RECORD_LEN).contains(&total_len)
         );
         let len = total_len as u32;
         let prod = self.prod.load(Ordering::Relaxed); // sole writer of prod
@@ -171,15 +182,19 @@ impl<'a> Producer<'a> {
         s
     }
 
-    fn slice_mut(&self, off: u32, n: usize) -> &mut [u8] {
+    fn slice_mut(&mut self, off: u32, n: usize) -> &mut [u8] {
         debug_assert!(off as usize + n <= self.size as usize);
         // SAFETY: range lies inside the free region exclusively owned by this
         // producer (checked against cons above); see module-level argument.
+        // `&mut self` keeps the borrow checker's aliasing net: the returned
+        // slice borrows the producer, so two live slices cannot coexist.
         unsafe { core::slice::from_raw_parts_mut(self.data.add(off as usize), n) }
     }
 }
 
 /// Consumer half of one ring.
+///
+/// Like [`Producer`]: `Send` but **not** `Sync` — move it, don't share it.
 pub struct Consumer<'a> {
     data: *const u8,
     size: u32,
@@ -196,16 +211,22 @@ impl<'a> Consumer<'a> {
     /// # Safety
     /// Same requirements as [`Producer::from_raw`], consumer side: at most one
     /// `Consumer` per ring, valid `data`/`size`/index cells for `'a`.
+    ///
+    /// # Panics
+    /// If `size` is not a power of two at least [`MAX_RECORD_LEN`] (real
+    /// assert — the invariant guards the pointer math below).
     pub unsafe fn from_raw(
         data: *const u8,
         size: u32,
         prod: *const u32,
         cons: *const u32,
     ) -> Consumer<'a> {
-        debug_assert!(size.is_power_of_two() && size as usize >= MAX_RECORD_LEN);
+        assert!(size.is_power_of_two() && size as usize >= MAX_RECORD_LEN);
         Consumer {
             data,
             size,
+            // prod is the peer's cell: load-only here, never stored. cons is
+            // this side's cell (load + store).
             prod: AtomicU32::from_ptr(prod as *mut u32),
             cons: AtomicU32::from_ptr(cons as *mut u32),
             _marker: PhantomData,
@@ -259,7 +280,10 @@ impl<'a> Consumer<'a> {
             return Err(DecodeError::Truncated);
         }
         self.copy_out(off, &mut scratch[..len]);
-        // Validate the full header now that all bytes are local.
+        // Defense-in-depth re-parse over the local copy: the inline checks
+        // above already validated the framing, but they read ring memory the
+        // producer side could theoretically be racing; the local copy is the
+        // version of record. Keep both.
         RecordHeader::read_from(&scratch[..len])?;
         self.cons
             .store(cons.wrapping_add(len as u32), Ordering::Release);
@@ -288,6 +312,29 @@ mod tests {
     use std::boxed::Box;
     use std::vec;
     use std::vec::Vec;
+
+    #[test]
+    fn index_math_boundaries() {
+        let size = 1u32 << 12;
+        // empty and full
+        assert_eq!(free(0, 0, size), size);
+        assert_eq!(used(0, 0), 0);
+        assert_eq!(free(size, 0, size), 0);
+        assert_eq!(used(size, 0), size);
+        // free-running wrap across u32::MAX
+        assert_eq!(used(4, u32::MAX - 3), 8);
+        assert_eq!(free(4, u32::MAX - 3, size), size - 8);
+        // corrupt index pair (used > size) saturates instead of underflowing
+        assert_eq!(free(0, 1, size), 0);
+        // tail math at the ring end
+        assert_eq!(contiguous_tail(0, size), size);
+        assert_eq!(contiguous_tail(size - 8, size), 8);
+        assert_eq!(contiguous_tail(size.wrapping_mul(3) - 8, size), 8);
+        // record exactly filling the tail needs no pad; one byte over pads
+        assert_eq!(bytes_needed(size - 16, size, 16), 16);
+        assert_eq!(bytes_needed(size - 8, size, 16), 8 + 16);
+        assert_eq!(bytes_needed(0, size, 16), 16);
+    }
 
     /// A self-contained ring for tests: data buffer + index cells.
     struct TestRing {

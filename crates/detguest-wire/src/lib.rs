@@ -64,4 +64,7 @@ pub enum EncodeError {
     BufferTooSmall,
     /// A field exceeds its documented limit (e.g. name > 256 bytes).
     FieldTooLong,
+    /// Seqlock writer discipline violated: nested `writer_begin`, or
+    /// `writer_end` without an open write (agent bug, never data-dependent).
+    SeqlockMisuse,
 }

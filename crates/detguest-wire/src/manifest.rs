@@ -313,7 +313,7 @@ pub fn read_generation(m: &[u8]) -> Result<u64, DecodeError> {
 pub fn writer_begin(m: &mut [u8]) -> Result<u64, EncodeError> {
     let g = read_generation(m).map_err(|_| EncodeError::BufferTooSmall)?;
     if g % 2 != 0 {
-        return Err(EncodeError::FieldTooLong); // nested begin — agent bug
+        return Err(EncodeError::SeqlockMisuse); // nested begin — agent bug
     }
     let new = g + 1;
     m[OFF_GENERATION..OFF_GENERATION + 8].copy_from_slice(&new.to_le_bytes());
@@ -325,7 +325,7 @@ pub fn writer_begin(m: &mut [u8]) -> Result<u64, EncodeError> {
 pub fn writer_end(m: &mut [u8]) -> Result<u64, EncodeError> {
     let g = read_generation(m).map_err(|_| EncodeError::BufferTooSmall)?;
     if g % 2 != 1 {
-        return Err(EncodeError::FieldTooLong); // end without begin — agent bug
+        return Err(EncodeError::SeqlockMisuse); // end without begin — agent bug
     }
     let new = g + 1;
     m[OFF_GENERATION..OFF_GENERATION + 8].copy_from_slice(&new.to_le_bytes());

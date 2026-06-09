@@ -97,10 +97,22 @@ impl FaultDecision {
     /// Pack for the `IN 0xD384` answer. `arg` is masked to 24 bits; arguments
     /// above [`FAULT_ARG_MAX`] cannot be represented and are truncated, so
     /// callers must range-check first (the host crate does).
+    ///
+    /// Kind invariants (debug-asserted): `Platform.kind` is `1..=63` and
+    /// `Workload.kind` is `64..=255`. A `Platform { kind: 0, .. }` would
+    /// silently round-trip back to `Proceed`, dropping `arg` — construct
+    /// decisions via [`FaultDecision::unpack`] or respect the ranges.
     pub const fn pack(self) -> u32 {
         match self {
             FaultDecision::Proceed => 0,
-            FaultDecision::Platform { kind, arg } | FaultDecision::Workload { kind, arg } => {
+            FaultDecision::Platform { kind, arg } => {
+                debug_assert!(kind >= 1 && kind <= 63);
+                debug_assert!(arg <= FAULT_ARG_MAX);
+                (kind as u32) | ((arg & FAULT_ARG_MAX) << 8)
+            }
+            FaultDecision::Workload { kind, arg } => {
+                debug_assert!(kind >= 64);
+                debug_assert!(arg <= FAULT_ARG_MAX);
                 (kind as u32) | ((arg & FAULT_ARG_MAX) << 8)
             }
         }

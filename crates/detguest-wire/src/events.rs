@@ -289,6 +289,8 @@ pub fn encode_event(
 ) -> Result<usize, EncodeError> {
     match *ev {
         EventPayload::Pad => {
+            // Fixed 16-byte pad only; real variable-length tail pads are
+            // produced by ring::Producer::try_push via record::encode_pad.
             crate::record::encode_pad(buf, RECORD_HEADER_LEN, seq).map(|_| RECORD_HEADER_LEN)
         }
         EventPayload::Hello {
@@ -496,6 +498,12 @@ pub fn encode_event(
 
 /// Decode one event record (rings A/W) from `bytes` (which must start at a
 /// record boundary). Returns the header and the typed payload.
+///
+/// String-bearing fields (`NameIntern.name`, `AssertViolation.details`,
+/// `LogLine.msg`) are returned as raw `&[u8]`: UTF-8 validity (and no-NUL for
+/// names) is the *producer's* contract, not enforced here — host consumers
+/// must use `from_utf8_lossy`-style handling, never assume `from_utf8`
+/// succeeds. Same for the command/workload-ctrl decoders below.
 ///
 /// Unknown kinds return [`DecodeError::UnknownKind`]; the caller still advances
 /// by the framed `len` (forward compatibility, API.md §3.5).

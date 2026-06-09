@@ -301,7 +301,9 @@ impl ChannelHeader {
     }
 
     /// Attach-path validation (API.md §2 `Channel::attach`): magic, version,
-    /// and every ring descriptor within the page with power-of-two size.
+    /// every ring descriptor within the page with power-of-two size, and no
+    /// two ring data areas overlapping (two SPSC rings aliasing the same
+    /// bytes would break the single-owner discipline `ring` relies on).
     pub fn validate(&self) -> Result<(), DecodeError> {
         if self.magic != CHANNEL_MAGIC {
             return Err(DecodeError::BadMagic);
@@ -311,6 +313,16 @@ impl ChannelHeader {
         }
         for d in &self.ring_desc {
             d.validate()?;
+        }
+        for i in 0..self.ring_desc.len() {
+            for j in (i + 1)..self.ring_desc.len() {
+                let (a, b) = (&self.ring_desc[i], &self.ring_desc[j]);
+                let a_end = a.offset as u64 + a.size as u64;
+                let b_end = b.offset as u64 + b.size as u64;
+                if (a.offset as u64) < b_end && (b.offset as u64) < a_end {
+                    return Err(DecodeError::BadField);
+                }
+            }
         }
         Ok(())
     }
@@ -356,6 +368,19 @@ mod tests {
         let mut h = ChannelHeader::canonical();
         h.ring_desc[0].offset = 0x100; // overlaps header area
         assert!(h.validate().is_err());
+    }
+
+    #[test]
+    fn overlapping_ring_descs_rejected() {
+        // Two rings aliasing the same bytes would break SPSC single-ownership.
+        let mut h = ChannelHeader::canonical();
+        h.ring_desc[1] = h.ring_desc[0];
+        assert_eq!(h.validate(), Err(DecodeError::BadField));
+        // Partial overlap is rejected too.
+        let mut h = ChannelHeader::canonical();
+        h.ring_desc[1].offset = h.ring_desc[0].offset + 8;
+        h.ring_desc[1].size = h.ring_desc[0].size;
+        assert_eq!(h.validate(), Err(DecodeError::BadField));
     }
 
     #[test]
