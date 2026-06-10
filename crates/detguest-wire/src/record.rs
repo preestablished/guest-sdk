@@ -255,10 +255,15 @@ impl RecordHeader {
     }
 
     /// The payload byte range within a record of this header, if any.
+    ///
+    /// For records shorter than a full header (8-byte tail `Pad`s) the empty
+    /// range sits at `len`, not at [`RECORD_HEADER_LEN`] — an empty range must
+    /// still be in-bounds for the record's own bytes, or slicing the record
+    /// with it panics (found by the `decode_record` fuzz target).
     pub fn payload_range(&self) -> core::ops::Range<usize> {
         let l = self.len as usize;
         if l <= RECORD_HEADER_LEN {
-            RECORD_HEADER_LEN..RECORD_HEADER_LEN
+            l..l
         } else {
             RECORD_HEADER_LEN..l
         }
@@ -397,5 +402,18 @@ mod tests {
     #[test]
     fn ring_i_kind_one_stays_reserved() {
         assert_eq!(WorkloadCtrlKind::from_u8(1), None);
+    }
+
+    #[test]
+    fn eight_byte_pad_decodes_as_event_without_panicking() {
+        // Regression: fuzz artifact crash-f3aa5f21 — an 8-byte tail Pad fed to
+        // decode_event sliced bytes[16..16] out of an 8-byte input and
+        // panicked. payload_range must stay within the record's own length.
+        let bytes = [0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFC, 0x0A];
+        let hdr = RecordHeader::read_from(&bytes).unwrap();
+        assert_eq!(hdr.payload_range(), 8..8);
+        let (hdr, ev) = crate::events::decode_event(&bytes).unwrap();
+        assert_eq!(hdr.len, 8);
+        assert_eq!(ev, crate::events::EventPayload::Pad);
     }
 }
