@@ -398,6 +398,8 @@ impl VmHarness {
 /// SIGALRM handler that exists only to interrupt KVM_RUN (EINTR).
 extern "C" fn vcpu_kick(_sig: libc::c_int) {}
 
+/// NOTE: process-wide side effect — the harness owns SIGALRM for the whole
+/// test process (no other SIGALRM users exist here; libtest does not use it).
 fn install_vcpu_kick_handler() {
     // SAFETY: installing a no-op, non-SA_RESTART handler for SIGALRM.
     unsafe {

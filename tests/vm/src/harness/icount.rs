@@ -38,7 +38,15 @@ struct PerfEventAttr {
     sample_regs_user: u64,
     sample_stack_user: u32,
     clockid: i32,
+    sample_regs_intr: u64,
+    aux_watermark: u32,
+    sample_max_stack: u16,
+    reserved_2: u16,
 }
+
+// The kernel copies `size` bytes from userspace; the struct must really be
+// that large or the syscall reads out of bounds (review finding).
+const _: () = assert!(std::mem::size_of::<PerfEventAttr>() == ATTR_SIZE as usize);
 
 /// An open guest-only retired-instruction counter on this thread.
 pub struct GuestIcount {

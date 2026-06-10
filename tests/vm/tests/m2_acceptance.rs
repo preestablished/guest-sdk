@@ -337,19 +337,24 @@ fn print_lines_workload_streams_and_exit_code() {
     // LogLine framing: stream 1 carries exactly the 5 stdout lines in order,
     // stream 2 the 3 stderr lines (per-stream order; cross-stream
     // interleaving is scheduler-owned).
-    let lines = |stream: u8| -> Vec<String> {
+    let lines = |stream: u8, want_level: u8| -> Vec<String> {
         o.events
             .iter()
             .filter_map(|e| match &e.payload {
-                OwnedPayload::LogLine { stream: s, msg, .. } if *s == stream => {
+                OwnedPayload::LogLine {
+                    stream: s,
+                    level,
+                    msg,
+                } if *s == stream => {
+                    assert_eq!(*level, want_level, "level framing for stream {stream}");
                     Some(String::from_utf8_lossy(msg).into_owned())
                 }
                 _ => None,
             })
             .collect()
     };
-    let stdout_lines = lines(1);
-    let stderr_lines = lines(2);
+    let stdout_lines = lines(1, 2); // stream 1 (stdout) at level 2 (info)
+    let stderr_lines = lines(2, 0); // stream 2 (stderr) at level 0 (error)
     assert_eq!(
         stdout_lines,
         (1..=5)
