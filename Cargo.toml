@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/detguest-wire",
     "crates/detguest-agent",
+    "crates/detguest-host",
     "crates/m0-proto-client",
     # In-VM KVM test harness. A normal workspace member so hosted CI lanes
     # build/fmt/clippy it everywhere; the KVM-requiring tests themselves are

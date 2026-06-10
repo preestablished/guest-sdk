@@ -72,6 +72,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "detguest-host"
+version = "0.1.0"
+dependencies = [
+ "detguest-wire",
+]
+
+[[package]]
 name = "detguest-vmtest"
 version = "0.1.0"
 dependencies = [

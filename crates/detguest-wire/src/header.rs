@@ -127,7 +127,7 @@ const _: () = {
 };
 
 /// The four SPSC rings (ARCHITECTURE.md §2 table).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum RingId {
     /// host → agent control commands.
