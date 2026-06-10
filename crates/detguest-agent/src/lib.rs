@@ -1,17 +1,26 @@
-//! detguest-agent — the in-guest PID 1 agent.
+//! detguest-agent — the in-guest PID 1 agent (ARCHITECTURE.md §4).
 //!
-//! M2 (IMPLEMENTATION-PLAN) fills this crate out: init mounts, hugetlbfs
-//! channel allocation, pagemap self-translation, CHANNEL_INIT detcall, boot
-//! manifest parsing, workload supervision. This skeleton carries the wire-side
-//! helpers those modules share.
+//! Lifecycle: mount /proc /sys devtmpfs hugetlbfs → allocate + initialize the
+//! 2 MiB detchannel → resolve its GPA via pagemap → CHANNEL_INIT detcall →
+//! `Hello` → parse `/etc/detguest/boot.toml` → autostart (agent-local; no
+//! host input precedes READY) → `Ready` → single-threaded supervise loop
+//! (pipes → LogLine, SIGCHLD → WorkloadExited, ring C commands).
 //!
-//! Unsafe policy (IMPLEMENTATION-PLAN M6): module-scoped. Unsafe is permitted
-//! only in the documented modules — `translate` (pagemap GVA→GPA), and the
-//! channel-mapping/PIO paths when they land — each carrying its own
-//! `#![allow(unsafe_code)]` with a safety argument. Everything else inherits
-//! this crate-level deny. (Crate-level `forbid` would make those modules
-//! unwritable — deny is deliberate.)
+//! Unsafe policy (IMPLEMENTATION-PLAN M6, module-scoped): unsafe is permitted
+//! only in the documented modules — [`pio`] (iopl + OUT/IN inline asm),
+//! [`channel`] (hugetlbfs mmap of shared channel memory), and the libc
+//! process/epoll plumbing in [`supervise`] and [`runtime`]. Everything else
+//! inherits this crate-level deny. (`translate` needs no unsafe: pagemap is
+//! plain file I/O.)
 #![deny(unsafe_code)]
+
+pub mod boot;
+pub mod channel;
+pub mod commands;
+pub mod pio;
+pub mod runtime;
+pub mod supervise;
+pub mod translate;
 
 use detguest_wire::events::{encode_event, encoded_event_len, EventPayload};
 use detguest_wire::EncodeError;
@@ -40,6 +49,26 @@ pub fn ready_record(
     encode_event(buf, seq, vnanos, 0, &ev)
 }
 
+/// Packed `Hello.agent_version` for this crate version.
+pub fn agent_version() -> u32 {
+    const fn parse_u8(s: &str) -> u8 {
+        // const-friendly tiny parser for the env! version components
+        let b = s.as_bytes();
+        let mut v = 0u8;
+        let mut i = 0;
+        while i < b.len() {
+            v = v * 10 + (b[i] - b'0');
+            i += 1;
+        }
+        v
+    }
+    detguest_wire::events::pack_agent_version(
+        parse_u8(env!("CARGO_PKG_VERSION_MAJOR")),
+        parse_u8(env!("CARGO_PKG_VERSION_MINOR")),
+        parse_u8(env!("CARGO_PKG_VERSION_PATCH")),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,10 +79,8 @@ mod tests {
     fn ready_record_is_spec_correct() {
         let mut buf = [0u8; 64];
         let n = ready_record(&mut buf, 3, 1_000_000, 0xFFFF_FFFF, 0, 2).unwrap();
-        // 16-byte header + 16-byte Ready payload (API.md §3.2) — not the old
-        // ad-hoc 9-byte encoding this skeleton used to carry.
         assert_eq!(n, 32);
-        assert_eq!(buf[2], EventKind::Ready as u8); // kind 14, not READY_RECORD=1
+        assert_eq!(buf[2], EventKind::Ready as u8);
         let (hdr, ev) = detguest_wire::events::decode_event(&buf[..n]).unwrap();
         assert_eq!(hdr.seq, 3);
         assert_eq!(
@@ -64,5 +91,10 @@ mod tests {
                 manifest_generation: 2
             }
         );
+    }
+
+    #[test]
+    fn agent_version_packs() {
+        assert_eq!(agent_version() >> 16, 0); // major 0 for now
     }
 }
