@@ -4,7 +4,16 @@ members = [
     "crates/detguest-wire",
     "crates/detguest-agent",
     "crates/m0-proto-client",
+    # In-VM KVM test harness. A normal workspace member so hosted CI lanes
+    # build/fmt/clippy it everywhere; the KVM-requiring tests themselves are
+    # #[ignore] + env-gated (DETGUEST_VM_TESTS=1) and only run on the Intel
+    # runner via `cargo test -p detguest-vmtest -- --ignored`.
+    "tests/vm",
 ]
+# The fuzz crate is excluded: it needs nightly + libfuzzer and must not enter
+# the default hosted `cargo test --workspace` lanes. It is its own workspace
+# root; build it with `cargo +nightly fuzz run decode_record` from fuzz/.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

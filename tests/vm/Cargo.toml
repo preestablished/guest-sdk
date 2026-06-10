@@ -1,0 +1,11 @@
+[package]
+name = "detguest-vmtest"
+description = "Minimal KVM test harness for the in-VM tier (Intel box only)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+detguest-wire = { path = "../../crates/detguest-wire" }

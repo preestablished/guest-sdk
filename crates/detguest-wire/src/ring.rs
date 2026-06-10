@@ -478,7 +478,9 @@ mod tests {
         // 64 KiB ring hammered from a real second thread.
         let mut r = TestRing::new(1 << 16);
         let (mut p, mut c) = r.halves();
-        const N: u32 = 200_000;
+        // Miri executes this test too (it is the strongest UB check we have
+        // for the raw-pointer paths) — just much slower, so shrink the load.
+        const N: u32 = if cfg!(miri) { 300 } else { 200_000 };
         std::thread::scope(|s| {
             s.spawn(move || {
                 for i in 0..N {
