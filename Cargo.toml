@@ -10,6 +10,10 @@ members = [
     # #[ignore] + env-gated (DETGUEST_VM_TESTS=1) and only run on the Intel
     # runner via `cargo test -p detguest-vmtest -- --ignored`.
     "tests/vm",
+    # Trivial in-VM test workloads; cross-compiled static (musl) and baked
+    # into the initramfs by image/build.sh. Plain bins — they build and pass
+    # `cargo test --workspace` everywhere.
+    "tests/vm/workloads",
 ]
 # The fuzz crate is excluded: it needs nightly + libfuzzer and must not enter
 # the default hosted `cargo test --workspace` lanes. It is its own workspace
