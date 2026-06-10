@@ -65,3 +65,21 @@ systemctl --user disable --now actions-runner-guest-sdk.service
 cd ~/actions-runner-guest-sdk
 ./config.sh remove --token "$(gh api -X POST repos/preestablished/guest-sdk/actions/runners/remove-token --jq .token)"
 ```
+
+## Security posture (review findings, 2026-06-10)
+
+The repo is **public**, so the in-VM job is gated to `push` events only
+(`if: github.event_name == 'push'` in ci.yaml) — fork-PR code never runs on
+this box; hosted lanes carry the full pre-merge signal. GitHub's
+first-time-contributor approval is NOT sufficient (returning contributors
+bypass it).
+
+Residual risk and recommended least-privilege follow-ups (this runner user
+currently has `docker` — root-equivalent — and `sudo` membership, and the box
+hosts other personal services):
+
+- run the runner as a dedicated user with no `docker`/`sudo` membership
+  (kvm group only);
+- consider ephemeral runners (`--ephemeral`) so each job gets a fresh
+  registration;
+- SHA-pin third-party actions if the workflow surface grows.

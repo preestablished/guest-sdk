@@ -9,12 +9,16 @@ on:
     - cron: "17 4 * * *" # daily, 04:17 UTC
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   decode_record:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with: { path: guest-sdk }
@@ -24,10 +28,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: guest-sdk/fuzz }
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        uses: taiki-e/install-action@v2
+        with: { tool: cargo-fuzz }
       - name: Fuzz decode_record for 30 minutes
         working-directory: guest-sdk
-        run: cargo +nightly fuzz run decode_record -- -max_total_time=1800
+        # The gate is "30 minutes clean": a crash exits nonzero (libFuzzer),
+        # and a suspiciously-early clean exit fails too — it means the run
+        # did not actually fuzz for the mandated window.
+        run: |
+          start=$(date +%s)
+          cargo +nightly fuzz run decode_record -- -max_total_time=1800
+          elapsed=$(( $(date +%s) - start ))
+          if [ "$elapsed" -lt 1700 ]; then
+            echo "fuzz exited clean after only ${elapsed}s — gate requires ~1800s"
+            exit 1
+          fi
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
