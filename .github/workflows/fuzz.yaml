@@ -25,6 +25,7 @@ jobs:
       - uses: actions/checkout@v4
         with: { repository: preestablished/control-plane, path: control-plane }
       - uses: dtolnay/rust-toolchain@nightly
+        with: { components: rust-src } # cargo fuzz defaults -Zbuild-std
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: guest-sdk/fuzz }
       - name: Install cargo-fuzz
@@ -35,9 +36,15 @@ jobs:
         # The gate is "30 minutes clean": a crash exits nonzero (libFuzzer),
         # and a suspiciously-early clean exit fails too — it means the run
         # did not actually fuzz for the mandated window.
+        # --target is explicit: cargo-fuzz's default target is the triple
+        # its OWN binary was built for (compile-time constant), and the
+        # taiki-e prebuilt is musl-linked — so without the flag the fuzz
+        # build targets musl, which has no sanitizer std (first dispatch
+        # failed with E0463). Pinning gnu tracks the runner host.
         run: |
           start=$(date +%s)
-          cargo +nightly fuzz run decode_record -- -max_total_time=1800
+          cargo +nightly fuzz run decode_record \
+            --target x86_64-unknown-linux-gnu -- -max_total_time=1800
           elapsed=$(( $(date +%s) - start ))
           if [ "$elapsed" -lt 1700 ]; then
             echo "fuzz exited clean after only ${elapsed}s — gate requires ~1800s"
