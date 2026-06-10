@@ -13,9 +13,9 @@ own boots.
 
 | | |
 |---|---|
-| Version | **6.12.93** (longterm/LTS) |
+| Version | **6.12.93** (longterm/LTS; upstream EOL Dec 2028) |
 | Source | `https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.93.tar.xz` |
-| SHA256 | `492648a87c0b69c5ac7f43be64792b9000e3439550d4e82e4a14710c49094fa3` |
+| SHA256 | `492648a87c0b69c5ac7f43be64792b9000e3439550d4e82e4a14710c49094fa3` — over the `.tar.xz` exactly as downloaded (what `build.sh` checks); when bumping, copy the `.tar.xz` line from `sha256sums.asc`, not the `.tar.gz` one |
 
 Rationale:
 
@@ -31,6 +31,12 @@ Rationale:
   reproducible, proxy-cacheable, and avoids a 5 GiB git history in CI. The
   digest above is from `cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc`
   (2026-06-10).
+- **No paravirt clock, bare TSC.** The config deliberately has no
+  `HYPERVISOR_GUEST`/kvmclock and a pinned periodic 100 Hz tick
+  (`HZ_PERIODIC` + `HZ_100`): guest time must come only from the
+  hypervisor-virtualized TSC and logged timer interrupts (ARCHITECTURE.md
+  §7 rule 1); a paravirt clock would import host time and break the
+  READY-point icount contract.
 
 ## Build artifact caching
 

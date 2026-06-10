@@ -41,6 +41,9 @@ REQUIRED_SET=(
   "CONFIG_PERF_EVENTS=y"
   "CONFIG_DEVTMPFS=y"
   "CONFIG_BLK_DEV_INITRD=y"
+  "CONFIG_UNIX=y"
+  "CONFIG_HZ_PERIODIC=y"
+  "CONFIG_HZ_100=y"
 )
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -68,6 +71,9 @@ run_build() {
     local img=detguest-kernel-build:24.04
     if ! docker image inspect "$img" >/dev/null 2>&1; then
       log "creating kernel build image ${img}"
+      # A failed/interrupted earlier run leaves the named container behind
+      # and would wedge `docker run --name` forever — clear it first.
+      docker rm -f detguest-kbuild-tmp >/dev/null 2>&1 || true
       docker run --name detguest-kbuild-tmp "$DOCKER_IMAGE" bash -c \
         'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
            build-essential flex bison bc libelf-dev libssl-dev cpio xz-utils kmod >/dev/null'
@@ -95,7 +101,10 @@ fetch_kernel() {
 }
 
 build_key() {
-  { echo "$KERNEL_VERSION"; cat "${SCRIPT_DIR}/kernel.config"; } | sha256sum | cut -d' ' -f1
+  # Covers everything that shapes bzImage: the pin, the fragment, and this
+  # script itself (the config pipeline lives here).
+  { echo "$KERNEL_VERSION"; cat "${SCRIPT_DIR}/kernel.config" "${BASH_SOURCE[0]}"; } \
+    | sha256sum | cut -d' ' -f1
 }
 
 assert_required_set() {
@@ -105,7 +114,7 @@ assert_required_set() {
       # Disabled is satisfied by an explicit "not set" line OR by the symbol
       # being absent entirely (kconfig omits symbols with unmet deps —
       # e.g. SWAP without BLOCK, RANDOMIZE_BASE without RELOCATABLE).
-      local sym; sym="$(echo "$line" | sed 's/^# \(CONFIG_[A-Z0-9_]*\) is not set$/\1/')"
+      local sym="${line#\# }"; sym="${sym% is not set}"
       if ! grep -qxF "$line" "$cfg" && grep -q "^${sym}=" "$cfg"; then
         log "VIOLATION: ${sym} is enabled in the final .config"
         missing=1
@@ -154,13 +163,28 @@ cmd_initramfs() {
 
   local root="${BUILD}/initramfs-root"
   rm -rf "$root"
-  mkdir -p "$root"/{proc,sys,dev,dev/hugepages,run,etc/detguest,sbin}
-  cp -a "${stage}/." "$root/"
-  # The image's only init path: /init IS the agent (ARCHITECTURE.md §4 step 1;
-  # no dh-init binary exists anywhere).
-  ln -sf /sbin/detguest-agent "${root}/init"
+  # Byte-reproducibility requires normalizing everything the newc header
+  # records beyond what --reproducible covers (it only zeroes dev/ino):
+  # umask-derived modes, the stage dir's own mode propagated by cp -a onto
+  # rootfs /, and mtimes. The READY-point icount is a pure function of the
+  # image, so identical inputs must yield identical bytes.
+  (
+    umask 022
+    mkdir -p "$root"/{proc,sys,dev,dev/hugepages,run,etc/detguest,sbin}
+    cp -a "${stage}/." "$root/"
+    chmod 0755 "$root"
+    # The image's only init path: /init IS the agent (ARCHITECTURE.md §4
+    # step 1; no dh-init binary exists anywhere).
+    ln -sf /sbin/detguest-agent "${root}/init"
+    # Canonical modes: the image is a pure function of (content bytes,
+    # executable bit) — stage-dir umask/mode noise must not leak in.
+    find "$root" -type d -exec chmod 0755 {} +
+    find "$root" -type f -exec sh -c \
+      'for f; do if [ -x "$f" ]; then chmod 0755 "$f"; else chmod 0644 "$f"; fi; done' _ {} +
+    find "$root" -exec touch -h -d @0 {} +
+  )
 
-  log "assembling initramfs.cpio (newc, uncompressed, deterministic order)"
+  log "assembling initramfs.cpio (newc, uncompressed, normalized + sorted)"
   ( cd "$root" && find . -print0 | LC_ALL=C sort -z \
       | cpio --null -o -H newc --reproducible --owner=0:0 2>/dev/null \
   ) > "${BUILD}/initramfs.cpio"

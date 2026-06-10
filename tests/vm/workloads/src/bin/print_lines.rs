@@ -10,17 +10,24 @@
 //!   agent reaps it.
 //!
 //! Interleaving across the two pipes is scheduler-visible, so the harness
-//! asserts per-stream sequences, not a global order. Everything here is
-//! deterministic per ARCHITECTURE.md §7: fixed strings, no time, no entropy.
+//! asserts per-stream sequences, not a global order. Write errors are
+//! ignored rather than panicking (a closed pipe must yield exit code 7,
+//! never Rust's panic exit 101 — the exit code is the assertion target).
+#![forbid(unsafe_code)]
+
+use std::io::Write;
 
 const EXIT_CODE: i32 = 7;
 
 fn main() {
+    let mut out = std::io::stdout();
+    let mut err = std::io::stderr();
     for i in 1..=5 {
-        println!("print-lines stdout {i}");
+        let _ = writeln!(out, "print-lines stdout {i}");
     }
+    let _ = out.flush();
     for i in 1..=3 {
-        eprintln!("print-lines stderr {i}");
+        let _ = writeln!(err, "print-lines stderr {i}");
     }
     std::process::exit(EXIT_CODE);
 }
