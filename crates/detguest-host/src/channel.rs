@@ -90,10 +90,15 @@ pub struct DropCounters {
 
 /// An attached detchannel (API.md §2).
 ///
-/// Host-side state (intern table, host producer seqs, metrics) must be
-/// checkpointed alongside the hypervisor's per-branch state; it is
-/// reconstructible from the event stream but caching it avoids re-scans
-/// (API.md §2).
+/// Host-side state lives outside guest RAM and must be checkpointed
+/// alongside the hypervisor's per-branch state. Two classes:
+/// - the intern table and pending-inject table are *reconstructible* from
+///   the drained event stream (caching them avoids re-scans);
+/// - the ring C/I producer seqs are **not** reconstructible — the host is
+///   the producer there and never drains those rings. They MUST be saved
+///   via [`Channel::producer_seqs`] and restored via
+///   [`Channel::restore_producer_seqs`] after re-attaching on a snapshot
+///   restore, or the next push would re-emit an already-used seq.
 pub struct Channel<M: GuestMem> {
     pub(crate) gm: M,
     pub(crate) base: u64,
@@ -111,6 +116,20 @@ pub struct Channel<M: GuestMem> {
     /// INJECT answers for an iseq with no matching drained query
     /// (API.md §5: answer Proceed + warning metric).
     pub unmatched_injects: u64,
+    /// `NameIntern` re-binding an existing id to a *different* name
+    /// (first-wins is kept; a nonzero count indicates a guest bug).
+    pub intern_redefinitions: u64,
+}
+
+/// The host's ring C/I producer seqs — the non-reconstructible part of the
+/// per-channel host state (see [`Channel`] docs). Checkpoint with the
+/// hypervisor's per-branch state; restore after re-attach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProducerSeqs {
+    /// Next ring C record seq (pads consume one too).
+    pub ring_c: u32,
+    /// Next ring I record seq.
+    pub ring_i: u32,
 }
 
 impl<M: GuestMem> std::fmt::Debug for Channel<M> {
@@ -176,7 +195,25 @@ impl<M: GuestMem> Channel<M> {
             next_seq_i: 0,
             unknown_kind_records: 0,
             unmatched_injects: 0,
+            intern_redefinitions: 0,
         })
+    }
+
+    /// Export the ring C/I producer seqs for checkpointing. A fresh boot
+    /// starts at (0, 0); after a snapshot restore the hypervisor must feed
+    /// the checkpointed value back via [`Channel::restore_producer_seqs`] —
+    /// `attach` alone cannot derive these (the host never drains C/I).
+    pub fn producer_seqs(&self) -> ProducerSeqs {
+        ProducerSeqs {
+            ring_c: self.next_seq_c,
+            ring_i: self.next_seq_i,
+        }
+    }
+
+    /// Restore checkpointed ring C/I producer seqs after re-attaching.
+    pub fn restore_producer_seqs(&mut self, seqs: ProducerSeqs) {
+        self.next_seq_c = seqs.ring_c;
+        self.next_seq_i = seqs.ring_i;
     }
 
     /// The validated channel header.
@@ -212,6 +249,10 @@ impl<M: GuestMem> Channel<M> {
 
     /// Resolve an interned `name_id` (folded from drained `NameIntern`
     /// events — API.md §2).
+    ///
+    /// The cached name is a **lossy** UTF-8 conversion; the raw bytes (which
+    /// may differ for a non-UTF-8 producer) are on the original drained
+    /// `NameIntern` event.
     pub fn intern_name(&self, id: u32) -> Option<&str> {
         self.interns.get(&id).map(|e| e.name.as_str())
     }
@@ -226,6 +267,11 @@ impl<M: GuestMem> Channel<M> {
     }
 
     /// Current drop counters (guest-written; read-only here).
+    ///
+    /// Deliberate deviation from API.md §2's sketched infallible signature:
+    /// the counters live in guest memory and `GuestMem` reads can fail, so
+    /// the error is surfaced instead of swallowed (docs-as-built update
+    /// tracked for the M6 documentation pass).
     pub fn drop_counters(&self) -> Result<DropCounters, MemError> {
         use detguest_wire::header as h;
         let mut c = DropCounters {

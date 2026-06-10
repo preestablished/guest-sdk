@@ -71,7 +71,10 @@ impl MockGuestMem {
             .checked_add(data.len() as u64)
             .expect("segment end overflows");
         for s in &self.segments {
-            let s_end = s.base + s.data.len() as u64;
+            let s_end = s
+                .base
+                .checked_add(s.data.len() as u64)
+                .expect("segment end overflows");
             assert!(end <= s.base || base >= s_end, "overlapping mock segments");
         }
         self.segments.push(Segment { base, data });

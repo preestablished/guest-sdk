@@ -127,8 +127,15 @@ impl<M: GuestMem> Channel<M> {
         if end > region.len {
             return Err(RegionReadError::OutOfBounds);
         }
-        // The extents must cover at least the region length.
-        let covered: u64 = region.extents.iter().map(|x| x.len).sum();
+        // The extents must cover at least the region length (extents summing
+        // past it are tolerated — the walk stops at the requested range).
+        // Checked fold: extent lens are guest-written; a wrapping sum could
+        // forge coverage.
+        let covered = region
+            .extents
+            .iter()
+            .try_fold(0u64, |a, x| a.checked_add(x.len))
+            .ok_or(RegionReadError::OutOfBounds)?;
         if covered < region.len {
             return Err(RegionReadError::OutOfBounds);
         }
@@ -144,7 +151,11 @@ impl<M: GuestMem> Channel<M> {
             }
             let take = u64::min(x.len - to_skip, remaining.len() as u64) as usize;
             let (chunk, rest) = remaining.split_at_mut(take);
-            self.gm.read(x.gpa + to_skip, chunk)?;
+            let gpa = x
+                .gpa
+                .checked_add(to_skip)
+                .ok_or(RegionReadError::OutOfBounds)?;
+            self.gm.read(gpa, chunk)?;
             remaining = rest;
             to_skip = 0;
         }
@@ -316,6 +327,35 @@ mod tests {
         assert_eq!(
             ch.read_region("none", 0, &mut buf).unwrap_err(),
             RegionReadError::NameNotFound
+        );
+
+        // Empty read at offset == len is in-bounds (zero bytes requested).
+        let mut empty = [0u8; 0];
+        ch.read_region("wram", 48, &mut empty).unwrap();
+        // ... but one past is not.
+        assert_eq!(
+            ch.read_region("wram", 49, &mut empty).unwrap_err(),
+            RegionReadError::OutOfBounds
+        );
+    }
+
+    #[test]
+    fn read_region_tolerates_over_coverage() {
+        // Extents summing past region.len are legal; the walk stops at the
+        // requested range.
+        const A: u64 = 0x4000_0000;
+        let mut ch = manifest_area(|area| {
+            put_region(area, 0, b"over", 10, 0, 0, &[Extent { gpa: A, len: 16 }]);
+        });
+        ch.gm.add_segment(A, (0u8..16).collect());
+        let mut buf = [0u8; 10];
+        ch.read_region("over", 0, &mut buf).unwrap();
+        assert_eq!(&buf[..], &(0u8..10).collect::<Vec<_>>()[..]);
+        // Reads past region.len stay rejected even though extents cover it.
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            ch.read_region("over", 12, &mut buf).unwrap_err(),
+            RegionReadError::OutOfBounds
         );
     }
 }

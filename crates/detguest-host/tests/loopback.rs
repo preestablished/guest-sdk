@@ -113,6 +113,8 @@ struct Sim<'a> {
     w: SimRing<'a>,
     vnanos: u64,
     drops: DropBook,
+    /// Critical-event doorbell drains triggered by a full ring.
+    doorbells: u64,
     /// Expected non-dropped events, per ring, in production order.
     expected_a: Vec<GuestEvent>,
     expected_w: Vec<GuestEvent>,
@@ -170,6 +172,7 @@ fn produce(
             Err(RingFull) => {
                 if critical {
                     // Doorbell: host drains inside the exit, freeing space.
+                    sim.doorbells += 1;
                     drained.extend(drain_and_collect(ch, sink));
                     continue;
                 }
@@ -354,6 +357,7 @@ fn loopback_100k_mixed_events() {
         w: SimRing { producer: prod_w },
         vnanos: 0,
         drops: DropBook::default(),
+        doorbells: 0,
         expected_a: Vec::new(),
         expected_w: Vec::new(),
     };
@@ -481,6 +485,27 @@ fn loopback_100k_mixed_events() {
                 );
             }
             assert!(sim.drops.w_records > 0, "the burst must overflow ring W");
+        }
+
+        // A critical burst: more critical events than ring A can hold with
+        // no intervening pause drain — the doorbell-retry path must carry it.
+        if i == 80_000 {
+            for _ in 0..3000 {
+                produce(
+                    &mut sim,
+                    &mut ch,
+                    &mut sink,
+                    &mut drained,
+                    RingId::A,
+                    EventPayload::WorkloadStarted {
+                        guest_pid: 3,
+                        unit: 1,
+                    },
+                    0,
+                    true,
+                );
+            }
+            assert!(sim.doorbells > 0, "the burst must trigger doorbell drains");
         }
 
         match rng.below(100) {
@@ -680,6 +705,17 @@ fn loopback_100k_mixed_events() {
             "{ring:?}: last logged bump == final index"
         );
     }
+
+    // ---- wraps actually happened: pads consumed extra seqs ----
+    assert!(
+        sim.a.producer.next_seq() as usize > sim.expected_a.len(),
+        "ring A must have wrapped (pads consume seqs)"
+    );
+    assert!(
+        sim.w.producer.next_seq() as usize > sim.expected_w.len(),
+        "ring W must have wrapped (pads consume seqs)"
+    );
+    assert!(sim.doorbells > 0, "doorbell-retry path exercised");
 
     // ---- intern folding + declared reachables surfaced ----
     assert_eq!(ch.intern_name(0xFFFF_0001), Some("wram"));

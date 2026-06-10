@@ -170,6 +170,34 @@ mod tests {
     }
 
     #[test]
+    fn producer_seqs_checkpoint_and_restore() {
+        // Restore semantics: after a snapshot restore the hypervisor
+        // re-attaches (seqs reset to 0) and must feed the checkpoint back so
+        // pushes continue the seq stream instead of re-emitting seq 0.
+        let mut ch = channel();
+        let mut sink = RecordingSink::default();
+        let cmd = Command::SetLogMask { mask: 1 };
+        ch.push_command(&cmd, &mut sink).unwrap();
+        ch.push_command(&cmd, &mut sink).unwrap();
+        let saved = ch.producer_seqs();
+        assert_eq!(saved.ring_c, 2);
+
+        // "Restore": re-attach over the same guest memory.
+        let gm = std::mem::replace(&mut ch.gm, MockGuestMem::new());
+        let mut ch2 = Channel::attach(gm, BASE).unwrap();
+        assert_eq!(ch2.producer_seqs().ring_c, 0, "fresh attach starts at 0");
+        ch2.restore_producer_seqs(saved);
+        ch2.push_command(&cmd, &mut sink).unwrap();
+        // The third record on the ring carries seq 2, not 0.
+        let mut rec = [0u8; 24];
+        ch2.guest_mem()
+            .read(ch2.data_gpa(RingId::C) + 48, &mut rec)
+            .unwrap();
+        let (hdr, _) = decode_command(&rec).unwrap();
+        assert_eq!(hdr.seq, 2);
+    }
+
+    #[test]
     fn push_workload_ctrl_uses_ring_i() {
         let mut ch = channel();
         let mut sink = RecordingSink::default();

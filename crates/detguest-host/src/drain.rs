@@ -31,6 +31,11 @@ pub struct GuestEvent {
 /// events (`Pad` is consumed by the drain loop and never surfaces). String
 /// fields stay raw bytes: UTF-8 is the producer's contract, not enforced on
 /// the wire (consumers use lossy conversion).
+///
+/// Naming note vs API.md §2: the spec sketches `GuestEvent.payload:
+/// EventPayload`; the drained form must own its bytes (the ring memory is
+/// recycled), hence this owned mirror (docs-as-built update tracked for the
+/// M6 documentation pass).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OwnedPayload {
@@ -266,13 +271,25 @@ impl<M: GuestMem> Channel<M> {
                             reachable_decl,
                         } = owned
                         {
-                            self.interns
-                                .entry(name_id)
-                                .and_modify(|e| e.reachable_decl |= reachable_decl)
-                                .or_insert_with(|| InternEntry {
-                                    name: String::from_utf8_lossy(name).into_owned(),
-                                    reachable_decl,
-                                });
+                            use std::collections::btree_map::Entry;
+                            let lossy = String::from_utf8_lossy(name);
+                            match self.interns.entry(name_id) {
+                                Entry::Occupied(mut o) => {
+                                    let e = o.get_mut();
+                                    e.reachable_decl |= reachable_decl;
+                                    // First-wins; a re-bind to a different
+                                    // name is a guest bug worth a metric.
+                                    if e.name != lossy {
+                                        self.intern_redefinitions += 1;
+                                    }
+                                }
+                                Entry::Vacant(v) => {
+                                    v.insert(InternEntry {
+                                        name: lossy.into_owned(),
+                                        reachable_decl,
+                                    });
+                                }
+                            }
                         }
                         if let OwnedPayload::InjectQuery { iseq, name_id } = owned {
                             self.pending_injects.insert(iseq, name_id);
