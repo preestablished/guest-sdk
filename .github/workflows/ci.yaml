@@ -1,0 +1,129 @@
+# CI tiering per IMPLEMENTATION-PLAN: wire+host tests run everywhere
+# (including aarch64); the in-VM tier is gated to the Intel self-hosted
+# runner. Every job needs the sibling control-plane checkout — the workspace
+# carries a `determinism-proto = { path = "../control-plane/..." }` path dep
+# (consumed only by m0-proto-client; both repos are public).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: guest-sdk
+
+jobs:
+  # Hosted lane: fmt, clippy -D warnings, full workspace tests.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: guest-sdk }
+      - uses: actions/checkout@v4
+        with: { repository: preestablished/control-plane, path: control-plane }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: guest-sdk }
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  # M0 acceptance: the wire crate builds and tests without std (bead lcv).
+  no_std:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: guest-sdk }
+      - uses: actions/checkout@v4
+        with: { repository: preestablished/control-plane, path: control-plane }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: guest-sdk }
+      - run: cargo test -p detguest-wire --no-default-features
+
+  # Miri over the ring module — the raw-pointer/index logic UB check
+  # (bead 51r; IMPLEMENTATION-PLAN risk table).
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: guest-sdk }
+      - uses: actions/checkout@v4
+        with: { repository: preestablished/control-plane, path: control-plane }
+      - uses: dtolnay/rust-toolchain@nightly
+        with: { components: miri }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: guest-sdk }
+      - run: cargo miri test -p detguest-wire --lib ring
+
+  # Loom interleavings of the SPSC producer/consumer protocol (bead wq8).
+  loom:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: --cfg loom
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: guest-sdk }
+      - uses: actions/checkout@v4
+        with: { repository: preestablished/control-plane, path: control-plane }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: guest-sdk }
+      - run: cargo test -p detguest-wire --test loom_ring --release
+
+  # Static musl cross-build of the agent + workloads, with a --check smoke
+  # run of the produced binary (bead ssl).
+  musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: guest-sdk }
+      - uses: actions/checkout@v4
+        with: { repository: preestablished/control-plane, path: control-plane }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: x86_64-unknown-linux-musl }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: guest-sdk }
+      - run: >
+          cargo build --release --target x86_64-unknown-linux-musl
+          -p detguest-agent -p detguest-workloads
+      - run: ./target/x86_64-unknown-linux-musl/release/detguest-agent --check
+      - run: >
+          file target/x86_64-unknown-linux-musl/release/detguest-agent
+          | grep -E 'static(ally|-pie) linked'
+
+  # aarch64 lane: wire + host tests only — nothing in those crates is
+  # x86-specific; the detcall ABI sits behind a module (bead xcc;
+  # IMPLEMENTATION-PLAN "CI tiering"). Public-repo arm64 hosted runner.
+  aarch64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: guest-sdk }
+      - uses: actions/checkout@v4
+        with: { repository: preestablished/control-plane, path: control-plane }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: guest-sdk }
+      - run: cargo test -p detguest-wire -p detguest-host
+
+  # In-VM tier: Intel box only (beads rci + atd). Preflight is the phase
+  # entry gate — pinned kernel, perf_event access, KVM caps — then the
+  # KVM-gated tests run with both gates open.
+  in_vm:
+    runs-on: [self-hosted, intel, kvm]
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: guest-sdk }
+      - uses: actions/checkout@v4
+        with: { repository: preestablished/control-plane, path: control-plane }
+      - run: ./scripts/intel-preflight.sh
+      - run: >
+          DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest --
+          --ignored --test-threads=1

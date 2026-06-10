@@ -1,0 +1,37 @@
+# Scheduled decoder fuzzing — the 30-minute clean-run gate from
+# IMPLEMENTATION-PLAN M0 acceptance (bead m7g). Runs nightly and on demand;
+# 30 minutes of libFuzzer wall time, any crash fails the job and uploads the
+# reproducing artifact.
+name: fuzz
+
+on:
+  schedule:
+    - cron: "17 4 * * *" # daily, 04:17 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  decode_record:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: guest-sdk }
+      - uses: actions/checkout@v4
+        with: { repository: preestablished/control-plane, path: control-plane }
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: guest-sdk/fuzz }
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz decode_record for 30 minutes
+        working-directory: guest-sdk
+        run: cargo +nightly fuzz run decode_record -- -max_total_time=1800
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decode_record-crashes
+          path: guest-sdk/fuzz/artifacts/decode_record/
+          if-no-files-found: ignore
