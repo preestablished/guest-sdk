@@ -1,0 +1,21 @@
+[package]
+name = "detguest-workloads"
+description = "Trivial test workloads baked into the initramfs for the in-VM M2 acceptance tier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Cross-compiled static for the guest image:
+#   cargo build --release --target x86_64-unknown-linux-musl -p detguest-workloads
+
+[[bin]]
+name = "autostart-trivial"
+path = "src/bin/autostart_trivial.rs"
+
+[[bin]]
+name = "print-lines"
+path = "src/bin/print_lines.rs"
+
+[dependencies]
