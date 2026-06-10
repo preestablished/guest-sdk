@@ -3,6 +3,10 @@
 version = 3
 
 [[package]]
+name = "determinism-proto"
+version = "0.1.0"
+
+[[package]]
 name = "detguest-agent"
 version = "0.1.0"
 dependencies = [
@@ -12,3 +16,10 @@ dependencies = [
 [[package]]
 name = "detguest-wire"
 version = "0.1.0"
+
+[[package]]
+name = "guest-sdk-m0-proto-client"
+version = "0.1.0"
+dependencies = [
+ "determinism-proto",
+]

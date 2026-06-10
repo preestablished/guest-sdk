@@ -1,0 +1,8 @@
+[package]
+name = "guest-sdk-m0-proto-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+determinism-proto = { workspace = true, features = ["common", "hypervisor"] }

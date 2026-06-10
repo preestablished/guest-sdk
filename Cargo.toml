@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/detguest-wire",
     "crates/detguest-agent",
+    "crates/m0-proto-client",
 ]
 
 [workspace.package]
@@ -10,6 +11,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
 license = "MIT"
+
+[workspace.dependencies]
+determinism-proto = { path = "../control-plane/crates/determinism-proto", default-features = false }
 
 [profile.release]
 lto = true
