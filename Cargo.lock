@@ -69,6 +69,7 @@ name = "detguest-agent"
 version = "0.1.0"
 dependencies = [
  "detguest-wire",
+ "libc",
 ]
 
 [[package]]

@@ -6,5 +6,17 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# Static musl binary for the initramfs:
+#   cargo build --release --target x86_64-unknown-linux-musl -p detguest-agent
+
+# No toml crate: its parser (toml_edit -> indexmap -> hashbrown) seeds a
+# hasher via getrandom(2) at parse time — in-guest entropy consumption that
+# violates ARCHITECTURE.md §7 rule 2 (verified by strace during review).
+# boot.rs carries a deterministic hand-rolled parser for the §7.1 subset.
 [dependencies]
 detguest-wire = { path = "../detguest-wire" }
+libc = "0.2"
+
+[[bin]]
+name = "detguest-agent"
+path = "src/main.rs"
