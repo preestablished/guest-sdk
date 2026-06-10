@@ -1,0 +1,12 @@
+[package]
+name = "detguest-host"
+description = "Host-side detchannel access: attach, drain, command push, manifest reads, inject responder (linked by determinism-hypervisor)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# ARCHITECTURE.md §1: `host` depends on `wire`. Nothing else — in particular,
+# detguest-host must NOT take the determinism-proto dependency.
+[dependencies]
+detguest-wire = { path = "../detguest-wire" }
