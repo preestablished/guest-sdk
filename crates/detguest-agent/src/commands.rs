@@ -17,9 +17,27 @@ pub fn handle(sup: &mut Supervisor, cmd: Command) -> io::Result<bool> {
         Command::StartWorkload { unit, log_mask } => {
             // `unit` selects among the boot manifest's preconfigured entries;
             // argv is NEVER sent over the wire (ARCHITECTURE.md §4 step 9).
-            sup.start_unit(unit)?;
-            if log_mask != 0 {
-                sup.log_mask = log_mask;
+            match sup.start_unit(unit) {
+                Ok(()) => {
+                    // API.md §6: apply the command's log_mask. 0 is a legal
+                    // mask meaning "silence all levels".
+                    sup.log_mask = log_mask;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Refused; report host-ward, keep supervising.
+                    let msg = format!("StartWorkload {unit} refused: {e}");
+                    let v = crate::supervise::vnanos();
+                    sup.channel.emit(
+                        v,
+                        0,
+                        &detguest_wire::events::EventPayload::LogLine {
+                            stream: detguest_wire::events::log_stream::AGENT,
+                            level: 0,
+                            msg: msg.as_bytes(),
+                        },
+                    );
+                }
+                Err(e) => return Err(e),
             }
         }
         Command::Quiesce {

@@ -78,10 +78,16 @@ fn fault(msg: impl Into<String>) -> BootFault {
 }
 
 /// Parse and §7.2-validate boot.toml contents.
+///
+/// Parsing uses the in-crate deterministic TOML-subset parser ([`tiny`]),
+/// not the `toml` crate: that crate's parser seeds a hash table via
+/// `getrandom(2)` at parse time, which in-guest is entropy consumption — a
+/// P0 violation of ARCHITECTURE.md §7 rule 2. The subset covers exactly the
+/// §7.1 schema: comments, `[table]` / `[[array-of-tables]]` / dotted
+/// `[unit.control]` headers, basic strings, integers (incl. `0x` hex), and
+/// inline string arrays.
 pub fn parse(text: &str) -> Result<BootManifest, BootFault> {
-    let doc: toml::Value = text
-        .parse()
-        .map_err(|e| fault(format!("parse error: {e}")))?;
+    let doc: tiny::Value = tiny::parse_doc(text).map_err(|e| fault(format!("parse error: {e}")))?;
     let table = doc
         .as_table()
         .ok_or_else(|| fault("top level must be a table"))?;
@@ -163,6 +169,9 @@ pub fn parse(text: &str) -> Result<BootManifest, BootFault> {
                         .ok_or_else(|| {
                             fault(format!("unit[{i}].control: missing u32 proto_version"))
                         })? as u32;
+                    // TODO(M4): when the §4.2 protocol leg lands, validate
+                    // proto_version equals the version the agent speaks
+                    // (§7.2) at boot rather than at Hello time.
                     let game_dev = ct
                         .get("game_dev")
                         .and_then(|x| x.as_str())
@@ -262,6 +271,299 @@ pub fn parse(text: &str) -> Result<BootManifest, BootFault> {
         units,
         expected_regions,
     })
+}
+
+/// Deterministic TOML-subset parser for the API.md §7.1 schema.
+///
+/// No hash tables anywhere (BTreeMap only — §7 rule 2 forbids the std
+/// HashMap default hasher and any entropy draw), no dependencies, total over
+/// arbitrary input (errors, never panics). Supported: `#` comments, blank
+/// lines, `[a]` / `[a.b]` table headers (dotted segments descend through the
+/// LAST element of an array-of-tables, per TOML), `[[a]]` array-of-tables,
+/// bare keys, basic `"strings"` with `\\ \" \n \t` escapes, decimal and
+/// `0x` hex integers, and single-line `["string", ...]` arrays.
+mod tiny {
+    use std::collections::BTreeMap;
+
+    /// The value tree (accessor surface mirrors `toml::Value`).
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Value {
+        /// Basic string.
+        Str(String),
+        /// Integer.
+        Int(i64),
+        /// Array (strings or tables in this subset).
+        Array(Vec<Value>),
+        /// Table.
+        Table(BTreeMap<String, Value>),
+    }
+
+    impl Value {
+        pub fn as_table(&self) -> Option<&BTreeMap<String, Value>> {
+            match self {
+                Value::Table(t) => Some(t),
+                _ => None,
+            }
+        }
+        pub fn as_integer(&self) -> Option<i64> {
+            match self {
+                Value::Int(i) => Some(*i),
+                _ => None,
+            }
+        }
+        pub fn as_str(&self) -> Option<&str> {
+            match self {
+                Value::Str(s) => Some(s),
+                _ => None,
+            }
+        }
+        pub fn as_array(&self) -> Option<&Vec<Value>> {
+            match self {
+                Value::Array(a) => Some(a),
+                _ => None,
+            }
+        }
+    }
+
+    /// Strip a `#` comment (respecting `"` strings) and trim.
+    fn strip_comment(line: &str) -> &str {
+        let mut in_str = false;
+        let mut escaped = false;
+        for (i, c) in line.char_indices() {
+            match c {
+                '\\' if in_str && !escaped => {
+                    escaped = true;
+                    continue;
+                }
+                '"' if !escaped => in_str = !in_str,
+                '#' if !in_str => return &line[..i],
+                _ => {}
+            }
+            escaped = false;
+        }
+        line
+    }
+
+    fn parse_string(s: &str) -> Result<(String, &str), String> {
+        let rest = s
+            .strip_prefix('"')
+            .ok_or_else(|| format!("expected string at {s:?}"))?;
+        let mut out = String::new();
+        let mut chars = rest.char_indices();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '"' => return Ok((out, &rest[i + 1..])),
+                '\\' => match chars.next() {
+                    Some((_, '"')) => out.push('"'),
+                    Some((_, '\\')) => out.push('\\'),
+                    Some((_, 'n')) => out.push('\n'),
+                    Some((_, 't')) => out.push('\t'),
+                    other => return Err(format!("unsupported escape {other:?}")),
+                },
+                _ => out.push(c),
+            }
+        }
+        Err("unterminated string".into())
+    }
+
+    fn parse_int(s: &str) -> Result<i64, String> {
+        let t = s.trim();
+        let (neg, t) = match t.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, t.strip_prefix('+').unwrap_or(t)),
+        };
+        let digits = t.replace('_', "");
+        let v = if let Some(hex) = digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"))
+        {
+            i64::from_str_radix(hex, 16)
+        } else {
+            digits.parse::<i64>()
+        }
+        .map_err(|e| format!("bad integer {s:?}: {e}"))?;
+        Ok(if neg { -v } else { v })
+    }
+
+    fn parse_value(s: &str) -> Result<Value, String> {
+        let t = s.trim();
+        if t.starts_with('"') {
+            let (v, rest) = parse_string(t)?;
+            if !rest.trim().is_empty() {
+                return Err(format!("trailing junk after string: {rest:?}"));
+            }
+            return Ok(Value::Str(v));
+        }
+        if let Some(inner) = t.strip_prefix('[') {
+            let inner = inner
+                .strip_suffix(']')
+                .ok_or_else(|| format!("unterminated array {t:?}"))?;
+            let mut items = Vec::new();
+            let mut rest = inner.trim();
+            while !rest.is_empty() {
+                let (v, after) = parse_string(rest)?;
+                items.push(Value::Str(v));
+                rest = after.trim_start();
+                if let Some(r) = rest.strip_prefix(',') {
+                    rest = r.trim_start();
+                } else if !rest.is_empty() {
+                    return Err(format!("expected ',' in array near {rest:?}"));
+                }
+            }
+            return Ok(Value::Array(items));
+        }
+        parse_int(t).map(Value::Int)
+    }
+
+    fn valid_key(k: &str) -> bool {
+        !k.is_empty()
+            && k.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    /// Navigate to the table at `path` (creating tables; descending through
+    /// the last element of arrays-of-tables), returning a mutable ref.
+    fn navigate<'a>(
+        root: &'a mut BTreeMap<String, Value>,
+        path: &[&str],
+    ) -> Result<&'a mut BTreeMap<String, Value>, String> {
+        let mut cur = root;
+        for seg in path {
+            if !valid_key(seg) {
+                return Err(format!("invalid table name segment {seg:?}"));
+            }
+            let entry = cur
+                .entry((*seg).to_owned())
+                .or_insert_with(|| Value::Table(BTreeMap::new()));
+            cur = match entry {
+                Value::Table(t) => t,
+                Value::Array(a) => match a.last_mut() {
+                    Some(Value::Table(t)) => t,
+                    _ => return Err(format!("{seg} is not a table array")),
+                },
+                _ => return Err(format!("{seg} is not a table")),
+            };
+        }
+        Ok(cur)
+    }
+
+    /// Parse a document into a root table.
+    pub fn parse_doc(text: &str) -> Result<Value, String> {
+        let mut root: BTreeMap<String, Value> = BTreeMap::new();
+        // Path of the currently open table header.
+        let mut cur_path: Vec<String> = Vec::new();
+        for (lineno, raw) in text.lines().enumerate() {
+            let line = strip_comment(raw).trim();
+            let err = |m: String| format!("line {}: {m}", lineno + 1);
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(h) = line.strip_prefix("[[") {
+                let name = h
+                    .strip_suffix("]]")
+                    .ok_or_else(|| err("malformed [[header]]".into()))?
+                    .trim();
+                let segs: Vec<&str> = name.split('.').map(str::trim).collect();
+                let (last, parents) = segs
+                    .split_last()
+                    .ok_or_else(|| err("empty [[header]]".into()))?;
+                if !valid_key(last) {
+                    return Err(err(format!("invalid table name {last:?}")));
+                }
+                let parent = navigate(&mut root, parents).map_err(err)?;
+                let arr = parent
+                    .entry((*last).to_owned())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                match arr {
+                    Value::Array(a) => a.push(Value::Table(BTreeMap::new())),
+                    _ => return Err(err(format!("{last} is not an array of tables"))),
+                }
+                cur_path = segs.iter().map(|s| (*s).to_owned()).collect();
+            } else if let Some(h) = line.strip_prefix('[') {
+                let name = h
+                    .strip_suffix(']')
+                    .ok_or_else(|| err("malformed [header]".into()))?
+                    .trim();
+                let segs: Vec<&str> = name.split('.').map(str::trim).collect();
+                navigate(&mut root, &segs).map_err(&err)?;
+                cur_path = segs.iter().map(|s| (*s).to_owned()).collect();
+            } else if let Some(eq) = line.find('=') {
+                let key = line[..eq].trim();
+                if !valid_key(key) {
+                    return Err(err(format!("invalid key {key:?}")));
+                }
+                let value = parse_value(&line[eq + 1..]).map_err(&err)?;
+                let path: Vec<&str> = cur_path.iter().map(String::as_str).collect();
+                let table = navigate(&mut root, &path).map_err(&err)?;
+                if table.insert(key.to_owned(), value).is_some() {
+                    return Err(err(format!("duplicate key {key:?}")));
+                }
+            } else {
+                return Err(err(format!("unrecognized line {line:?}")));
+            }
+        }
+        Ok(Value::Table(root))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn determinism_identical_reparse() {
+            let doc = "a = 1\n[t]\nb = \"x\"\n[[arr]]\nc = 0x1F\n";
+            assert_eq!(parse_doc(doc).unwrap(), parse_doc(doc).unwrap());
+        }
+
+        #[test]
+        fn comments_strings_escapes_hex() {
+            let v = parse_doc(
+                "# top\nkey = \"a # not comment \\\"q\\\"\" # trailing\nhex = 0x1F\nneg = -3\n",
+            )
+            .unwrap();
+            let t = v.as_table().unwrap();
+            assert_eq!(t["key"].as_str(), Some("a # not comment \"q\""));
+            assert_eq!(t["hex"].as_integer(), Some(0x1F));
+            assert_eq!(t["neg"].as_integer(), Some(-3));
+        }
+
+        #[test]
+        fn dotted_header_attaches_to_last_array_element() {
+            let v =
+                parse_doc("[[unit]]\nid = 0\n[[unit]]\nid = 1\n[unit.control]\nprotocol = \"p\"\n")
+                    .unwrap();
+            let units = v.as_table().unwrap()["unit"].as_array().unwrap();
+            assert!(units[0].as_table().unwrap().get("control").is_none());
+            let c = units[1].as_table().unwrap()["control"].as_table().unwrap();
+            assert_eq!(c["protocol"].as_str(), Some("p"));
+        }
+
+        #[test]
+        fn string_arrays() {
+            let v = parse_doc("args = [\"--a\", \"b c\"]\nempty = []\n").unwrap();
+            let t = v.as_table().unwrap();
+            assert_eq!(t["args"].as_array().unwrap().len(), 2);
+            assert!(t["empty"].as_array().unwrap().is_empty());
+        }
+
+        #[test]
+        fn errors_never_panic() {
+            for bad in [
+                "key",
+                "= 1",
+                "[unterminated",
+                "[[x]",
+                "k = \"unterminated",
+                "k = [\"a\" \"b\"]",
+                "k = zzz",
+                "k = 1\nk = 2",
+                "[5bad key]",
+                "k = \"a\" junk",
+            ] {
+                assert!(parse_doc(bad).is_err(), "{bad:?} must error");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

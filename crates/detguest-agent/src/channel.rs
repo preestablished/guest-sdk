@@ -45,8 +45,23 @@ impl AgentChannel {
     pub fn alloc(doorbell: fn(u32)) -> io::Result<AgentChannel> {
         let path = std::ffi::CString::new(CHANNEL_PATH).unwrap();
         // SAFETY: plain libc open/ftruncate/mmap of a fresh hugetlbfs file.
+        // O_EXCL guards the zero-fill invariant init_at relies on: ftruncate
+        // does NOT zero an existing file's contents. A leftover file (there
+        // should never be one — PID 1 never restarts) is unlinked first.
         let fd = unsafe {
-            let raw = libc::open(path.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o700);
+            let mut raw = libc::open(
+                path.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                0o700,
+            );
+            if raw < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
+                libc::unlink(path.as_ptr());
+                raw = libc::open(
+                    path.as_ptr(),
+                    libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                    0o700,
+                );
+            }
             if raw < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -233,15 +248,16 @@ impl AgentChannel {
             }
             let mask = desc.size - 1;
             let mut pos = prod;
-            // The relay does not know the host's seq counter; ring I records
-            // carry seq from the producer index bytes instead. Use the
-            // record count approximation: seq is advisory on ring I (the SDK
-            // consumer does not enforce continuity across the two producers).
-            let seq = prod / total as u32;
+            // Ring I has two temporally-exclusive producers (host + this
+            // relay) and no shared seq counter — a spec gap (ARCHITECTURE.md
+            // §6 table vs §7 rule 3). Derive seq from the byte position
+            // (pos >> 3): deterministic, strictly increasing with prod, and
+            // distinct for a tail pad vs the record after it. The v1 SDK
+            // consumer matches quiesce tokens, not seq continuity.
             if needed > total as u32 {
                 let tail = ring::contiguous_tail(prod, desc.size) as usize;
                 let mut pad = vec![0u8; tail];
-                detguest_wire::record::encode_pad(&mut pad, tail, seq).unwrap();
+                detguest_wire::record::encode_pad(&mut pad, tail, pos >> 3).unwrap();
                 std::ptr::copy_nonoverlapping(
                     pad.as_ptr(),
                     self.base.add(desc.offset as usize + (pos & mask) as usize),
@@ -250,7 +266,7 @@ impl AgentChannel {
                 pos = pos.wrapping_add(tail as u32);
             }
             let mut buf = [0u8; 32];
-            let n = detguest_wire::events::encode_workload_ctrl(&mut buf, seq, vnanos, rec)
+            let n = detguest_wire::events::encode_workload_ctrl(&mut buf, pos >> 3, vnanos, rec)
                 .expect("fixed-size record");
             std::ptr::copy_nonoverlapping(
                 buf.as_ptr(),

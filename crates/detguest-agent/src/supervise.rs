@@ -103,10 +103,14 @@ pub fn spawn(unit: &Unit, channel_fd: RawFd) -> io::Result<Workload> {
     // SAFETY: libc pipe2/fork/exec sequence; the child only calls
     // async-signal-safe functions before exec (dup2/fcntl/setrlimit/execve).
     unsafe {
-        if libc::pipe2(out_pipe.as_mut_ptr(), libc::O_CLOEXEC) != 0
-            || libc::pipe2(err_pipe.as_mut_ptr(), libc::O_CLOEXEC) != 0
-        {
+        if libc::pipe2(out_pipe.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
             return Err(io::Error::last_os_error());
+        }
+        if libc::pipe2(err_pipe.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+            let e = io::Error::last_os_error();
+            libc::close(out_pipe[0]);
+            libc::close(out_pipe[1]);
+            return Err(e);
         }
         let exec = std::ffi::CString::new(unit.exec.as_str())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in exec path"))?;
@@ -249,6 +253,14 @@ impl Supervisor {
     /// StartWorkload and boot autostart — the autostart path involves NO
     /// ring-C record, ARCHITECTURE.md §4 step 7).
     pub fn start_unit(&mut self, unit_id: u32) -> io::Result<()> {
+        if self.workload.is_some() {
+            // v1 supervises exactly one workload; silently replacing it
+            // would leak the old process and emit a lying WorkloadStarted.
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a workload is already running",
+            ));
+        }
         let unit = self
             .manifest
             .unit(unit_id)
@@ -420,7 +432,30 @@ impl Supervisor {
                         // SAFETY: drain the timerfd counter.
                         unsafe { libc::read(self.timerfd, ticks.as_mut_ptr().cast(), 8) };
                     }
-                    TOK_OUT | TOK_ERR => self.drain_pipe(ev.u64),
+                    TOK_OUT | TOK_ERR => {
+                        self.drain_pipe(ev.u64);
+                        if ev.events & (libc::EPOLLHUP as u32 | libc::EPOLLERR as u32) != 0 {
+                            // Writer closed without exiting: deregister so a
+                            // permanently-HUP fd cannot busy-spin the loop.
+                            // The fd stays open for the final drain at reap.
+                            if let Some(w) = &self.workload {
+                                let fd = if ev.u64 == TOK_OUT {
+                                    w.stdout
+                                } else {
+                                    w.stderr
+                                };
+                                // SAFETY: removing our own registration.
+                                unsafe {
+                                    libc::epoll_ctl(
+                                        self.epfd,
+                                        libc::EPOLL_CTL_DEL,
+                                        fd,
+                                        std::ptr::null_mut(),
+                                    );
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }

@@ -192,7 +192,10 @@ pub fn run() -> ! {
     match sup.run() {
         Ok(()) => power_off(),
         Err(e) => {
-            // Post-Ready supervise failure: report and halt loudly.
+            // Post-Ready supervise failure: report and halt loudly. Doorbell
+            // first so a full ring is drained and the (droppable) LogLine
+            // has space to land.
+            crate::pio::doorbell(detguest_wire::ports::DOORBELL_RING_A);
             sup.channel.emit_with_doorbell(
                 vnanos(),
                 0,

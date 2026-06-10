@@ -22,24 +22,35 @@ pub fn raise_iopl() -> std::io::Result<()> {
 
 /// 32-bit port write (`OUT port, eax`). Every detcall OUT is a synchronous
 /// VM exit handled with the vCPU paused (deterministic by construction).
+///
+/// Deliberately NOT `options(nomem)`: the host drains channel memory inside
+/// the exit, so the OUT must behave as a memory barrier to the compiler —
+/// the normative "record visible before the OUT" discipline
+/// (ARCHITECTURE.md §2, API.md §5) would otherwise allow the compiler to
+/// hoist the OUT above the `Release` store publishing the record.
 #[inline]
 pub fn out32(port: u16, value: u32) {
-    // SAFETY: requires IOPL≥3 (raise_iopl). Port I/O has no Rust-visible
-    // memory effects; the hypervisor handles the exit.
+    // Belt-and-braces: an explicit compiler fence in addition to the asm
+    // block's default memory clobber.
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    // SAFETY: requires IOPL≥3 (raise_iopl); the hypervisor handles the exit.
     unsafe {
-        core::arch::asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack));
+        core::arch::asm!("out dx, eax", in("dx") port, in("eax") value, options(nostack));
     }
 }
 
 /// 32-bit port read (`IN eax, port`). The returned value is recorded by the
-/// host in the input log (replay re-answers it identically).
+/// host in the input log (replay re-answers it identically). Not `nomem`
+/// for the same ordering reason as [`out32`] (the host may have mutated
+/// channel memory inside the exit).
 #[inline]
 pub fn in32(port: u16) -> u32 {
     let value: u32;
-    // SAFETY: requires IOPL≥3; no Rust-visible memory effects.
+    // SAFETY: requires IOPL≥3.
     unsafe {
-        core::arch::asm!("in eax, dx", in("dx") port, out("eax") value, options(nomem, nostack));
+        core::arch::asm!("in eax, dx", in("dx") port, out("eax") value, options(nostack));
     }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     value
 }
 
