@@ -16,6 +16,8 @@
 //! memslot, pv-pad latch stub, retired-instruction counter, guest-time
 //! measurement) land here behind these gates.
 
+pub mod harness;
+
 /// True when the environment opts into running KVM-requiring tests.
 pub fn vm_tests_enabled() -> bool {
     std::env::var_os("DETGUEST_VM_TESTS").is_some_and(|v| v == "1")

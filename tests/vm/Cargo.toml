@@ -8,4 +8,10 @@ license.workspace = true
 publish = false
 
 [dependencies]
+detguest-host = { version = "0.1.0", path = "../../crates/detguest-host" }
 detguest-wire = { path = "../../crates/detguest-wire" }
+kvm-bindings = "0.13"
+kvm-ioctls = "0.23"
+libc = "0.2.186"
+linux-loader = { version = "0.13", features = ["bzimage"] }
+vm-memory = { version = "0.17", features = ["backend-mmap"] }

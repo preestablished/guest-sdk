@@ -51,6 +51,14 @@ Rationale:
   there is exactly **one** kernel build in this repo) never need the source
   tree, just the image.
 
+## Exported boot requirements (hypervisor-facing)
+
+The agent allocates its 2 MiB detchannel from hugetlbfs at boot, so **any
+cmdline that boots this image — including the canonical hypervisor-owned
+one — must pre-fill the 2 MiB pool: `hugepages=N` with N >= 1** (the image
+has no runtime sysctl path). The harness uses `hugepages=4`. Recorded on
+[issue #1](https://github.com/preestablished/guest-sdk/issues/1).
+
 ## Consumers
 
 - `image/build.sh kernel` — produces `image/build/bzImage` from this pin.

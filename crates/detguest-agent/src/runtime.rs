@@ -18,6 +18,17 @@ use crate::{agent_version, pio, translate};
 /// Boot manifest path inside the initramfs (API.md §7).
 pub const BOOT_TOML_PATH: &str = "/etc/detguest/boot.toml";
 
+/// Print that can never panic and never depends on fds: best-effort
+/// write(2) to stderr (ignored on failure) plus the emergency serial path.
+pub fn console_log(msg: &str) {
+    let line = format!("detguest-agent: {msg}\n");
+    // SAFETY: plain write(2) to fd 2; failure is ignored by design.
+    unsafe {
+        libc::write(2, line.as_ptr() as *const libc::c_void, line.len());
+    }
+    crate::pio::emergency_serial(&line);
+}
+
 fn mount(src: &str, target: &str, fstype: &str) -> io::Result<()> {
     let s = std::ffi::CString::new(src).unwrap();
     let t = std::ffi::CString::new(target).unwrap();
@@ -30,20 +41,52 @@ fn mount(src: &str, target: &str, fstype: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Step 2: mount /proc, /sys, devtmpfs, hugetlbfs.
+/// Step 2: mount /proc, /sys, devtmpfs, hugetlbfs — and wire stdio.
+///
+/// The initramfs carries no /dev/console node, so PID 1 starts with NO valid
+/// fds 0–2: any println/eprintln before stdio setup would itself panic
+/// (write to a closed fd), masking the real error with exit 101. So: mount
+/// devtmpfs first, immediately bind fds 0–2 to /dev/console, and only then
+/// do anything that can print.
 pub fn mount_all() -> io::Result<()> {
-    mount("proc", "/proc", "proc")?;
-    mount("sysfs", "/sys", "sysfs")?;
-    // devtmpfs may already be auto-mounted; EBUSY is fine.
+    // devtmpfs before everything: stdio depends on it. EBUSY = already there.
     match mount("devtmpfs", "/dev", "devtmpfs") {
         Ok(()) => {}
         Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
-        Err(e) => return Err(e),
+        Err(e) => {
+            setup_stdio(); // best effort (/dev/null fallback)
+            return Err(e);
+        }
     }
+    setup_stdio();
+    mount("proc", "/proc", "proc")?;
+    mount("sysfs", "/sys", "sysfs")?;
     std::fs::create_dir_all("/dev/hugepages")?;
     mount("hugetlbfs", "/dev/hugepages", "hugetlbfs")?;
     std::fs::create_dir_all("/run")?;
     Ok(())
+}
+
+/// Bind fds 0–2 to /dev/console (or /dev/null) so std's print macros have a
+/// valid target. Failures here leave the fds as-is — nothing we can report.
+fn setup_stdio() {
+    // SAFETY: open + dup2 onto the standard fd numbers.
+    unsafe {
+        let console = std::ffi::CString::new("/dev/console").unwrap();
+        let mut fd = libc::open(console.as_ptr(), libc::O_RDWR);
+        if fd < 0 {
+            let null = std::ffi::CString::new("/dev/null").unwrap();
+            fd = libc::open(null.as_ptr(), libc::O_RDWR);
+        }
+        if fd >= 0 {
+            for target in 0..3 {
+                libc::dup2(fd, target);
+            }
+            if fd > 2 {
+                libc::close(fd);
+            }
+        }
+    }
 }
 
 /// Power off the VM (step 11 / §7.3). Refuses to act unless we are PID 1 —
@@ -162,13 +205,13 @@ fn emit_ready(sup: &mut Supervisor, unit: u32) {
 pub fn run() -> ! {
     if let Err(e) = mount_all() {
         // No channel yet — serial console is the only witness.
-        eprintln!("detguest-agent: mount failed: {e}");
+        console_log(&format!("mount failed: {e}"));
         power_off();
     }
     let mut channel = match bring_up_channel() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("detguest-agent: channel bring-up failed: {e}");
+            console_log(&format!("channel bring-up failed: {e}"));
             power_off();
         }
     };
@@ -182,7 +225,7 @@ pub fn run() -> ! {
     let mut sup = match Supervisor::new(channel, manifest) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("detguest-agent: supervisor setup failed: {e}");
+            console_log(&format!("supervisor setup failed: {e}"));
             power_off();
         }
     };

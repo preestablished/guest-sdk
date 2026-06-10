@@ -144,6 +144,9 @@ jobs:
         with: { path: guest-sdk }
       - uses: actions/checkout@v4
         with: { repository: preestablished/control-plane, path: control-plane }
+      # The runner service env does not source the user profile; rustup's
+      # bin dir must be added explicitly or the preflight cargo gate fails.
+      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: ./scripts/intel-preflight.sh
       - run: >
           DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest --
