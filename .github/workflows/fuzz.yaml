@@ -35,9 +35,13 @@ jobs:
         # The gate is "30 minutes clean": a crash exits nonzero (libFuzzer),
         # and a suspiciously-early clean exit fails too — it means the run
         # did not actually fuzz for the mandated window.
+        # --target is explicit: the prebuilt cargo-fuzz binary is
+        # musl-linked and would otherwise default to the musl target, which
+        # has no std for the sanitizer build (found on the first dispatch).
         run: |
           start=$(date +%s)
-          cargo +nightly fuzz run decode_record -- -max_total_time=1800
+          cargo +nightly fuzz run decode_record \
+            --target x86_64-unknown-linux-gnu -- -max_total_time=1800
           elapsed=$(( $(date +%s) - start ))
           if [ "$elapsed" -lt 1700 ]; then
             echo "fuzz exited clean after only ${elapsed}s — gate requires ~1800s"
