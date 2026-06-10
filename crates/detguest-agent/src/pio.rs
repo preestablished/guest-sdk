@@ -72,3 +72,27 @@ pub fn channel_init(gpa: u64, size_pages: u32) -> u32 {
 pub fn doorbell(mask: u32) {
     out32(ports::PORT_DOORBELL, mask);
 }
+
+/// 8-bit port write (`OUT port, al`) — the emergency serial path.
+#[inline]
+pub fn out8(port: u16, value: u8) {
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    // SAFETY: requires IOPL>=3; no Rust-visible memory effects.
+    unsafe {
+        core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nostack));
+    }
+}
+
+/// Last-resort boot diagnostics: bytes straight to the 8250 THR (0x3F8).
+/// Needs no filesystem, no fds — only IOPL, which this raises idempotently.
+/// Errors here are unreportable by definition; ignore them.
+pub fn emergency_serial(msg: &str) {
+    // Without IOPL an OUT is a GPF — worse than losing the message.
+    if raise_iopl().is_err() {
+        return;
+    }
+    for b in msg.bytes() {
+        out8(0x3F8, b);
+    }
+    out8(0x3F8, b'\n');
+}
