@@ -57,6 +57,58 @@ fn encoded_event(seq: u32, vnanos: u64, flags: u8, ev: &EventPayload<'_>) -> Vec
     buf[..n].to_vec()
 }
 
+/// Every fixture this suite asserts. `GOLDEN_REGEN=1` writes without deleting,
+/// so a renamed/removed case would leave a stale `.bin` that silently stops
+/// being checked — this test turns that into a failure.
+#[test]
+fn no_orphan_fixtures() {
+    const EXPECTED: &[&str] = &[
+        "assert_violation.bin",
+        "assert_violation_truncated.bin",
+        "beacon.bin",
+        "channel_header.bin",
+        "cmd_quiesce_coop.bin",
+        "cmd_quiesce_forced.bin",
+        "cmd_resume.bin",
+        "cmd_reverify_regions.bin",
+        "cmd_set_log_mask.bin",
+        "cmd_shutdown_graceful.bin",
+        "cmd_shutdown_immediate.bin",
+        "cmd_start_workload.bin",
+        "frame_mark.bin",
+        "hello.bin",
+        "inject_query.bin",
+        "logline.bin",
+        "logline_max.bin",
+        "manifest_area.bin",
+        "name_intern.bin",
+        "name_intern_decl.bin",
+        "pad_tail40.bin",
+        "pad_tail8.bin",
+        "quiesce_ready.bin",
+        "reachable.bin",
+        "ready.bin",
+        "region_register.bin",
+        "region_update.bin",
+        "wc_quiesce_req.bin",
+        "wc_resume.bin",
+        "workload_exited.bin",
+        "workload_started.bin",
+    ];
+    let mut on_disk: Vec<String> = std::fs::read_dir(golden_dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    on_disk.sort();
+    let mut expected: Vec<&str> = EXPECTED.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        on_disk, expected,
+        "golden dir drifted from the asserted set — orphaned fixtures stop \
+         being checked; update EXPECTED together with the test cases"
+    );
+}
+
 #[test]
 fn event_fixtures_byte_exact() {
     let region = RegionEvent {

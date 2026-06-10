@@ -29,6 +29,7 @@ fn arb_msg() -> impl Strategy<Value = Vec<u8>> {
 
 #[derive(Debug, Clone)]
 enum OwnedEvent {
+    Pad,
     Hello(u32, u32, u64),
     NameIntern(u32, Vec<u8>, bool),
     AssertViolation(u32, u32, Vec<u8>),
@@ -48,6 +49,7 @@ enum OwnedEvent {
 impl OwnedEvent {
     fn as_payload(&self) -> EventPayload<'_> {
         match self {
+            OwnedEvent::Pad => EventPayload::Pad,
             OwnedEvent::Hello(p, a, c) => EventPayload::Hello {
                 proto_version: *p,
                 agent_version: *a,
@@ -112,6 +114,7 @@ fn arb_region_event() -> impl Strategy<Value = RegionEvent> {
 
 fn arb_event() -> impl Strategy<Value = OwnedEvent> {
     prop_oneof![
+        Just(OwnedEvent::Pad),
         (any::<u32>(), any::<u32>(), any::<u64>()).prop_map(|(p, a, c)| OwnedEvent::Hello(p, a, c)),
         (any::<u32>(), arb_name(), any::<bool>())
             .prop_map(|(id, n, d)| OwnedEvent::NameIntern(id, n, d)),
@@ -143,7 +146,10 @@ proptest! {
         let (hdr, back) = decode_event(&buf[..n]).unwrap();
         prop_assert_eq!(hdr.len as usize, n);
         prop_assert_eq!(hdr.seq, seq);
-        prop_assert_eq!(hdr.vnanos, vnanos);
+        // Pads are framing filler: encode_event routes them through
+        // encode_pad, which always stamps vnanos = 0.
+        let expect_vnanos = if matches!(ev, OwnedEvent::Pad) { 0 } else { vnanos };
+        prop_assert_eq!(hdr.vnanos, expect_vnanos);
         prop_assert_eq!(back, payload);
         prop_assert_eq!(hdr.flags & FLAG_REACHABLE_DECL != 0,
                         matches!(ev, OwnedEvent::NameIntern(_, _, true)));

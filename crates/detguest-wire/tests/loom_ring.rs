@@ -39,11 +39,14 @@ struct ModelRing {
 unsafe impl Sync for ModelRing {}
 
 impl ModelRing {
-    fn new() -> ModelRing {
+    /// `start` pre-winds the free-running indices (must be a multiple of
+    /// SIZE so the masked offset starts at slot 0).
+    fn new(start: u32) -> ModelRing {
+        assert_eq!(start & (SIZE - 1), 0);
         ModelRing {
             slots: (0..SLOTS).map(|_| UnsafeCell::new(0)).collect(),
-            prod: AtomicU32::new(0),
-            cons: AtomicU32::new(0),
+            prod: AtomicU32::new(start),
+            cons: AtomicU32::new(start),
         }
     }
 
@@ -117,7 +120,7 @@ impl ModelRing {
 #[test]
 fn spsc_interleavings_publish_complete_records() {
     loom::model(|| {
-        let ring = Arc::new(ModelRing::new());
+        let ring = Arc::new(ModelRing::new(0));
         let p = Arc::clone(&ring);
         let producer = thread::spawn(move || {
             for marker in 1u64..=3 {
@@ -147,16 +150,17 @@ fn spsc_interleavings_publish_complete_records() {
 #[test]
 fn spsc_full_ring_unblocks_after_pop() {
     loom::model(|| {
-        let ring = Arc::new(ModelRing::new());
-        // Fill: 2 × 24 B + 16 B = 64 B exactly.
+        let ring = Arc::new(ModelRing::new(0));
+        // Fill: 2 × 24 B + 16 B = 64 B exactly. (16 B is the real format's
+        // minimum non-pad record; nothing here uses sub-spec 8 B records.)
         assert!(ring.try_push(24, 1));
         assert!(ring.try_push(24, 2));
         assert!(ring.try_push(16, 3));
-        assert!(!ring.try_push(8, 4), "ring is exactly full");
+        assert!(!ring.try_push(16, 4), "ring is exactly full");
 
         let p = Arc::clone(&ring);
         let producer = thread::spawn(move || {
-            while !p.try_push(8, 5) {
+            while !p.try_push(16, 5) {
                 thread::yield_now();
             }
         });
@@ -168,5 +172,44 @@ fn spsc_full_ring_unblocks_after_pop() {
         };
         assert_eq!((len, marker), (24, 1));
         producer.join().unwrap();
+    });
+}
+
+/// Free-running u32 wraparound under concurrency: indices pre-wound to just
+/// below `u32::MAX` wrap past it mid-test. The x86-invisible failure mode the
+/// research note flags — `used`/`free`/placement must stay correct across the
+/// numeric wrap under every interleaving.
+#[test]
+fn spsc_interleavings_across_u32_wrap() {
+    loom::model(|| {
+        // Largest multiple of SIZE below u32::MAX: masked offset starts at 0,
+        // and the third 24 B record pushes prod numerically past u32::MAX.
+        let start = u32::MAX - (SIZE - 1); // 0xFFFF_FFC0 for SIZE=64
+        let ring = Arc::new(ModelRing::new(start));
+        let p = Arc::clone(&ring);
+        let producer = thread::spawn(move || {
+            for marker in 1u64..=3 {
+                while !p.try_push(24, marker) {
+                    thread::yield_now();
+                }
+            }
+        });
+        let mut seen = Vec::new();
+        while seen.len() < 3 {
+            match ring.try_pop() {
+                Some((_len, 0)) => {} // pad
+                Some((len, marker)) => {
+                    assert_eq!(len, 24);
+                    seen.push(marker);
+                }
+                None => thread::yield_now(),
+            }
+        }
+        producer.join().unwrap();
+        assert_eq!(seen, [1, 2, 3]);
+        assert!(
+            ring.prod.load(Ordering::Relaxed) < start,
+            "prod index must have wrapped past u32::MAX"
+        );
     });
 }
