@@ -83,3 +83,37 @@ pub fn handle(sup: &mut Supervisor, cmd: Command) -> io::Result<bool> {
     }
     Ok(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::boot::BootManifest;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static DOORBELLS: AtomicU32 = AtomicU32::new(0);
+
+    fn test_doorbell(_mask: u32) {
+        DOORBELLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn reverify_regions_is_currently_noop_without_regions() {
+        let before = DOORBELLS.load(Ordering::Relaxed);
+        let mut sup = crate::supervise::Supervisor::new(
+            crate::channel::test_channel(test_doorbell),
+            BootManifest::default(),
+        )
+        .unwrap();
+
+        let stop_now = handle(&mut sup, Command::ReverifyRegions).unwrap();
+
+        assert!(!stop_now);
+        assert!(sup.workload.is_none());
+        assert!(sup.shutdown.is_none());
+        assert_eq!(
+            DOORBELLS.load(Ordering::Relaxed),
+            before,
+            "must not emit RegionUpdate or any other doorbell"
+        );
+    }
+}

@@ -255,3 +255,86 @@ pub fn run() -> ! {
 
 // Keep the unused-import lint honest for ports (used in doc paths).
 const _: u16 = ports::PORT_IDENT;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::boot::{ExpectedRegion, Unit, UnitControl};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static DOORBELLS: AtomicU32 = AtomicU32::new(0);
+
+    fn test_doorbell(_mask: u32) {
+        DOORBELLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn manifest(
+        control: Option<UnitControl>,
+        expected_regions: Vec<ExpectedRegion>,
+    ) -> BootManifest {
+        BootManifest {
+            autostart_unit: Some(0),
+            units: vec![Unit {
+                id: 0,
+                exec: "/does/not/matter".to_string(),
+                args: Vec::new(),
+                log_mask: 0x1F,
+                control,
+            }],
+            expected_regions,
+        }
+    }
+
+    #[test]
+    fn non_empty_expected_regions_fault_before_ready_for_now() {
+        let before = DOORBELLS.load(Ordering::Relaxed);
+        let mut sup = Supervisor::new(
+            crate::channel::test_channel(test_doorbell),
+            manifest(
+                None,
+                vec![ExpectedRegion {
+                    name: "wram".to_string(),
+                    layout_version: 1,
+                }],
+            ),
+        )
+        .unwrap();
+
+        let err = autostart_and_ready(&mut sup).unwrap_err();
+
+        assert!(err.contains("expected_regions not satisfiable"));
+        assert!(sup.workload.is_none(), "must fail before fork/exec");
+        assert_eq!(
+            DOORBELLS.load(Ordering::Relaxed),
+            before,
+            "must not emit Ready"
+        );
+    }
+
+    #[test]
+    fn unit_control_faults_before_m4_for_now() {
+        let before = DOORBELLS.load(Ordering::Relaxed);
+        let mut sup = Supervisor::new(
+            crate::channel::test_channel(test_doorbell),
+            manifest(
+                Some(UnitControl {
+                    protocol: "refwork-ctl".to_string(),
+                    proto_version: 1,
+                    game_dev: Some("/dev/vdb".to_string()),
+                }),
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+
+        let err = autostart_and_ready(&mut sup).unwrap_err();
+
+        assert!(err.contains("unit.control protocol leg not implemented before M4"));
+        assert!(sup.workload.is_none(), "must fail before fork/exec");
+        assert_eq!(
+            DOORBELLS.load(Ordering::Relaxed),
+            before,
+            "must not emit Ready"
+        );
+    }
+}
