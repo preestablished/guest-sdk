@@ -90,6 +90,12 @@ impl std::error::Error for InitError {
     }
 }
 
+fn with_sdk_state<R>(f: impl FnOnce(&mut SdkState) -> R) -> Option<R> {
+    let sdk = SDK.get()?;
+    let mut state = sdk._state.lock().ok()?;
+    Some(f(&mut state))
+}
+
 /// One-time initialization.
 ///
 /// Without `DETGUEST_CHANNEL_FD`, returns [`InitError::NoChannel`] and the rest
@@ -205,7 +211,16 @@ pub enum LogLevel {
 
 /// Structured log line host-ward.
 pub fn log_line(level: LogLevel, msg: &str) {
-    let _ = (level, msg);
+    let _ = with_sdk_state(|state| {
+        let ev = detguest_wire::events::EventPayload::LogLine {
+            stream: detguest_wire::events::log_stream::SDK_USER,
+            level: level as u8,
+            msg: msg.as_bytes(),
+        };
+        let _ = state
+            ._channel
+            .emit_w_event(0, 0, &ev, channel::EventClass::Droppable);
+    });
 }
 
 /// Snapshot of SDK statistics.
