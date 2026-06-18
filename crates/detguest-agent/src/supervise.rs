@@ -564,6 +564,7 @@ impl Supervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
 
     #[test]
     fn linebuf_frames_lines() {
@@ -595,6 +596,57 @@ mod tests {
     }
 
     #[test]
+    fn spawn_exports_sdk_channel_fd_and_preserves_log_pipes() {
+        let channel_fd = memfd("detguest-agent-spawn-test");
+        let script = "\
+printf 'fd=%s\\n' \"$DETGUEST_CHANNEL_FD\"
+if : <&\"$DETGUEST_CHANNEL_FD\"; then
+  printf 'fd-open\\n'
+else
+  printf 'fd-closed\\n'
+  exit 41
+fi
+printf 'memlock=%s\\n' \"$(ulimit -l)\"
+printf 'stderr-still-works\\n' >&2
+";
+        let unit = Unit {
+            id: 7,
+            exec: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            log_mask: 0x1F,
+            control: None,
+        };
+
+        let workload = spawn(&unit, channel_fd).expect("spawn shell workload");
+        let status = wait_for(workload.pid);
+        let stdout = read_fd_to_string(workload.stdout);
+        let stderr = read_fd_to_string(workload.stderr);
+
+        unsafe {
+            libc::close(workload.stdout);
+            libc::close(workload.stderr);
+            libc::close(channel_fd);
+        }
+
+        assert!(libc::WIFEXITED(status), "child status: {status}");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains(&format!("fd={channel_fd}\nfd-open\n")),
+            "stdout:\n{stdout}"
+        );
+        if memlock_hard_limit() == libc::RLIM_INFINITY {
+            assert!(stdout.contains("memlock=unlimited\n"), "stdout:\n{stdout}");
+        } else {
+            assert!(stdout.contains("memlock="), "stdout:\n{stdout}");
+        }
+        assert_eq!(stderr, "stderr-still-works\n");
+    }
+
+    #[test]
     fn linebuf_finish_flushes_partial() {
         let mut lb = LineBuf::default();
         let mut got: Vec<Vec<u8>> = Vec::new();
@@ -602,5 +654,58 @@ mod tests {
         assert!(got.is_empty());
         lb.finish(|l| got.push(l.to_vec()));
         assert_eq!(got, vec![b"no newline".to_vec()]);
+    }
+
+    fn memfd(name: &str) -> RawFd {
+        let name = CString::new(name).unwrap();
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "memfd_create: {}", io::Error::last_os_error());
+        fd
+    }
+
+    fn wait_for(pid: i32) -> i32 {
+        loop {
+            let mut status = 0i32;
+            let got = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if got == pid {
+                return status;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            panic!("waitpid({pid}): {err}");
+        }
+    }
+
+    fn read_fd_to_string(fd: RawFd) -> String {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                out.extend_from_slice(&buf[..n as usize]);
+                continue;
+            }
+            if n == 0 {
+                break;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                break;
+            }
+            panic!("read({fd}): {err}");
+        }
+        String::from_utf8(out).expect("test workload emits UTF-8")
+    }
+
+    fn memlock_hard_limit() -> libc::rlim_t {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut lim) };
+        assert_eq!(rc, 0, "getrlimit: {}", io::Error::last_os_error());
+        lim.rlim_max
     }
 }
