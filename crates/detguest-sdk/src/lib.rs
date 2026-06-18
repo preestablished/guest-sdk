@@ -36,6 +36,17 @@ pub struct Sdk {
 struct SdkState {
     _channel: channel::MappedChannel,
     _pio: pio::PioState,
+    intern: intern::InternTable,
+    beacons: beacons::BeaconCounters,
+    stats: StatsState,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct StatsState {
+    asserts_passed_total: u64,
+    asserts_failed_total: u64,
+    reachable_names: u64,
+    inject_queries_total: u64,
 }
 
 static SDK: OnceLock<Sdk> = OnceLock::new();
@@ -127,6 +138,9 @@ fn init_from_channel_fd<'a>(
         _state: std::sync::Mutex::new(SdkState {
             _channel: channel,
             _pio: pio,
+            intern: intern::InternTable::default(),
+            beacons: beacons::BeaconCounters::default(),
+            stats: StatsState::default(),
         }),
     };
     match cell.set(sdk) {
@@ -140,7 +154,10 @@ fn init_from_channel_fd<'a>(
 /// Standalone mode emits no ring traffic. If `DETGUEST_STANDALONE_PANIC=1` is
 /// set, a failed assertion panics after evaluating and formatting `details`.
 pub fn assert_always(cond: bool, name: &'static str, details: fmt::Arguments<'_>) {
-    let _ = intern::valid_name(name);
+    if let Some(mut state) = sdk_state() {
+        state.assert_always(cond, name, details);
+        return;
+    }
     if cond {
         return;
     }
@@ -162,21 +179,24 @@ macro_rules! det_assert_always {
 
 /// Declare that a location should be reachable and record that it was reached.
 pub fn expect_reachable(name: &'static str) {
-    let _ = intern::valid_name(name);
+    let _ = with_sdk_state(|state| state.expect_reachable(name));
 }
 
 /// Pre-declare a reachability target without recording a hit.
 pub fn declare_reachable(name: &'static str) {
-    let _ = intern::valid_name(name);
+    let _ = with_sdk_state(|state| state.declare_reachable(name));
 }
 
 /// Cheap coverage counter for the scorer.
 pub fn coverage_beacon(id: u32) {
-    beacons::coverage_beacon(id);
+    let _ = with_sdk_state(|state| state.coverage_beacon(id));
 }
 
 /// Ask the host whether to inject a fault here.
 pub fn inject_point(name: &'static str) -> FaultDecision {
+    let _ = with_sdk_state(|state| {
+        state.stats.inject_queries_total = state.stats.inject_queries_total.saturating_add(1);
+    });
     inject::inject_point(name)
 }
 
@@ -252,7 +272,7 @@ impl Default for SdkStats {
 
 /// Snapshot of local SDK statistics.
 pub fn stats() -> SdkStats {
-    SdkStats::default()
+    with_sdk_state(|state| state.snapshot()).unwrap_or_default()
 }
 
 /// Publish `[ptr, ptr+len)` to the host under `name`.
@@ -271,6 +291,95 @@ pub unsafe fn register_region(
     flags: RegionFlags,
 ) -> Result<RegionHandle, RegionError> {
     regions::register_region(name, layout_version, ptr, len, flags)
+}
+
+fn sdk_state() -> Option<std::sync::MutexGuard<'static, SdkState>> {
+    SDK.get()?._state.lock().ok()
+}
+
+impl SdkState {
+    fn snapshot(&self) -> SdkStats {
+        SdkStats {
+            stats_version: 1,
+            asserts_passed_total: self.stats.asserts_passed_total,
+            asserts_failed_total: self.stats.asserts_failed_total,
+            reachable_names: self.stats.reachable_names,
+            inject_queries_total: self.stats.inject_queries_total,
+        }
+    }
+
+    fn intern_name(&mut self, name: &'static str, extra_flags: u8) -> Option<u32> {
+        let interned = self.intern.intern(name).ok()?;
+        if interned.is_new {
+            let ev = detguest_wire::events::EventPayload::NameIntern {
+                name_id: interned.id,
+                name: name.as_bytes(),
+            };
+            let _ = self
+                ._channel
+                .emit_w_event(0, extra_flags, &ev, channel::EventClass::Critical);
+        }
+        Some(interned.id)
+    }
+
+    fn assert_always(&mut self, cond: bool, name: &'static str, details: fmt::Arguments<'_>) {
+        let Some(name_id) = self.intern_name(name, 0) else {
+            return;
+        };
+        if cond {
+            self.stats.asserts_passed_total = self.stats.asserts_passed_total.saturating_add(1);
+            let _ = self.intern.record_assert(name_id, true);
+            return;
+        }
+
+        self.stats.asserts_failed_total = self.stats.asserts_failed_total.saturating_add(1);
+        let Ok(counts) = self.intern.record_assert(name_id, false) else {
+            return;
+        };
+        if counts.fail_count > ASSERT_REPEAT_LIMIT {
+            return;
+        }
+
+        let details = fmt::format(details);
+        let ev = detguest_wire::events::EventPayload::AssertViolation {
+            name_id,
+            violation_count: counts.fail_count,
+            details: details.as_bytes(),
+        };
+        let _ = self
+            ._channel
+            .emit_w_event(0, 0, &ev, channel::EventClass::Critical);
+    }
+
+    fn expect_reachable(&mut self, name: &'static str) {
+        let Some(name_id) = self.intern_name(name, 0) else {
+            return;
+        };
+        let Ok(hits) = self.intern.record_reachable(name_id) else {
+            return;
+        };
+        if hits == 1 {
+            self.stats.reachable_names = self.stats.reachable_names.saturating_add(1);
+            let ev = detguest_wire::events::EventPayload::Reachable { name_id };
+            let _ = self
+                ._channel
+                .emit_w_event(0, 0, &ev, channel::EventClass::Critical);
+        }
+    }
+
+    fn declare_reachable(&mut self, name: &'static str) {
+        let _ = self.intern_name(name, detguest_wire::record::FLAG_REACHABLE_DECL);
+    }
+
+    fn coverage_beacon(&mut self, id: u32) {
+        let hit = self.beacons.hit(id);
+        if hit.first_hit {
+            let ev = detguest_wire::events::EventPayload::Beacon { beacon_id: hit.id };
+            let _ = self
+                ._channel
+                .emit_w_event(0, 0, &ev, channel::EventClass::Droppable);
+        }
+    }
 }
 
 #[cfg(test)]
