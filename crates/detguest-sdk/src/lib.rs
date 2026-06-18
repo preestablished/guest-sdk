@@ -39,6 +39,7 @@ struct SdkState {
     intern: intern::InternTable,
     beacons: beacons::BeaconCounters,
     stats: StatsState,
+    frame_index: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -141,6 +142,7 @@ fn init_from_channel_fd<'a>(
             intern: intern::InternTable::default(),
             beacons: beacons::BeaconCounters::default(),
             stats: StatsState::default(),
+            frame_index: 0,
         }),
     };
     match cell.set(sdk) {
@@ -202,12 +204,18 @@ pub fn inject_point(name: &'static str) -> FaultDecision {
 
 /// Per-frame controller read from the pv-pad latch.
 pub fn poll_input(port: u8) -> u32 {
-    pio::poll_input(port)
+    sdk_state()
+        .map(|state| state._pio.poll_input(port))
+        .unwrap_or_else(|| pio::poll_input(port))
 }
 
 /// Mark a completed emulated frame.
 pub fn frame_mark() {
-    pio::frame_mark();
+    if let Some(mut state) = sdk_state() {
+        state.frame_mark();
+    } else {
+        pio::frame_mark();
+    }
 }
 
 /// Cooperative quiesce point.
@@ -380,13 +388,24 @@ impl SdkState {
                 .emit_w_event(0, 0, &ev, channel::EventClass::Droppable);
         }
     }
+
+    fn frame_mark(&mut self) {
+        self.frame_index = self.frame_index.wrapping_add(1);
+        let frame_index = self.frame_index;
+        let ev = detguest_wire::events::EventPayload::FrameMark { frame_index };
+        let _ = self
+            ._channel
+            .emit_w_event(0, 0, &ev, channel::EventClass::Critical);
+        self._pio.write_frame_counter(frame_index);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use detguest_wire::events::{decode_event, encoded_event_len, EventPayload};
     use detguest_wire::header::{
-        ChannelHeader, FLAG_WORKLOAD_ATTACHED, OFF_HEADER_FLAGS, PROTO_VERSION,
+        ChannelHeader, FLAG_WORKLOAD_ATTACHED, OFF_HEADER_FLAGS, OFF_RING_W_DATA, PROTO_VERSION,
     };
     use std::{
         fs::File,
@@ -398,6 +417,10 @@ mod tests {
 
     fn fake_pio() -> Result<pio::PioState, InitError> {
         Ok(pio::PioState::for_test())
+    }
+
+    fn test_pvpad_words() -> &'static mut [u32; pio::PV_PAD_WORDS] {
+        Box::leak(Box::new([0; pio::PV_PAD_WORDS]))
     }
 
     fn test_channel_file(header: ChannelHeader) -> File {
@@ -505,5 +528,35 @@ mod tests {
         .unwrap();
         assert_eq!(handle.region_id(), 0);
         handle.unregister();
+    }
+
+    #[test]
+    fn frame_mark_publishes_record_before_frame_counter_write() {
+        let file = test_channel_file(ChannelHeader::canonical());
+        let channel = channel::MappedChannel::map(file.as_raw_fd()).unwrap();
+        let words = test_pvpad_words();
+        let words_ptr = words.as_mut_ptr();
+        let pio = pio::PioState::for_test_with_pvpad(words);
+        let mut state = SdkState {
+            _channel: channel,
+            _pio: pio,
+            intern: intern::InternTable::default(),
+            beacons: beacons::BeaconCounters::default(),
+            stats: StatsState::default(),
+            frame_index: 0,
+        };
+
+        state.frame_mark();
+
+        let ev = EventPayload::FrameMark { frame_index: 1 };
+        let len = encoded_event_len(&ev);
+        let mut record = vec![0u8; len];
+        file.read_exact_at(&mut record, OFF_RING_W_DATA as u64)
+            .unwrap();
+        let (hdr, payload) = decode_event(&record).unwrap();
+        assert_eq!(hdr.seq, 0);
+        assert_eq!(payload, ev);
+        let frame = unsafe { words_ptr.add(pio::PVPAD_FRAME_COUNTER_WORD).read() };
+        assert_eq!(frame, 1);
     }
 }
