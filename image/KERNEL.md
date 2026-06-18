@@ -59,6 +59,13 @@ one — must pre-fill the 2 MiB pool: `hugepages=N` with N >= 1** (the image
 has no runtime sysctl path). The harness uses `hugepages=4`. Recorded on
 [issue #1](https://github.com/preestablished/guest-sdk/issues/1).
 
+The SDK/agent privilege path assumes the minimal image runs workloads as root
+with CAP_SYS_RAWIO available and `RLIMIT_MEMLOCK` raised to unlimited before
+exec. The config pins `CONFIG_MULTIUSER=y`, `CONFIG_X86_IOPL_IOPERM=y`,
+`CONFIG_DEVMEM=y`, and `# CONFIG_STRICT_DEVMEM is not set`; `image/build.sh`
+asserts those final `.config` lines after `olddefconfig` so drift fails before
+an image is published.
+
 ## Consumers
 
 - `image/build.sh kernel` — produces `image/build/bzImage` from this pin.
