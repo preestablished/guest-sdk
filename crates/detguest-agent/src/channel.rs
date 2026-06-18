@@ -34,6 +34,14 @@ pub struct AgentChannel {
     scratch: Box<[u8; detguest_wire::MAX_RECORD_LEN]>,
 }
 
+#[cfg(test)]
+pub(crate) fn test_channel(doorbell: fn(u32)) -> AgentChannel {
+    let page: &'static mut [u8] = Box::leak(vec![0u8; CHANNEL_SIZE].into_boxed_slice());
+    let fd = std::fs::File::open("/dev/null").unwrap();
+    // SAFETY: leaked zeroed CHANNEL_SIZE buffer, exclusively owned by the test.
+    unsafe { AgentChannel::init_at(OwnedFd::from(fd), page.as_mut_ptr(), doorbell) }
+}
+
 // Single-threaded agent; the handle never crosses threads, but Send keeps
 // composition options open (same argument as the ring halves).
 unsafe impl Send for AgentChannel {}
@@ -315,17 +323,9 @@ mod tests {
         DOORBELLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Channel over a leaked buffer + a dup'd /dev/null fd (host test).
-    fn test_channel() -> AgentChannel {
-        let page: &'static mut [u8] = Box::leak(vec![0u8; CHANNEL_SIZE].into_boxed_slice());
-        let fd = std::fs::File::open("/dev/null").unwrap();
-        // SAFETY: leaked zeroed CHANNEL_SIZE buffer, exclusively ours.
-        unsafe { AgentChannel::init_at(OwnedFd::from(fd), page.as_mut_ptr(), test_doorbell) }
-    }
-
     #[test]
     fn header_and_manifest_initialized() {
-        let ch = test_channel();
+        let ch = test_channel(test_doorbell);
         let hdr_bytes =
             // SAFETY: reading our own initialized buffer.
             unsafe { std::slice::from_raw_parts(ch.base_ptr(), OFF_RESERVED) };
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn agent_ready_flag_sets() {
-        let mut ch = test_channel();
+        let mut ch = test_channel(test_doorbell);
         ch.set_agent_ready();
         let hdr_bytes = unsafe { std::slice::from_raw_parts(ch.base_ptr(), OFF_RESERVED) };
         let hdr = ChannelHeader::read_from(hdr_bytes).unwrap();
@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn emit_writes_ring_a_and_hello_doorbells() {
-        let mut ch = test_channel();
+        let mut ch = test_channel(test_doorbell);
         let before = DOORBELLS.load(Ordering::Relaxed);
         assert!(ch.emit_with_doorbell(
             7,
@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn droppable_overflow_bumps_counters_not_doorbell() {
-        let mut ch = test_channel();
+        let mut ch = test_channel(test_doorbell);
         let msg = vec![b'x'; 1000];
         let mut dropped = 0u64;
         // Ring A is 64 KiB; ~64 of these fit. Push until drops happen.
@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn poll_command_reads_host_pushes() {
-        let mut ch = test_channel();
+        let mut ch = test_channel(test_doorbell);
         // Simulate a host push on ring C: encode at offset 0, bump prod.
         let c = RingId::C.canonical_desc();
         let mut buf = [0u8; 32];
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn relay_quiesce_req_lands_on_ring_i() {
-        let mut ch = test_channel();
+        let mut ch = test_channel(test_doorbell);
         ch.relay_workload_ctrl(5, &detguest_wire::WorkloadCtrl::QuiesceReq { token: 9 })
             .unwrap();
         let i = RingId::I.canonical_desc();

@@ -28,9 +28,13 @@ use std::process::Command as Proc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use detguest_host::OwnedPayload;
+use detguest_host::{GuestEvent, OwnedPayload};
 use detguest_vmtest::harness::{StopReason, VmConfig, VmHarness};
+use detguest_wire::events::log_stream;
 use detguest_wire::events::{Command, ShutdownMode};
+use detguest_wire::record::EventKind;
+
+const M3_TESTLOAD_EVENT_HASH: u64 = 0x3b0d_3ebc_93e4_ba51;
 
 fn gated() -> bool {
     if !detguest_vmtest::vm_tests_enabled() {
@@ -97,6 +101,7 @@ fn artifacts() -> &'static Artifacts {
             )
             .unwrap();
             std::fs::copy(musl.join("print-lines"), dir.join("opt/print-lines")).unwrap();
+            std::fs::copy(musl.join("testload"), dir.join("opt/testload")).unwrap();
             std::fs::write(dir.join("etc/detguest/boot.toml"), boot_toml).unwrap();
             run(
                 &root,
@@ -119,6 +124,20 @@ exec = \"/opt/autostart-trivial\"
 [[unit]]
 id = 1
 exec = \"/opt/print-lines\"
+
+[[unit]]
+id = 2
+exec = \"/opt/testload\"
+
+[[unit]]
+id = 3
+exec = \"/opt/testload\"
+args = [\"--spam-logs\"]
+
+[[unit]]
+id = 4
+exec = \"/opt/testload\"
+args = [\"--spam-asserts\"]
 ";
         Artifacts {
             bzimage: build.join("bzImage"),
@@ -167,6 +186,130 @@ fn boot_to_ready() -> (VmHarness, u64) {
         vm.serial_text()
     );
     (vm, icount)
+}
+
+fn boot_noauto_to_ready() -> VmHarness {
+    let a = artifacts();
+    let cfg = VmConfig::new(a.bzimage.clone(), a.initramfs_noauto.clone());
+    let mut vm = VmHarness::new(&cfg).expect("harness build");
+    let reason = vm
+        .run_until(Duration::from_secs(60), |o| ready(o).is_some())
+        .expect("run");
+    assert_eq!(
+        reason,
+        StopReason::Predicate,
+        "serial:\n{}",
+        vm.serial_text()
+    );
+    match ready(&vm.observed).unwrap().payload {
+        OwnedPayload::Ready { unit, .. } => assert_eq!(unit, 0xFFFF_FFFF, "no autostart unit"),
+        _ => unreachable!(),
+    }
+    vm
+}
+
+fn start_unit_and_wait_exit(vm: &mut VmHarness, unit: u32, timeout: Duration) {
+    vm.push_command(&Command::StartWorkload {
+        unit,
+        log_mask: 0x1F,
+    });
+    let reason = vm
+        .run_until(timeout, |o| {
+            o.events
+                .iter()
+                .any(|e| matches!(e.payload, OwnedPayload::WorkloadExited { .. }))
+        })
+        .expect("run");
+    assert_eq!(
+        reason,
+        StopReason::Predicate,
+        "serial:\n{}",
+        vm.serial_text()
+    );
+}
+
+fn last_exit(o: &detguest_vmtest::harness::Observed) -> (i32, i32) {
+    o.events
+        .iter()
+        .rev()
+        .find_map(|e| match e.payload {
+            OwnedPayload::WorkloadExited {
+                exit_code,
+                term_signal,
+                ..
+            } => Some((exit_code, term_signal)),
+            _ => None,
+        })
+        .unwrap()
+}
+
+fn m3_testload_event_lines(events: &[GuestEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| {
+            let ring = match e.ring {
+                detguest_wire::RingId::A => "A",
+                detguest_wire::RingId::W => "W",
+                _ => return None,
+            };
+            match &e.payload {
+                OwnedPayload::NameIntern {
+                    name_id,
+                    name,
+                    reachable_decl,
+                } if name.starts_with(b"testload.") => Some(format!(
+                    "{ring}:NameIntern:{}:{name_id}:{}",
+                    u8::from(*reachable_decl),
+                    String::from_utf8_lossy(name)
+                )),
+                OwnedPayload::AssertViolation {
+                    name_id,
+                    violation_count,
+                    details,
+                } => Some(format!(
+                    "{ring}:AssertViolation:{name_id}:{violation_count}:{}",
+                    String::from_utf8_lossy(details)
+                )),
+                OwnedPayload::Reachable { name_id } => Some(format!("{ring}:Reachable:{name_id}")),
+                OwnedPayload::Beacon { beacon_id } => Some(format!("{ring}:Beacon:{beacon_id}")),
+                OwnedPayload::LogLine { stream, level, msg }
+                    if *stream == log_stream::SDK_USER && msg.starts_with(b"testload:") =>
+                {
+                    Some(format!(
+                        "{ring}:LogLine:{stream}:{level}:{}",
+                        String::from_utf8_lossy(msg)
+                    ))
+                }
+                OwnedPayload::FrameMark { frame_index } => {
+                    Some(format!("{ring}:FrameMark:{frame_index}"))
+                }
+                OwnedPayload::WorkloadExited {
+                    exit_code,
+                    term_signal,
+                    ..
+                } if *exit_code == 0 && *term_signal == 0 => {
+                    Some(format!("{ring}:WorkloadExited:{exit_code}:{term_signal}"))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn fnv1a64_lines(lines: &[String]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for line in lines {
+        for byte in line
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain(std::iter::once(b'\n'))
+        {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
 }
 
 #[test]
@@ -290,42 +433,10 @@ fn print_lines_workload_streams_and_exit_code() {
     if !gated() {
         return;
     }
-    let a = artifacts();
-    let cfg = VmConfig::new(a.bzimage.clone(), a.initramfs_noauto.clone());
-    let mut vm = VmHarness::new(&cfg).expect("harness build");
-    // No autostart: Ready fires right after Hello with region_count 0.
-    let reason = vm
-        .run_until(Duration::from_secs(60), |o| ready(o).is_some())
-        .expect("run");
-    assert_eq!(
-        reason,
-        StopReason::Predicate,
-        "serial:\n{}",
-        vm.serial_text()
-    );
-    match ready(&vm.observed).unwrap().payload {
-        OwnedPayload::Ready { unit, .. } => assert_eq!(unit, 0xFFFF_FFFF, "no autostart unit"),
-        _ => unreachable!(),
-    }
+    let mut vm = boot_noauto_to_ready();
 
     // Start unit 1 (print-lines) over ring C and run until it is reaped.
-    vm.push_command(&Command::StartWorkload {
-        unit: 1,
-        log_mask: 0x1F,
-    });
-    let reason = vm
-        .run_until(Duration::from_secs(30), |o| {
-            o.events
-                .iter()
-                .any(|e| matches!(e.payload, OwnedPayload::WorkloadExited { .. }))
-        })
-        .expect("run");
-    assert_eq!(
-        reason,
-        StopReason::Predicate,
-        "serial:\n{}",
-        vm.serial_text()
-    );
+    start_unit_and_wait_exit(&mut vm, 1, Duration::from_secs(30));
 
     let o = &vm.observed;
     assert!(
@@ -369,17 +480,82 @@ fn print_lines_workload_streams_and_exit_code() {
             .collect::<Vec<_>>(),
         "stream 2 (stderr) framing"
     );
-    let exited = o
+    assert_eq!(last_exit(o), (7, 0), "exit code 7, no signal");
+}
+
+#[test]
+#[ignore = "KVM tier: Intel runner only (DETGUEST_VM_TESTS=1)"]
+fn testload_spam_logs_reports_ring_w_drops() {
+    if !gated() {
+        return;
+    }
+    let mut vm = boot_noauto_to_ready();
+
+    start_unit_and_wait_exit(&mut vm, 3, Duration::from_secs(120));
+
+    let counters = vm
+        .channel
+        .as_ref()
+        .expect("channel attached")
+        .drop_counters()
+        .unwrap();
+    assert!(counters.ring_w_records > 0, "ring W drops expected");
+    assert!(counters.ring_w_bytes > 0, "ring W dropped bytes expected");
+    assert!(
+        counters.ring_w_by_kind[EventKind::LogLine as usize] > 0,
+        "LogLine drops expected"
+    );
+    assert_eq!(last_exit(&vm.observed), (0, 0), "testload exits cleanly");
+}
+
+#[test]
+#[ignore = "KVM tier: Intel runner only (DETGUEST_VM_TESTS=1)"]
+fn testload_m3_event_stream_hash_matches_golden() {
+    if !gated() {
+        return;
+    }
+    let mut vm = boot_noauto_to_ready();
+
+    start_unit_and_wait_exit(&mut vm, 2, Duration::from_secs(60));
+
+    let lines = m3_testload_event_lines(&vm.observed.events);
+    let hash = fnv1a64_lines(&lines);
+    assert_eq!(
+        hash,
+        M3_TESTLOAD_EVENT_HASH,
+        "normalized M3 stream:\n{}",
+        lines.join("\n")
+    );
+}
+
+#[test]
+#[ignore = "KVM tier: Intel runner only (DETGUEST_VM_TESTS=1)"]
+fn testload_spam_asserts_completes_without_critical_drops() {
+    const EXPECTED_ASSERTS: usize = 20_000;
+
+    if !gated() {
+        return;
+    }
+    let mut vm = boot_noauto_to_ready();
+
+    start_unit_and_wait_exit(&mut vm, 4, Duration::from_secs(120));
+
+    let counters = vm
+        .channel
+        .as_ref()
+        .expect("channel attached")
+        .drop_counters()
+        .unwrap();
+    assert_eq!(counters.ring_w_records, 0, "critical events must not drop");
+    let violations = vm
+        .observed
         .events
         .iter()
-        .find_map(|e| match e.payload {
-            OwnedPayload::WorkloadExited {
-                exit_code,
-                term_signal,
-                ..
-            } => Some((exit_code, term_signal)),
-            _ => None,
-        })
-        .unwrap();
-    assert_eq!(exited, (7, 0), "exit code 7, no signal");
+        .filter(|e| matches!(e.payload, OwnedPayload::AssertViolation { .. }))
+        .count();
+    assert_eq!(
+        violations, EXPECTED_ASSERTS,
+        "every spam assertion must reach the host"
+    );
+    assert_eq!(last_exit(&vm.observed), (0, 0), "testload exits cleanly");
 }

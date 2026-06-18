@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/detguest-wire",
+    "crates/detguest-sdk",
     "crates/detguest-agent",
     "crates/detguest-host",
     "crates/m0-proto-client",

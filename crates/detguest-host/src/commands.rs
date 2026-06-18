@@ -124,7 +124,9 @@ mod tests {
     use crate::channel::Channel;
     use crate::guestmem::{GuestMem, GuestMemExt, MockGuestMem};
     use crate::{RecordingSink, SinkOp};
-    use detguest_wire::events::{decode_command, decode_workload_ctrl, QuiesceMode};
+    use detguest_wire::events::{
+        decode_command, decode_workload_ctrl, encode_event, EventPayload, QuiesceMode,
+    };
     use detguest_wire::header::{ChannelHeader, CHANNEL_SIZE, OFF_RESERVED};
 
     const BASE: u64 = 0x1000_0000;
@@ -209,6 +211,52 @@ mod tests {
             .unwrap();
         let (_, back) = decode_workload_ctrl(&rec).unwrap();
         assert_eq!(back, WorkloadCtrl::QuiesceReq { token: 9 });
+    }
+
+    #[test]
+    fn recording_sink_captures_ring_push_and_consumer_bump() {
+        let mut ch = channel();
+        let mut sink = RecordingSink::default();
+
+        ch.push_command(&Command::SetLogMask { mask: 0x3 }, &mut sink)
+            .unwrap();
+
+        let mut rec = [0u8; 64];
+        let n = encode_event(
+            &mut rec,
+            0,
+            11,
+            0,
+            &EventPayload::Hello {
+                proto_version: 1,
+                agent_version: 0x100,
+                capabilities: 0,
+            },
+        )
+        .unwrap();
+        ch.gm.write(ch.data_gpa(RingId::A), &rec[..n]).unwrap();
+        ch.gm.write_u32(ch.prod_gpa(RingId::A), n as u32).unwrap();
+
+        let events = ch.drain_events(&mut sink).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            sink.ops.first(),
+            Some(SinkOp::RingPush {
+                ring: RingId::C,
+                ..
+            })
+        ));
+        assert!(
+            sink.ops.iter().any(|op| matches!(
+                op,
+                SinkOp::ConsBump {
+                    ring: RingId::A,
+                    new_cons
+                } if *new_cons == n as u32
+            )),
+            "draining ring A must log the consumer bump"
+        );
     }
 
     #[test]

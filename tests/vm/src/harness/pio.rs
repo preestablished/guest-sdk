@@ -168,14 +168,50 @@ pub fn pvpad_read(h: &mut VmHarness, addr: u64) -> u32 {
 /// pv-pad MMIO write (FRAME_COUNTER is the frame-boundary exit the host
 /// records `frame → icount` at — the harness collects the sequence).
 pub fn pvpad_write(h: &mut VmHarness, addr: u64, value: u32) {
-    let Some(off) = addr.checked_sub(PVPAD_BASE) else {
-        return;
-    };
-    if off == PVPAD_FRAME_COUNTER_OFF && off < PVPAD_END_OFF {
-        h.pio_state().pvpad.frame_counter = value;
-        h.observed.frame_counter_writes.push(value);
+    if let Some(frame) = apply_pvpad_write(&mut h.pio_state().pvpad, addr, value) {
+        h.observed.frame_counter_writes.push(frame);
         // Drain inside the frame-boundary exit: the FrameMark record
         // preceding this write is guaranteed visible (ARCHITECTURE.md §2).
         h.drain();
+    }
+}
+
+fn apply_pvpad_write(pv: &mut PvPad, addr: u64, value: u32) -> Option<u32> {
+    let off = addr.checked_sub(PVPAD_BASE)?;
+    if off == PVPAD_FRAME_COUNTER_OFF && off < PVPAD_END_OFF {
+        pv.frame_counter = value;
+        return Some(value);
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_counter_write_updates_latch_and_requests_drain() {
+        let mut pv = PvPad {
+            pads: [0; 4],
+            frame_counter: 0,
+        };
+
+        let drain_frame = apply_pvpad_write(&mut pv, PVPAD_BASE + PVPAD_FRAME_COUNTER_OFF, 42);
+
+        assert_eq!(drain_frame, Some(42));
+        assert_eq!(pv.frame_counter, 42);
+    }
+
+    #[test]
+    fn non_frame_counter_pvpad_write_does_not_request_drain() {
+        let mut pv = PvPad {
+            pads: [0; 4],
+            frame_counter: 7,
+        };
+
+        let drain_frame = apply_pvpad_write(&mut pv, PVPAD_BASE + PVPAD_PAD0_OFF, 99);
+
+        assert_eq!(drain_frame, None);
+        assert_eq!(pv.frame_counter, 7);
     }
 }

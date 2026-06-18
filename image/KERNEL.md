@@ -46,6 +46,12 @@ Rationale:
   missing/stale, and only reconfigures+rebuilds when the kernel version or
   `image/kernel.config` changed (it stamps `build/.kernel-build-key` with
   `sha256(version + config fragment)` and compares).
+- `image/build.sh kernel` writes `image/build/kernel.provenance` before
+  compiling `bzImage`. The file records `kernel_version`, `kernel_url`,
+  `kernel_tarball_sha256`, the config-fragment hash, this build script's hash,
+  the final `.config` hash, and the build key. It also copies the post-
+  `olddefconfig` result to `image/build/kernel.final.config` so config drift is
+  inspectable before Intel VM tests run.
 - **CI cache key**: `kernel-${KERNEL_VERSION}-$(sha256sum image/kernel.config)`
   over `image/build/bzImage` only — the consumers (`tests/vm/` is the join;
   there is exactly **one** kernel build in this repo) never need the source
@@ -58,6 +64,13 @@ cmdline that boots this image — including the canonical hypervisor-owned
 one — must pre-fill the 2 MiB pool: `hugepages=N` with N >= 1** (the image
 has no runtime sysctl path). The harness uses `hugepages=4`. Recorded on
 [issue #1](https://github.com/preestablished/guest-sdk/issues/1).
+
+The SDK/agent privilege path assumes the minimal image runs workloads as root
+with CAP_SYS_RAWIO available and `RLIMIT_MEMLOCK` raised to unlimited before
+exec. The config pins `CONFIG_MULTIUSER=y`, `CONFIG_X86_IOPL_IOPERM=y`,
+`CONFIG_DEVMEM=y`, and `# CONFIG_STRICT_DEVMEM is not set`; `image/build.sh`
+asserts those final `.config` lines after `olddefconfig` so drift fails before
+an image is published.
 
 ## Consumers
 

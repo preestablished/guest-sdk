@@ -30,20 +30,40 @@ KERNEL_SHA256=492648a87c0b69c5ac7f43be64792b9000e3439550d4e82e4a14710c49094fa3
 # (olddefconfig silently flipping any of these must fail the build).
 REQUIRED_SET=(
   "# CONFIG_SMP is not set"
+  "# CONFIG_NUMA is not set"
   "# CONFIG_COMPACTION is not set"
   "# CONFIG_MIGRATION is not set"
   "# CONFIG_KSM is not set"
   "# CONFIG_TRANSPARENT_HUGEPAGE is not set"
   "# CONFIG_SWAP is not set"
   "# CONFIG_RANDOMIZE_BASE is not set"
+  "# CONFIG_RANDOMIZE_MEMORY is not set"
+  "# CONFIG_RELOCATABLE is not set"
+  "# CONFIG_STRICT_DEVMEM is not set"
+  "# CONFIG_NO_HZ_IDLE is not set"
+  "# CONFIG_NO_HZ_FULL is not set"
+  "# CONFIG_HIGH_RES_TIMERS is not set"
+  "# CONFIG_HYPERVISOR_GUEST is not set"
   "CONFIG_HUGETLBFS=y"
+  "CONFIG_PROC_FS=y"
   "CONFIG_PROC_PAGE_MONITOR=y"
+  "CONFIG_SYSFS=y"
   "CONFIG_PERF_EVENTS=y"
   "CONFIG_DEVTMPFS=y"
+  "CONFIG_DEVTMPFS_MOUNT=y"
   "CONFIG_BLK_DEV_INITRD=y"
+  "CONFIG_BINFMT_ELF=y"
+  "CONFIG_SHMEM=y"
+  "CONFIG_MULTIUSER=y"
+  "CONFIG_NET=y"
   "CONFIG_UNIX=y"
   "CONFIG_X86_IOPL_IOPERM=y"
   "CONFIG_DEVMEM=y"
+  "CONFIG_EPOLL=y"
+  "CONFIG_SIGNALFD=y"
+  "CONFIG_TIMERFD=y"
+  "CONFIG_EVENTFD=y"
+  "CONFIG_FUTEX=y"
   "CONFIG_HZ_PERIODIC=y"
   "CONFIG_HZ_100=y"
 )
@@ -109,6 +129,22 @@ build_key() {
     | sha256sum | cut -d' ' -f1
 }
 
+write_kernel_provenance() {
+  local final_config="$1"
+  local out="${BUILD}/kernel.provenance"
+  {
+    echo "kernel_version=${KERNEL_VERSION}"
+    echo "kernel_url=${KERNEL_URL}"
+    echo "kernel_tarball_sha256=${KERNEL_SHA256}"
+    echo "kernel_config_fragment_sha256=$(sha256sum "${SCRIPT_DIR}/kernel.config" | cut -d' ' -f1)"
+    echo "build_script_sha256=$(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)"
+    echo "final_config_sha256=$(sha256sum "$final_config" | cut -d' ' -f1)"
+    echo "build_key=$(build_key)"
+  } > "$out"
+  cp "$final_config" "${BUILD}/kernel.final.config"
+  log "wrote kernel provenance: ${out}"
+}
+
 assert_required_set() {
   local cfg="$1" missing=0
   for line in "${REQUIRED_SET[@]}"; do
@@ -144,6 +180,7 @@ cmd_kernel() {
   run_build scripts/kconfig/merge_config.sh -m .config "${BUILD}/kernel.config.fragment"
   run_build make -s olddefconfig
   assert_required_set "${SRC}/.config"
+  write_kernel_provenance "${SRC}/.config"
   log "building bzImage with -j${NPROC} (expect tens of minutes on small hosts)"
   run_build make -s "-j${NPROC}" bzImage
   cp "${SRC}/arch/x86/boot/bzImage" "${BUILD}/bzImage"

@@ -275,8 +275,13 @@ mod tests {
     }
 
     #[test]
-    fn log_fault_plan_skeleton_proceeds() {
+    fn log_fault_plan_skeleton_always_proceeds_for_now() {
         let mut p = LogFaultPlan::default();
         assert_eq!(p.decide(0, 1, None), FaultDecision::Proceed);
+        assert_eq!(p.decide(7, 42, Some("disk_read")), FaultDecision::Proceed);
+        assert_eq!(
+            p.decide(u32::MAX, u32::MAX, Some("anything")),
+            FaultDecision::Proceed
+        );
     }
 }

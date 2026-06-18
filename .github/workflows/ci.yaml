@@ -27,7 +27,8 @@ defaults:
     working-directory: guest-sdk
 
 jobs:
-  # Hosted lane: fmt, clippy -D warnings, full workspace tests.
+  # Hosted lane: fmt, clippy -D warnings, full workspace tests. This covers
+  # the std SDK crate on normal hosted x86_64 without enabling KVM gates.
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -45,6 +46,8 @@ jobs:
       - run: cargo test --workspace
 
   # M0 acceptance: the wire crate builds and tests without std (bead lcv).
+  # detguest-sdk is intentionally std-only because it maps fds, /dev/mem, and
+  # uses process-level detcall privileges.
   no_std:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -90,8 +93,8 @@ jobs:
         with: { workspaces: guest-sdk }
       - run: cargo test -p detguest-wire --test loom_ring --release
 
-  # Static musl cross-build of the agent + workloads, with a --check smoke
-  # run of the produced binary (bead ssl).
+  # Static musl cross-build of the agent + SDK-linked workloads, with a
+  # --check smoke run of the produced binary (bead ssl).
   musl:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -106,15 +109,15 @@ jobs:
         with: { workspaces: guest-sdk }
       - run: >
           cargo build --release --target x86_64-unknown-linux-musl
-          -p detguest-agent -p detguest-workloads
+          -p detguest-agent -p detguest-sdk -p detguest-workloads
       - run: ./target/x86_64-unknown-linux-musl/release/detguest-agent --check
       - run: >
           file target/x86_64-unknown-linux-musl/release/detguest-agent
           | grep -E 'static(ally|-pie) linked'
 
-  # aarch64 lane: wire + host tests only — nothing in those crates is
-  # x86-specific; the detcall ABI sits behind a module (bead xcc;
-  # IMPLEMENTATION-PLAN "CI tiering"). Public-repo arm64 hosted runner.
+  # aarch64 lane: wire + host + SDK hosted tests only — these crates compile
+  # without KVM, and the SDK detcall ABI is cfg-gated so non-x86 builds fail
+  # only at runtime init, not at compile time. Public-repo arm64 hosted runner.
   aarch64:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
@@ -126,7 +129,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: guest-sdk }
-      - run: cargo test -p detguest-wire -p detguest-host
+      - run: cargo test -p detguest-wire -p detguest-host -p detguest-sdk
 
   # In-VM tier: Intel box only (beads rci + atd). Preflight is the phase
   # entry gate — pinned kernel, perf_event access, KVM caps — then the
