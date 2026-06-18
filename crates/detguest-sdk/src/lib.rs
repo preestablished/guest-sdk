@@ -450,10 +450,12 @@ mod tests {
     };
     use detguest_wire::header::{
         ChannelHeader, FLAG_WORKLOAD_ATTACHED, OFF_HEADER_FLAGS, OFF_RING_I_CONS, OFF_RING_I_DATA,
-        OFF_RING_I_PROD, OFF_RING_W_DATA, OFF_RING_W_PROD, PROTO_VERSION,
+        OFF_RING_I_PROD, OFF_RING_W_CONS, OFF_RING_W_DATA, OFF_RING_W_DROPPED_BYTES,
+        OFF_RING_W_DROPPED_BY_KIND, OFF_RING_W_DROPPED_RECORDS, OFF_RING_W_PROD, PROTO_VERSION,
+        RING_W_SIZE,
     };
     use detguest_wire::record::{
-        RecordHeader, FLAG_REACHABLE_DECL, FLAG_TRUNCATED, MAX_RECORD_LEN,
+        EventKind, RecordHeader, FLAG_REACHABLE_DECL, FLAG_TRUNCATED, MAX_RECORD_LEN,
     };
     use std::{
         fs::File,
@@ -538,6 +540,28 @@ mod tests {
         }
         file.write_all_at(&(at as u32).to_le_bytes(), OFF_RING_I_PROD as u64)
             .unwrap();
+    }
+
+    fn write_u32_at(file: &File, offset: usize, value: u32) {
+        file.write_all_at(&value.to_le_bytes(), offset as u64)
+            .unwrap();
+    }
+
+    fn read_u32_at(file: &File, offset: usize) -> u32 {
+        let mut bytes = [0u8; 4];
+        file.read_exact_at(&mut bytes, offset as u64).unwrap();
+        u32::from_le_bytes(bytes)
+    }
+
+    fn read_u64_at(file: &File, offset: usize) -> u64 {
+        let mut bytes = [0u8; 8];
+        file.read_exact_at(&mut bytes, offset as u64).unwrap();
+        u64::from_le_bytes(bytes)
+    }
+
+    fn force_ring_w_full(file: &File) {
+        write_u32_at(file, OFF_RING_W_PROD, RING_W_SIZE);
+        write_u32_at(file, OFF_RING_W_CONS, 0);
     }
 
     #[test]
@@ -738,6 +762,49 @@ mod tests {
             }
         });
         assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn droppable_log_lines_are_lost_with_exact_drop_counters_when_ring_w_full() {
+        let file = test_channel_file(ChannelHeader::canonical());
+        force_ring_w_full(&file);
+        let mut state = test_state(&file);
+        let msgs = ["drop-one", "drop-two"];
+
+        for msg in msgs {
+            state.log_line(LogLevel::Info, msg);
+        }
+
+        let expected_bytes: u64 = msgs
+            .iter()
+            .map(|msg| {
+                encoded_event_len(&EventPayload::LogLine {
+                    stream: detguest_wire::events::log_stream::SDK_USER,
+                    level: LogLevel::Info as u8,
+                    msg: msg.as_bytes(),
+                }) as u64
+            })
+            .sum();
+        assert_eq!(read_u32_at(&file, OFF_RING_W_PROD), RING_W_SIZE);
+        assert_eq!(read_u32_at(&file, OFF_RING_W_CONS), 0);
+        assert_eq!(read_u64_at(&file, OFF_RING_W_DROPPED_RECORDS), 2);
+        assert_eq!(read_u64_at(&file, OFF_RING_W_DROPPED_BYTES), expected_bytes);
+        assert_eq!(
+            read_u64_at(
+                &file,
+                OFF_RING_W_DROPPED_BY_KIND
+                    + EventKind::LogLine as usize * std::mem::size_of::<u64>()
+            ),
+            2
+        );
+        assert_eq!(
+            read_u64_at(
+                &file,
+                OFF_RING_W_DROPPED_BY_KIND
+                    + EventKind::FrameMark as usize * std::mem::size_of::<u64>()
+            ),
+            0
+        );
     }
 
     #[test]

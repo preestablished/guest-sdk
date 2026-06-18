@@ -493,12 +493,14 @@ mod tests {
         ring_w
             .emit(123, 0, &ev, EventClass::Critical, || {
                 doorbells += 1;
-                drain_ring_w(ptr);
+                if doorbells == 3 {
+                    drain_ring_w(ptr);
+                }
                 Ok(())
             })
             .unwrap();
 
-        assert_eq!(doorbells, 1);
+        assert_eq!(doorbells, 3);
         assert_eq!(load_counter(ptr, OFF_RING_W_DROPPED_RECORDS), 0);
         assert_eq!(load_counter(ptr, OFF_RING_W_DROPPED_BYTES), 0);
 

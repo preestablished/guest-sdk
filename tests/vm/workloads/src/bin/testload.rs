@@ -9,8 +9,19 @@
 use detguest_sdk::{self as sdk, LogLevel};
 
 const EXIT_CODE: i32 = 0;
+const SPAM_LOGS: u32 = 80_000;
+const SPAM_ASSERTS: u32 = 20_000;
 
 fn main() {
+    match std::env::args().nth(1).as_deref() {
+        Some("--spam-logs") => spam_logs(),
+        Some("--spam-asserts") => spam_asserts(),
+        _ => exercise_once(),
+    }
+    std::process::exit(EXIT_CODE);
+}
+
+fn exercise_once() {
     let _ = sdk::init();
 
     sdk::declare_reachable("testload.main.declared");
@@ -29,5 +40,21 @@ fn main() {
     sdk::quiesce_check();
 
     sdk::log_line(LogLevel::Debug, &format!("testload: pad0={pad0}"));
-    std::process::exit(EXIT_CODE);
+}
+
+fn spam_logs() {
+    let _ = sdk::init();
+    for i in 0..SPAM_LOGS {
+        sdk::log_line(LogLevel::Info, &format!("testload spam log {i:05}"));
+    }
+    sdk::frame_mark();
+}
+
+fn spam_asserts() {
+    let _ = sdk::init();
+    for i in 0..SPAM_ASSERTS {
+        let name: &'static str = Box::leak(format!("testload.spam.assert.{i:05}").into_boxed_str());
+        sdk::assert_always(false, name, format_args!("i={i}"));
+    }
+    sdk::frame_mark();
 }
