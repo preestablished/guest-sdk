@@ -190,9 +190,7 @@ if [[ -f "$BZ" ]]; then
     fail "image/build/kernel.provenance missing — run ./image/build.sh kernel to refresh the pinned artifact"
   fi
 else
-  # Not fatal: the harness tests can build it via image/build.sh (cached);
-  # surface it so a cold runner explains its first slow run.
-  note "bzImage not prebuilt — run ./image/build.sh kernel before the Intel VM lane for an early artifact/provenance check"
+  fail "image/build/bzImage missing — run ./image/build.sh kernel before the Intel VM lane; cold kernel builds must not hide inside the test timeout"
   if [[ -f "$FINAL_CONFIG" ]]; then
     check_kernel_config "$FINAL_CONFIG"
   else

@@ -52,6 +52,19 @@ struct StatsState {
 
 static SDK: OnceLock<Sdk> = OnceLock::new();
 
+fn vnanos() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) };
+    if rc == 0 {
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    } else {
+        0
+    }
+}
+
 /// Errors from one-time SDK initialization.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -320,9 +333,12 @@ impl SdkState {
                 name_id: interned.id,
                 name: name.as_bytes(),
             };
-            let _ = self
-                ._channel
-                .emit_w_event(0, extra_flags, &ev, channel::EventClass::Critical);
+            let _ = self._channel.emit_w_event(
+                vnanos(),
+                extra_flags,
+                &ev,
+                channel::EventClass::Critical,
+            );
         }
         Some(interned.id)
     }
@@ -341,11 +357,14 @@ impl SdkState {
         let Ok(counts) = self.intern.record_assert(name_id, false) else {
             return;
         };
-        if counts.fail_count > ASSERT_REPEAT_LIMIT {
-            return;
-        }
-
-        let details = fmt::format(details);
+        let details = if counts.fail_count > ASSERT_REPEAT_LIMIT {
+            if counts.fail_count != ASSERT_REPEAT_LIMIT + 1 {
+                return;
+            }
+            format!("further violations suppressed after {ASSERT_REPEAT_LIMIT} repeats")
+        } else {
+            fmt::format(details)
+        };
         let ev = detguest_wire::events::EventPayload::AssertViolation {
             name_id,
             violation_count: counts.fail_count,
@@ -353,7 +372,7 @@ impl SdkState {
         };
         let _ = self
             ._channel
-            .emit_w_event(0, 0, &ev, channel::EventClass::Critical);
+            .emit_w_event(vnanos(), 0, &ev, channel::EventClass::Critical);
     }
 
     fn expect_reachable(&mut self, name: &'static str) {
@@ -368,7 +387,7 @@ impl SdkState {
             let ev = detguest_wire::events::EventPayload::Reachable { name_id };
             let _ = self
                 ._channel
-                .emit_w_event(0, 0, &ev, channel::EventClass::Critical);
+                .emit_w_event(vnanos(), 0, &ev, channel::EventClass::Critical);
         }
     }
 
@@ -382,7 +401,7 @@ impl SdkState {
             let ev = detguest_wire::events::EventPayload::Beacon { beacon_id: hit.id };
             let _ = self
                 ._channel
-                .emit_w_event(0, 0, &ev, channel::EventClass::Droppable);
+                .emit_w_event(vnanos(), 0, &ev, channel::EventClass::Droppable);
         }
     }
 
@@ -394,7 +413,7 @@ impl SdkState {
         };
         let _ = self
             ._channel
-            .emit_w_event(0, 0, &ev, channel::EventClass::Droppable);
+            .emit_w_event(vnanos(), 0, &ev, channel::EventClass::Droppable);
     }
 
     fn quiesce_check(&mut self) {
@@ -413,7 +432,7 @@ impl SdkState {
         let ev = detguest_wire::events::EventPayload::QuiesceReady { token };
         if self
             ._channel
-            .emit_w_event_with_doorbell(0, 0, &ev, channel::EventClass::Critical)
+            .emit_w_event_with_doorbell(vnanos(), 0, &ev, channel::EventClass::Critical)
             .is_err()
         {
             return;
@@ -436,7 +455,7 @@ impl SdkState {
         let ev = detguest_wire::events::EventPayload::FrameMark { frame_index };
         let _ = self
             ._channel
-            .emit_w_event(0, 0, &ev, channel::EventClass::Critical);
+            .emit_w_event(vnanos(), 0, &ev, channel::EventClass::Critical);
         self._pio.write_frame_counter(frame_index);
     }
 }
@@ -762,6 +781,57 @@ mod tests {
             }
         });
         assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn sdk_events_carry_monotonic_raw_vnanos() {
+        let file = test_channel_file(ChannelHeader::canonical());
+        let mut state = test_state(&file);
+
+        state.log_line(LogLevel::Info, "timed");
+        state.frame_mark();
+
+        let mut vnanos = Vec::new();
+        for_each_ring_w_event(&file, |_index, hdr, _payload| {
+            vnanos.push(hdr.vnanos);
+        });
+        assert_eq!(vnanos.len(), 2);
+        assert!(vnanos.iter().all(|v| *v > 0), "{vnanos:?}");
+        assert!(vnanos[1] >= vnanos[0], "{vnanos:?}");
+    }
+
+    #[test]
+    fn repeated_assertions_emit_one_suppression_summary() {
+        let file = test_channel_file(ChannelHeader::canonical());
+        let mut state = test_state(&file);
+
+        for i in 0..ASSERT_REPEAT_LIMIT + 2 {
+            state.assert_always(false, "hot.assert", format_args!("i={i}"));
+        }
+
+        let mut violations = Vec::new();
+        for_each_ring_w_event(&file, |_index, _hdr, payload| {
+            if let EventPayload::AssertViolation {
+                violation_count,
+                details,
+                ..
+            } = payload
+            {
+                violations.push((
+                    violation_count,
+                    String::from_utf8_lossy(details).into_owned(),
+                ));
+            }
+        });
+        assert_eq!(violations.len(), (ASSERT_REPEAT_LIMIT + 1) as usize);
+        assert_eq!(violations[0], (1, "i=0".to_string()));
+        assert_eq!(
+            violations.last().unwrap(),
+            &(
+                ASSERT_REPEAT_LIMIT + 1,
+                "further violations suppressed after 16 repeats".to_string()
+            )
+        );
     }
 
     #[test]
