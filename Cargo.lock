@@ -86,6 +86,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "detguest-sdk"
+version = "0.1.0"
+dependencies = [
+ "detguest-wire",
+]
+
+[[package]]
 name = "detguest-vmtest"
 version = "0.1.0"
 dependencies = [
@@ -109,6 +116,9 @@ dependencies = [
 [[package]]
 name = "detguest-workloads"
 version = "0.1.0"
+dependencies = [
+ "detguest-sdk",
+]
 
 [[package]]
 name = "equivalent"

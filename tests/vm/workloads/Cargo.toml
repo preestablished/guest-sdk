@@ -19,3 +19,4 @@ name = "print-lines"
 path = "src/bin/print_lines.rs"
 
 [dependencies]
+detguest-sdk = { path = "../../../crates/detguest-sdk" }
