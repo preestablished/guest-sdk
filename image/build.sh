@@ -129,6 +129,22 @@ build_key() {
     | sha256sum | cut -d' ' -f1
 }
 
+write_kernel_provenance() {
+  local final_config="$1"
+  local out="${BUILD}/kernel.provenance"
+  {
+    echo "kernel_version=${KERNEL_VERSION}"
+    echo "kernel_url=${KERNEL_URL}"
+    echo "kernel_tarball_sha256=${KERNEL_SHA256}"
+    echo "kernel_config_fragment_sha256=$(sha256sum "${SCRIPT_DIR}/kernel.config" | cut -d' ' -f1)"
+    echo "build_script_sha256=$(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)"
+    echo "final_config_sha256=$(sha256sum "$final_config" | cut -d' ' -f1)"
+    echo "build_key=$(build_key)"
+  } > "$out"
+  cp "$final_config" "${BUILD}/kernel.final.config"
+  log "wrote kernel provenance: ${out}"
+}
+
 assert_required_set() {
   local cfg="$1" missing=0
   for line in "${REQUIRED_SET[@]}"; do
@@ -164,6 +180,7 @@ cmd_kernel() {
   run_build scripts/kconfig/merge_config.sh -m .config "${BUILD}/kernel.config.fragment"
   run_build make -s olddefconfig
   assert_required_set "${SRC}/.config"
+  write_kernel_provenance "${SRC}/.config"
   log "building bzImage with -j${NPROC} (expect tens of minutes on small hosts)"
   run_build make -s "-j${NPROC}" bzImage
   cp "${SRC}/arch/x86/boot/bzImage" "${BUILD}/bzImage"

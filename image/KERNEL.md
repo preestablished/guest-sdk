@@ -46,6 +46,12 @@ Rationale:
   missing/stale, and only reconfigures+rebuilds when the kernel version or
   `image/kernel.config` changed (it stamps `build/.kernel-build-key` with
   `sha256(version + config fragment)` and compares).
+- `image/build.sh kernel` writes `image/build/kernel.provenance` before
+  compiling `bzImage`. The file records `kernel_version`, `kernel_url`,
+  `kernel_tarball_sha256`, the config-fragment hash, this build script's hash,
+  the final `.config` hash, and the build key. It also copies the post-
+  `olddefconfig` result to `image/build/kernel.final.config` so config drift is
+  inspectable before Intel VM tests run.
 - **CI cache key**: `kernel-${KERNEL_VERSION}-$(sha256sum image/kernel.config)`
   over `image/build/bzImage` only — the consumers (`tests/vm/` is the join;
   there is exactly **one** kernel build in this repo) never need the source
