@@ -240,14 +240,7 @@ pub enum LogLevel {
 /// Structured log line host-ward.
 pub fn log_line(level: LogLevel, msg: &str) {
     let _ = with_sdk_state(|state| {
-        let ev = detguest_wire::events::EventPayload::LogLine {
-            stream: detguest_wire::events::log_stream::SDK_USER,
-            level: level as u8,
-            msg: msg.as_bytes(),
-        };
-        let _ = state
-            ._channel
-            .emit_w_event(0, 0, &ev, channel::EventClass::Droppable);
+        state.log_line(level, msg);
     });
 }
 
@@ -389,6 +382,17 @@ impl SdkState {
         }
     }
 
+    fn log_line(&mut self, level: LogLevel, msg: &str) {
+        let ev = detguest_wire::events::EventPayload::LogLine {
+            stream: detguest_wire::events::log_stream::SDK_USER,
+            level: level as u8,
+            msg: msg.as_bytes(),
+        };
+        let _ = self
+            ._channel
+            .emit_w_event(0, 0, &ev, channel::EventClass::Droppable);
+    }
+
     fn frame_mark(&mut self) {
         self.frame_index = self.frame_index.wrapping_add(1);
         let frame_index = self.frame_index;
@@ -403,10 +407,12 @@ impl SdkState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use detguest_wire::events::{decode_event, encoded_event_len, EventPayload};
+    use detguest_wire::events::{decode_event, encoded_event_len, EventPayload, MAX_LOG_MSG};
     use detguest_wire::header::{
-        ChannelHeader, FLAG_WORKLOAD_ATTACHED, OFF_HEADER_FLAGS, OFF_RING_W_DATA, PROTO_VERSION,
+        ChannelHeader, FLAG_WORKLOAD_ATTACHED, OFF_HEADER_FLAGS, OFF_RING_W_DATA, OFF_RING_W_PROD,
+        PROTO_VERSION,
     };
+    use detguest_wire::record::{RecordHeader, FLAG_REACHABLE_DECL, FLAG_TRUNCATED};
     use std::{
         fs::File,
         io,
@@ -438,6 +444,40 @@ mod tests {
         header.write_to(&mut bytes).unwrap();
         file.write_all_at(&bytes, 0).unwrap();
         file
+    }
+
+    fn test_state(file: &File) -> SdkState {
+        SdkState {
+            _channel: channel::MappedChannel::map(file.as_raw_fd()).unwrap(),
+            _pio: pio::PioState::for_test(),
+            intern: intern::InternTable::default(),
+            beacons: beacons::BeaconCounters::default(),
+            stats: StatsState::default(),
+            frame_index: 0,
+        }
+    }
+
+    fn for_each_ring_w_event(
+        file: &File,
+        mut f: impl FnMut(usize, RecordHeader, EventPayload<'_>),
+    ) {
+        let mut prod = [0u8; 4];
+        file.read_exact_at(&mut prod, OFF_RING_W_PROD as u64)
+            .unwrap();
+        let prod = u32::from_le_bytes(prod) as usize;
+        let mut bytes = vec![0u8; prod];
+        file.read_exact_at(&mut bytes, OFF_RING_W_DATA as u64)
+            .unwrap();
+        let mut at = 0;
+        let mut index = 0;
+        while at < bytes.len() {
+            let hdr = RecordHeader::read_from(&bytes[at..]).unwrap();
+            let len = hdr.len as usize;
+            let (_, payload) = decode_event(&bytes[at..at + len]).unwrap();
+            f(index, hdr, payload);
+            at += len;
+            index += 1;
+        }
     }
 
     fn init_for_test<'a>(file: &File, cell: &'a OnceLock<Sdk>) -> Result<&'a Sdk, InitError> {
@@ -531,20 +571,128 @@ mod tests {
     }
 
     #[test]
+    fn user_event_apis_emit_exact_first_hit_sequence() {
+        let file = test_channel_file(ChannelHeader::canonical());
+        let mut state = test_state(&file);
+
+        state.assert_always(false, "hp.limit", format_args!("hp={} max={}", 12, 10));
+        state.expect_reachable("room.ready");
+        state.expect_reachable("room.ready");
+        state.coverage_beacon(9);
+        state.coverage_beacon(9);
+        state.log_line(LogLevel::Info, "hello");
+
+        let mut seen = 0;
+        for_each_ring_w_event(&file, |index, hdr, payload| {
+            seen += 1;
+            match (index, payload) {
+                (
+                    0,
+                    EventPayload::NameIntern {
+                        name_id,
+                        name: b"hp.limit",
+                    },
+                ) => {
+                    assert_eq!(name_id, 1);
+                    assert_eq!(hdr.flags, 0);
+                }
+                (
+                    1,
+                    EventPayload::AssertViolation {
+                        name_id,
+                        violation_count,
+                        details: b"hp=12 max=10",
+                    },
+                ) => {
+                    assert_eq!(name_id, 1);
+                    assert_eq!(violation_count, 1);
+                }
+                (
+                    2,
+                    EventPayload::NameIntern {
+                        name_id,
+                        name: b"room.ready",
+                    },
+                ) => {
+                    assert_eq!(name_id, 2);
+                    assert_eq!(hdr.flags, 0);
+                }
+                (3, EventPayload::Reachable { name_id }) => assert_eq!(name_id, 2),
+                (4, EventPayload::Beacon { beacon_id }) => assert_eq!(beacon_id, 9),
+                (
+                    5,
+                    EventPayload::LogLine {
+                        stream,
+                        level,
+                        msg: b"hello",
+                    },
+                ) => {
+                    assert_eq!(stream, detguest_wire::events::log_stream::SDK_USER);
+                    assert_eq!(level, LogLevel::Info as u8);
+                }
+                other => panic!("unexpected event at {index}: {other:?}"),
+            }
+        });
+        assert_eq!(seen, 6);
+    }
+
+    #[test]
+    fn declare_reachable_marks_name_intern_with_reachable_decl() {
+        let file = test_channel_file(ChannelHeader::canonical());
+        let mut state = test_state(&file);
+
+        state.declare_reachable("declared");
+
+        let mut seen = 0;
+        for_each_ring_w_event(&file, |index, hdr, payload| {
+            seen += 1;
+            match (index, payload) {
+                (
+                    0,
+                    EventPayload::NameIntern {
+                        name_id,
+                        name: b"declared",
+                    },
+                ) => {
+                    assert_eq!(name_id, 1);
+                    assert_eq!(hdr.flags & FLAG_REACHABLE_DECL, FLAG_REACHABLE_DECL);
+                }
+                other => panic!("unexpected event at {index}: {other:?}"),
+            }
+        });
+        assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn log_line_truncates_at_wire_cap() {
+        let file = test_channel_file(ChannelHeader::canonical());
+        let mut state = test_state(&file);
+        let msg = "x".repeat(MAX_LOG_MSG + 1);
+
+        state.log_line(LogLevel::Info, &msg);
+
+        let mut seen = 0;
+        for_each_ring_w_event(&file, |index, hdr, payload| {
+            seen += 1;
+            match (index, payload) {
+                (0, EventPayload::LogLine { msg, .. }) => {
+                    assert_eq!(msg.len(), MAX_LOG_MSG);
+                    assert_eq!(hdr.flags & FLAG_TRUNCATED, FLAG_TRUNCATED);
+                }
+                other => panic!("unexpected event at {index}: {other:?}"),
+            }
+        });
+        assert_eq!(seen, 1);
+    }
+
+    #[test]
     fn frame_mark_publishes_record_before_frame_counter_write() {
         let file = test_channel_file(ChannelHeader::canonical());
-        let channel = channel::MappedChannel::map(file.as_raw_fd()).unwrap();
         let words = test_pvpad_words();
         let words_ptr = words.as_mut_ptr();
         let pio = pio::PioState::for_test_with_pvpad(words);
-        let mut state = SdkState {
-            _channel: channel,
-            _pio: pio,
-            intern: intern::InternTable::default(),
-            beacons: beacons::BeaconCounters::default(),
-            stats: StatsState::default(),
-            frame_index: 0,
-        };
+        let mut state = test_state(&file);
+        state._pio = pio;
 
         state.frame_mark();
 
