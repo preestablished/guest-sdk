@@ -97,6 +97,7 @@ fn artifacts() -> &'static Artifacts {
             )
             .unwrap();
             std::fs::copy(musl.join("print-lines"), dir.join("opt/print-lines")).unwrap();
+            std::fs::copy(musl.join("testload"), dir.join("opt/testload")).unwrap();
             std::fs::write(dir.join("etc/detguest/boot.toml"), boot_toml).unwrap();
             run(
                 &root,
@@ -119,6 +120,10 @@ exec = \"/opt/autostart-trivial\"
 [[unit]]
 id = 1
 exec = \"/opt/print-lines\"
+
+[[unit]]
+id = 2
+exec = \"/opt/testload\"
 ";
         Artifacts {
             bzimage: build.join("bzImage"),

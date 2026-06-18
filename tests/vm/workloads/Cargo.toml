@@ -18,5 +18,9 @@ path = "src/bin/autostart_trivial.rs"
 name = "print-lines"
 path = "src/bin/print_lines.rs"
 
+[[bin]]
+name = "testload"
+path = "src/bin/testload.rs"
+
 [dependencies]
 detguest-sdk = { path = "../../../crates/detguest-sdk" }
