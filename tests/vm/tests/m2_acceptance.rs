@@ -28,10 +28,13 @@ use std::process::Command as Proc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use detguest_host::OwnedPayload;
+use detguest_host::{GuestEvent, OwnedPayload};
 use detguest_vmtest::harness::{StopReason, VmConfig, VmHarness};
+use detguest_wire::events::log_stream;
 use detguest_wire::events::{Command, ShutdownMode};
 use detguest_wire::record::EventKind;
+
+const M3_TESTLOAD_EVENT_HASH: u64 = 0x3b0d_3ebc_93e4_ba51;
 
 fn gated() -> bool {
     if !detguest_vmtest::vm_tests_enabled() {
@@ -240,6 +243,75 @@ fn last_exit(o: &detguest_vmtest::harness::Observed) -> (i32, i32) {
         .unwrap()
 }
 
+fn m3_testload_event_lines(events: &[GuestEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| {
+            let ring = match e.ring {
+                detguest_wire::RingId::A => "A",
+                detguest_wire::RingId::W => "W",
+                _ => return None,
+            };
+            match &e.payload {
+                OwnedPayload::NameIntern {
+                    name_id,
+                    name,
+                    reachable_decl,
+                } if name.starts_with(b"testload.") => Some(format!(
+                    "{ring}:NameIntern:{}:{name_id}:{}",
+                    u8::from(*reachable_decl),
+                    String::from_utf8_lossy(name)
+                )),
+                OwnedPayload::AssertViolation {
+                    name_id,
+                    violation_count,
+                    details,
+                } => Some(format!(
+                    "{ring}:AssertViolation:{name_id}:{violation_count}:{}",
+                    String::from_utf8_lossy(details)
+                )),
+                OwnedPayload::Reachable { name_id } => Some(format!("{ring}:Reachable:{name_id}")),
+                OwnedPayload::Beacon { beacon_id } => Some(format!("{ring}:Beacon:{beacon_id}")),
+                OwnedPayload::LogLine { stream, level, msg }
+                    if *stream == log_stream::SDK_USER && msg.starts_with(b"testload:") =>
+                {
+                    Some(format!(
+                        "{ring}:LogLine:{stream}:{level}:{}",
+                        String::from_utf8_lossy(msg)
+                    ))
+                }
+                OwnedPayload::FrameMark { frame_index } => {
+                    Some(format!("{ring}:FrameMark:{frame_index}"))
+                }
+                OwnedPayload::WorkloadExited {
+                    exit_code,
+                    term_signal,
+                    ..
+                } if *exit_code == 0 && *term_signal == 0 => {
+                    Some(format!("{ring}:WorkloadExited:{exit_code}:{term_signal}"))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn fnv1a64_lines(lines: &[String]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for line in lines {
+        for byte in line
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain(std::iter::once(b'\n'))
+        {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
+}
+
 #[test]
 #[ignore = "KVM tier: Intel runner only (DETGUEST_VM_TESTS=1)"]
 fn boots_to_hello_and_ready_within_one_guest_second() {
@@ -434,6 +506,26 @@ fn testload_spam_logs_reports_ring_w_drops() {
         "LogLine drops expected"
     );
     assert_eq!(last_exit(&vm.observed), (0, 0), "testload exits cleanly");
+}
+
+#[test]
+#[ignore = "KVM tier: Intel runner only (DETGUEST_VM_TESTS=1)"]
+fn testload_m3_event_stream_hash_matches_golden() {
+    if !gated() {
+        return;
+    }
+    let mut vm = boot_noauto_to_ready();
+
+    start_unit_and_wait_exit(&mut vm, 2, Duration::from_secs(60));
+
+    let lines = m3_testload_event_lines(&vm.observed.events);
+    let hash = fnv1a64_lines(&lines);
+    assert_eq!(
+        hash,
+        M3_TESTLOAD_EVENT_HASH,
+        "normalized M3 stream:\n{}",
+        lines.join("\n")
+    );
 }
 
 #[test]
