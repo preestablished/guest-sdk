@@ -8,3 +8,4 @@ license.workspace = true
 
 [dependencies]
 detguest-wire = { path = "../detguest-wire" }
+libc = "0.2"

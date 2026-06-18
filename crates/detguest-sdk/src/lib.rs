@@ -6,7 +6,7 @@
 //! channel mapping and event production are implemented by the follow-on M3
 //! beads.
 
-use std::{fmt, io};
+use std::{fmt, io, sync::OnceLock};
 
 pub use detguest_wire::FaultDecision;
 
@@ -29,8 +29,16 @@ pub const ASSERT_REPEAT_LIMIT: u32 = 16;
 /// Opaque SDK handle returned by [`init`] once platform initialization succeeds.
 #[derive(Debug)]
 pub struct Sdk {
-    _private: (),
+    _state: std::sync::Mutex<SdkState>,
 }
+
+#[derive(Debug)]
+struct SdkState {
+    _channel: channel::MappedChannel,
+    _pio: pio::PioState,
+}
+
+static SDK: OnceLock<Sdk> = OnceLock::new();
 
 /// Errors from one-time SDK initialization.
 #[derive(Debug)]
@@ -85,22 +93,40 @@ impl std::error::Error for InitError {
 /// One-time initialization.
 ///
 /// Without `DETGUEST_CHANNEL_FD`, returns [`InitError::NoChannel`] and the rest
-/// of the SDK API stays in deterministic standalone mode. The channel mapping
-/// implementation is intentionally left for `guest-sdk-m3-sdk-channel-init`.
+/// of the SDK API stays in deterministic standalone mode.
 pub fn init() -> Result<&'static Sdk, InitError> {
-    init_from_channel_fd(std::env::var_os(channel::DETGUEST_CHANNEL_FD_ENV).as_deref())
+    init_from_channel_fd(
+        std::env::var_os(channel::DETGUEST_CHANNEL_FD_ENV).as_deref(),
+        &SDK,
+        pio::init,
+    )
 }
 
-fn init_from_channel_fd(raw: Option<&std::ffi::OsStr>) -> Result<&'static Sdk, InitError> {
+fn init_from_channel_fd<'a>(
+    raw: Option<&std::ffi::OsStr>,
+    cell: &'a OnceLock<Sdk>,
+    init_pio: fn() -> Result<pio::PioState, InitError>,
+) -> Result<&'a Sdk, InitError> {
+    if let Some(sdk) = cell.get() {
+        return Ok(sdk);
+    }
     let Some(raw) = raw else {
         return Err(InitError::NoChannel);
     };
     let fd = channel::parse_channel_fd(raw).map_err(InitError::AgentSocket)?;
-    let _ = fd;
-    Err(InitError::AgentSocket(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "detguest-sdk channel mapping is not implemented in this scaffold",
-    )))
+    let channel = channel::MappedChannel::map(fd)?;
+    let pio = init_pio()?;
+    channel.mark_workload_attached();
+    let sdk = Sdk {
+        _state: std::sync::Mutex::new(SdkState {
+            _channel: channel,
+            _pio: pio,
+        }),
+    };
+    match cell.set(sdk) {
+        Ok(()) => Ok(cell.get().expect("SDK set succeeded")),
+        Err(_) => Ok(cell.get().expect("SDK initialized concurrently")),
+    }
 }
 
 /// Record a finding if `cond` is false.
@@ -235,17 +261,98 @@ pub unsafe fn register_region(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use detguest_wire::header::{
+        ChannelHeader, FLAG_WORKLOAD_ATTACHED, OFF_HEADER_FLAGS, PROTO_VERSION,
+    };
+    use std::{
+        fs::File,
+        io,
+        os::fd::{AsRawFd, FromRawFd},
+        os::unix::fs::FileExt,
+        sync::OnceLock,
+    };
+
+    fn fake_pio() -> Result<pio::PioState, InitError> {
+        Ok(pio::PioState::for_test())
+    }
+
+    fn test_channel_file(header: ChannelHeader) -> File {
+        let name = std::ffi::CString::new("detguest-sdk-test").unwrap();
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(
+            fd >= 0,
+            "memfd_create failed: {}",
+            io::Error::last_os_error()
+        );
+        let file = unsafe { File::from_raw_fd(fd) };
+        file.set_len(detguest_wire::header::CHANNEL_SIZE as u64)
+            .unwrap();
+        let mut bytes = [0u8; detguest_wire::header::OFF_RESERVED];
+        header.write_to(&mut bytes).unwrap();
+        file.write_all_at(&bytes, 0).unwrap();
+        file
+    }
+
+    fn init_for_test<'a>(file: &File, cell: &'a OnceLock<Sdk>) -> Result<&'a Sdk, InitError> {
+        let raw = file.as_raw_fd().to_string();
+        init_from_channel_fd(Some(std::ffi::OsStr::new(&raw)), cell, fake_pio)
+    }
 
     #[test]
     fn init_without_channel_fd_reports_no_channel() {
-        let err = init_from_channel_fd(None).unwrap_err();
+        let cell = OnceLock::new();
+        let err = init_from_channel_fd(None, &cell, fake_pio).unwrap_err();
         assert!(matches!(err, InitError::NoChannel));
     }
 
     #[test]
     fn init_with_bad_fd_is_deterministic_error() {
-        let err = init_from_channel_fd(Some(std::ffi::OsStr::new("not-an-fd"))).unwrap_err();
+        let cell = OnceLock::new();
+        let err = init_from_channel_fd(Some(std::ffi::OsStr::new("not-an-fd")), &cell, fake_pio)
+            .unwrap_err();
         assert!(matches!(err, InitError::AgentSocket(_)));
+    }
+
+    #[test]
+    fn bad_header_magic_is_reported_before_pio_setup() {
+        let mut header = ChannelHeader::canonical();
+        header.magic ^= 1;
+        let file = test_channel_file(header);
+        let cell = OnceLock::new();
+        let err = init_for_test(&file, &cell).unwrap_err();
+        assert!(matches!(
+            err,
+            InitError::BadChannelHeader { found_magic } if found_magic == header.magic
+        ));
+    }
+
+    #[test]
+    fn protocol_version_mismatch_is_reported() {
+        let mut header = ChannelHeader::canonical();
+        header.proto_version = PROTO_VERSION + 1;
+        let file = test_channel_file(header);
+        let cell = OnceLock::new();
+        let err = init_for_test(&file, &cell).unwrap_err();
+        assert!(matches!(
+            err,
+            InitError::ProtocolVersionMismatch { guest, channel }
+                if guest == PROTO_VERSION && channel == header.proto_version
+        ));
+    }
+
+    #[test]
+    fn valid_init_sets_workload_attached_and_is_idempotent() {
+        let file = test_channel_file(ChannelHeader::canonical());
+        let cell = OnceLock::new();
+        let first = init_for_test(&file, &cell).unwrap() as *const Sdk;
+        let second = init_from_channel_fd(None, &cell, fake_pio).unwrap() as *const Sdk;
+        assert_eq!(first, second);
+
+        let mut flags = [0u8; 4];
+        file.read_exact_at(&mut flags, OFF_HEADER_FLAGS as u64)
+            .unwrap();
+        let flags = u32::from_le_bytes(flags);
+        assert_eq!(flags & FLAG_WORKLOAD_ATTACHED, FLAG_WORKLOAD_ATTACHED);
     }
 
     #[test]
