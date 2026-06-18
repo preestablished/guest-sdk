@@ -219,7 +219,11 @@ pub fn frame_mark() {
 }
 
 /// Cooperative quiesce point.
-pub fn quiesce_check() {}
+pub fn quiesce_check() {
+    if let Some(mut state) = sdk_state() {
+        state.quiesce_check();
+    }
+}
 
 /// Structured SDK user log level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,6 +397,39 @@ impl SdkState {
             .emit_w_event(0, 0, &ev, channel::EventClass::Droppable);
     }
 
+    fn quiesce_check(&mut self) {
+        loop {
+            match self._channel.poll_workload_ctrl() {
+                Ok(Some(detguest_wire::WorkloadCtrl::QuiesceReq { token })) => {
+                    self.park_until_resume(token);
+                }
+                Ok(Some(detguest_wire::WorkloadCtrl::Resume { .. })) => {}
+                Ok(None) | Err(_) => return,
+            }
+        }
+    }
+
+    fn park_until_resume(&mut self, token: u64) {
+        let ev = detguest_wire::events::EventPayload::QuiesceReady { token };
+        if self
+            ._channel
+            .emit_w_event_with_doorbell(0, 0, &ev, channel::EventClass::Critical)
+            .is_err()
+        {
+            return;
+        }
+        loop {
+            match self._channel.poll_workload_ctrl() {
+                Ok(Some(detguest_wire::WorkloadCtrl::Resume { token: t })) if t == token => {
+                    return;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => std::hint::spin_loop(),
+                Err(_) => return,
+            }
+        }
+    }
+
     fn frame_mark(&mut self) {
         self.frame_index = self.frame_index.wrapping_add(1);
         let frame_index = self.frame_index;
@@ -407,12 +444,17 @@ impl SdkState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use detguest_wire::events::{decode_event, encoded_event_len, EventPayload, MAX_LOG_MSG};
-    use detguest_wire::header::{
-        ChannelHeader, FLAG_WORKLOAD_ATTACHED, OFF_HEADER_FLAGS, OFF_RING_W_DATA, OFF_RING_W_PROD,
-        PROTO_VERSION,
+    use detguest_wire::events::{
+        decode_event, encode_workload_ctrl, encoded_event_len, EventPayload, WorkloadCtrl,
+        MAX_LOG_MSG,
     };
-    use detguest_wire::record::{RecordHeader, FLAG_REACHABLE_DECL, FLAG_TRUNCATED};
+    use detguest_wire::header::{
+        ChannelHeader, FLAG_WORKLOAD_ATTACHED, OFF_HEADER_FLAGS, OFF_RING_I_CONS, OFF_RING_I_DATA,
+        OFF_RING_I_PROD, OFF_RING_W_DATA, OFF_RING_W_PROD, PROTO_VERSION,
+    };
+    use detguest_wire::record::{
+        RecordHeader, FLAG_REACHABLE_DECL, FLAG_TRUNCATED, MAX_RECORD_LEN,
+    };
     use std::{
         fs::File,
         io,
@@ -483,6 +525,19 @@ mod tests {
     fn init_for_test<'a>(file: &File, cell: &'a OnceLock<Sdk>) -> Result<&'a Sdk, InitError> {
         let raw = file.as_raw_fd().to_string();
         init_from_channel_fd(Some(std::ffi::OsStr::new(&raw)), cell, fake_pio)
+    }
+
+    fn write_ring_i_controls(file: &File, controls: &[WorkloadCtrl]) {
+        let mut at = 0usize;
+        let mut scratch = [0u8; MAX_RECORD_LEN];
+        for (seq, rec) in controls.iter().enumerate() {
+            let len = encode_workload_ctrl(&mut scratch, seq as u32, 0, rec).unwrap();
+            file.write_all_at(&scratch[..len], (OFF_RING_I_DATA + at) as u64)
+                .unwrap();
+            at += len;
+        }
+        file.write_all_at(&(at as u32).to_le_bytes(), OFF_RING_I_PROD as u64)
+            .unwrap();
     }
 
     #[test]
@@ -683,6 +738,38 @@ mod tests {
             }
         });
         assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn quiesce_check_emits_ready_and_waits_for_matching_resume() {
+        let file = test_channel_file(ChannelHeader::canonical());
+        write_ring_i_controls(
+            &file,
+            &[
+                WorkloadCtrl::QuiesceReq { token: 0xAA },
+                WorkloadCtrl::Resume { token: 0xBB },
+                WorkloadCtrl::Resume { token: 0xAA },
+            ],
+        );
+        let mut state = test_state(&file);
+
+        state.quiesce_check();
+
+        let mut ready = Vec::new();
+        for_each_ring_w_event(&file, |_index, _hdr, payload| {
+            if let EventPayload::QuiesceReady { token } = payload {
+                ready.push(token);
+            }
+        });
+        assert_eq!(ready, vec![0xAA]);
+
+        let mut prod = [0u8; 4];
+        let mut cons = [0u8; 4];
+        file.read_exact_at(&mut prod, OFF_RING_I_PROD as u64)
+            .unwrap();
+        file.read_exact_at(&mut cons, OFF_RING_I_CONS as u64)
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(cons), u32::from_le_bytes(prod));
     }
 
     #[test]

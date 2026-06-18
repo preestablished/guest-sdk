@@ -1,6 +1,7 @@
 use std::{fs::OpenOptions, io, os::unix::fs::OpenOptionsExt, ptr::NonNull};
 
 use crate::InitError;
+#[cfg(not(test))]
 use detguest_wire::ports::{DOORBELL_RING_W, PORT_DOORBELL};
 
 const PV_PAD_BASE: libc::off_t = 0xD000_1000;
@@ -71,6 +72,12 @@ pub(crate) fn poll_input(port: u8) -> u32 {
 
 pub(crate) fn frame_mark() {}
 
+#[cfg(test)]
+pub(crate) fn doorbell_w() -> Result<(), InitError> {
+    Ok(())
+}
+
+#[cfg(not(test))]
 pub(crate) fn doorbell_w() -> Result<(), InitError> {
     detcall_out(PORT_DOORBELL, DOORBELL_RING_W)
 }
@@ -117,7 +124,7 @@ fn map_pv_pad() -> Result<MappedMmio, InitError> {
     })
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(not(test), target_arch = "x86_64"))]
 fn detcall_out(port: u16, value: u32) -> Result<(), InitError> {
     unsafe {
         core::arch::asm!(
@@ -130,7 +137,7 @@ fn detcall_out(port: u16, value: u32) -> Result<(), InitError> {
     Ok(())
 }
 
-#[cfg(target_arch = "x86")]
+#[cfg(all(not(test), target_arch = "x86"))]
 fn detcall_out(port: u16, value: u32) -> Result<(), InitError> {
     unsafe {
         core::arch::asm!(
@@ -143,7 +150,7 @@ fn detcall_out(port: u16, value: u32) -> Result<(), InitError> {
     Ok(())
 }
 
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(not(test), not(any(target_arch = "x86", target_arch = "x86_64"))))]
 fn detcall_out(_port: u16, _value: u32) -> Result<(), InitError> {
     Err(InitError::PioPermissionDenied)
 }

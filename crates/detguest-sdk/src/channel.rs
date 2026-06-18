@@ -7,7 +7,7 @@ use std::{
 };
 
 use detguest_wire::{
-    events::{encode_event, encoded_event_len, EventPayload},
+    events::{decode_workload_ctrl, encode_event, encoded_event_len, EventPayload, WorkloadCtrl},
     header::{
         ChannelHeader, RingId, CHANNEL_MAGIC, CHANNEL_SIZE, FLAG_WORKLOAD_ATTACHED,
         OFF_HEADER_FLAGS, OFF_RING_W_DROPPED_BYTES, OFF_RING_W_DROPPED_BY_KIND,
@@ -82,7 +82,7 @@ unsafe impl Send for MappedPage {}
 pub(crate) struct MappedChannel {
     page: MappedPage,
     ring_w: RingW,
-    _ring_i: Consumer<'static>,
+    ring_i: Consumer<'static>,
 }
 
 unsafe impl Send for MappedChannel {}
@@ -116,7 +116,7 @@ impl MappedChannel {
         Ok(MappedChannel {
             page,
             ring_w: producer_w,
-            _ring_i: consumer_i,
+            ring_i: consumer_i,
         })
     }
 
@@ -133,6 +133,21 @@ impl MappedChannel {
     ) -> Result<(), InitError> {
         self.ring_w
             .emit(vnanos, extra_flags, ev, class, pio::doorbell_w)
+    }
+
+    pub(crate) fn emit_w_event_with_doorbell(
+        &mut self,
+        vnanos: u64,
+        extra_flags: u8,
+        ev: &EventPayload<'_>,
+        class: EventClass,
+    ) -> Result<(), InitError> {
+        self.emit_w_event(vnanos, extra_flags, ev, class)?;
+        pio::doorbell_w()
+    }
+
+    pub(crate) fn poll_workload_ctrl(&mut self) -> Result<Option<WorkloadCtrl>, InitError> {
+        poll_workload_ctrl(&mut self.ring_i)
     }
 }
 
@@ -222,6 +237,23 @@ fn push_event(
         .map(|_| ())
 }
 
+fn poll_workload_ctrl(consumer: &mut Consumer<'_>) -> Result<Option<WorkloadCtrl>, InitError> {
+    let mut scratch = [0u8; MAX_RECORD_LEN];
+    loop {
+        let Some(len) = consumer.pop_into(&mut scratch).map_err(map_decode_error)? else {
+            return Ok(None);
+        };
+        match decode_workload_ctrl(&scratch[..len]) {
+            Ok((_hdr, rec)) => return Ok(Some(rec)),
+            // Pads and future/reserved workload-control kinds are still
+            // consumed. Ring I has no pad-input namespace; unknown records are
+            // ignored so old SDKs can coexist with future controls.
+            Err(DecodeError::UnknownKind(_)) => continue,
+            Err(err) => return Err(map_decode_error(err)),
+        }
+    }
+}
+
 struct RingWDropCounters {
     channel: NonNull<u8>,
 }
@@ -296,8 +328,12 @@ fn set_workload_attached(ptr: *mut u8) {
 mod tests {
     use super::*;
     use detguest_wire::{
-        events::decode_event,
-        header::{OFF_RESERVED, OFF_RING_W_CONS, OFF_RING_W_DATA, OFF_RING_W_PROD},
+        events::{decode_event, encode_workload_ctrl},
+        header::{
+            OFF_RESERVED, OFF_RING_I_CONS, OFF_RING_I_DATA, OFF_RING_I_PROD, OFF_RING_W_CONS,
+            OFF_RING_W_DATA, OFF_RING_W_PROD,
+        },
+        record::{record_len, RecordHeader},
     };
 
     fn test_page() -> &'static mut [u8] {
@@ -310,6 +346,31 @@ mod tests {
 
     fn test_ring_w(ptr: *mut u8) -> RingW {
         unsafe { RingW::from_raw(ptr, RingId::W.canonical_desc(), 0) }
+    }
+
+    fn test_ring_i_producer(ptr: *mut u8) -> Producer<'static> {
+        let desc = RingId::I.canonical_desc();
+        unsafe {
+            Producer::from_raw(
+                ptr.add(desc.offset as usize),
+                desc.size,
+                ptr.add(OFF_RING_I_PROD).cast::<u32>(),
+                ptr.add(OFF_RING_I_CONS).cast::<u32>(),
+                0,
+            )
+        }
+    }
+
+    fn test_ring_i_consumer(ptr: *mut u8) -> Consumer<'static> {
+        let desc = RingId::I.canonical_desc();
+        unsafe {
+            Consumer::from_raw(
+                ptr.add(desc.offset as usize),
+                desc.size,
+                ptr.add(OFF_RING_I_PROD).cast::<u32>(),
+                ptr.add(OFF_RING_I_CONS).cast::<u32>(),
+            )
+        }
     }
 
     fn atomic_u32(ptr: *mut u8, offset: usize) -> &'static AtomicU32 {
@@ -333,6 +394,55 @@ mod tests {
 
     fn load_counter(ptr: *mut u8, offset: usize) -> u64 {
         atomic_u64(ptr, offset).load(Ordering::Relaxed)
+    }
+
+    fn push_workload_ctrl(producer: &mut Producer<'_>, rec: &WorkloadCtrl) {
+        producer
+            .try_push(record_len(8), |buf, seq| {
+                encode_workload_ctrl(buf, seq, 0, rec)
+            })
+            .unwrap();
+    }
+
+    fn push_unknown_workload_ctrl(producer: &mut Producer<'_>, kind: u8) {
+        producer
+            .try_push(record_len(8), |buf, seq| {
+                let len = record_len(8);
+                RecordHeader {
+                    len: len as u16,
+                    kind,
+                    flags: 0,
+                    seq,
+                    vnanos: 0,
+                }
+                .write_to(buf)
+                .unwrap();
+                buf[detguest_wire::record::RECORD_HEADER_LEN..len].fill(0);
+                Ok::<usize, detguest_wire::EncodeError>(len)
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn poll_workload_ctrl_skips_reserved_kind_and_decodes_next() {
+        let page = test_page();
+        let ptr = page.as_mut_ptr();
+        let mut producer = test_ring_i_producer(ptr);
+        let mut consumer = test_ring_i_consumer(ptr);
+
+        push_unknown_workload_ctrl(&mut producer, 1);
+        push_workload_ctrl(&mut producer, &WorkloadCtrl::QuiesceReq { token: 99 });
+
+        assert_eq!(
+            poll_workload_ctrl(&mut consumer).unwrap(),
+            Some(WorkloadCtrl::QuiesceReq { token: 99 })
+        );
+        assert_eq!(poll_workload_ctrl(&mut consumer).unwrap(), None);
+        assert_eq!(
+            atomic_u32(ptr, OFF_RING_I_CONS).load(Ordering::Acquire),
+            atomic_u32(ptr, OFF_RING_I_PROD).load(Ordering::Acquire)
+        );
+        assert_eq!(page[OFF_RING_I_DATA + 2], 1);
     }
 
     #[test]
