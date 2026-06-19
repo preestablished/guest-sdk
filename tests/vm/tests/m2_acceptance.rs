@@ -102,6 +102,11 @@ fn artifacts() -> &'static Artifacts {
             .unwrap();
             std::fs::copy(musl.join("print-lines"), dir.join("opt/print-lines")).unwrap();
             std::fs::copy(musl.join("testload"), dir.join("opt/testload")).unwrap();
+            std::fs::copy(
+                musl.join("m9-refwork-contract"),
+                dir.join("opt/m9-refwork-contract"),
+            )
+            .unwrap();
             std::fs::write(dir.join("etc/detguest/boot.toml"), boot_toml).unwrap();
             run(
                 &root,

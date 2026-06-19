@@ -1,0 +1,31 @@
+# M9 reference-workload contract fixture.
+#
+# Staged into the initramfs as /etc/detguest/boot.toml. The agent must drive
+# the refwork-ctl control leg before Ready and withhold Ready until the
+# expected regions below are live in the detchannel manifest.
+boot_toml_version = 1
+
+[autostart]
+unit = 0
+
+[[unit]]
+id = 0
+exec = "/opt/m9-refwork-contract"
+log_mask = 0x1F
+
+[unit.control]
+protocol = "refwork-ctl"
+proto_version = 1
+game_dev = "/dev/vdb"
+
+[[expected_region]]
+name = "wram"
+layout_version = 1
+
+[[expected_region]]
+name = "framebuffer"
+layout_version = 1
+
+[[expected_region]]
+name = "meta"
+layout_version = 1

@@ -22,5 +22,9 @@ path = "src/bin/print_lines.rs"
 name = "testload"
 path = "src/bin/testload.rs"
 
+[[bin]]
+name = "m9-refwork-contract"
+path = "src/bin/m9_refwork_contract.rs"
+
 [dependencies]
 detguest-sdk = { path = "../../../crates/detguest-sdk" }

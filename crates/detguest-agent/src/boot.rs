@@ -694,4 +694,22 @@ layout_version = 1
         assert_eq!(c.game_dev.as_deref(), Some("/dev/vdb"));
         assert_eq!(m.expected_regions.len(), 3);
     }
+
+    #[test]
+    fn committed_m9_refwork_contract_manifest_parses() {
+        let m = parse(include_str!("../../../image/boot.toml.m9-refwork-contract")).unwrap();
+        assert_eq!(m.autostart_unit, Some(0));
+        let unit = m.unit(0).unwrap();
+        assert_eq!(unit.exec, "/opt/m9-refwork-contract");
+        let control = unit.control.as_ref().unwrap();
+        assert_eq!(control.protocol, "refwork-ctl");
+        assert_eq!(control.proto_version, 1);
+        assert_eq!(control.game_dev.as_deref(), Some("/dev/vdb"));
+        let regions: Vec<_> = m
+            .expected_regions
+            .iter()
+            .map(|region| (region.name.as_str(), region.layout_version))
+            .collect();
+        assert_eq!(regions, vec![("wram", 1), ("framebuffer", 1), ("meta", 1)]);
+    }
 }
