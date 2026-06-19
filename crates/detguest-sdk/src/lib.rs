@@ -6,7 +6,11 @@
 //! channel mapping and event production are implemented by the follow-on M3
 //! beads.
 
-use std::{fmt, io, sync::OnceLock};
+use std::{
+    fmt, io,
+    sync::atomic::{AtomicU64, Ordering},
+    sync::OnceLock,
+};
 
 pub use detguest_wire::FaultDecision;
 
@@ -52,18 +56,10 @@ struct StatsState {
 }
 
 static SDK: OnceLock<Sdk> = OnceLock::new();
+static EVENT_VNANOS: AtomicU64 = AtomicU64::new(1);
 
 fn vnanos() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) };
-    if rc == 0 {
-        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-    } else {
-        0
-    }
+    EVENT_VNANOS.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Errors from one-time SDK initialization.
@@ -980,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn sdk_events_carry_monotonic_raw_vnanos() {
+    fn sdk_events_carry_deterministic_monotonic_vnanos() {
         let file = test_channel_file(ChannelHeader::canonical());
         let mut state = test_state(&file);
 
@@ -993,7 +989,7 @@ mod tests {
         });
         assert_eq!(vnanos.len(), 2);
         assert!(vnanos.iter().all(|v| *v > 0), "{vnanos:?}");
-        assert!(vnanos[1] >= vnanos[0], "{vnanos:?}");
+        assert!(vnanos[1] > vnanos[0], "{vnanos:?}");
     }
 
     #[test]

@@ -10,6 +10,7 @@
 
 use std::io;
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use detguest_wire::events::{log_stream, EventPayload};
 use detguest_wire::WorkloadCtrl;
@@ -83,9 +84,15 @@ pub struct ShutdownState {
     pub kill_deadline: u64,
 }
 
-/// Guest CLOCK_MONOTONIC_RAW ns (the `vnanos` source — virtualized,
-/// deterministic per ARCHITECTURE.md §7 rule 1).
+static EVENT_VNANOS: AtomicU64 = AtomicU64::new(1);
+
+/// Deterministic ring-record timestamp. The host also records the drain
+/// icount; this field must not depend on Linux wall-clock state.
 pub fn vnanos() -> u64 {
+    EVENT_VNANOS.fetch_add(1, Ordering::Relaxed)
+}
+
+fn monotonic_raw_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -501,7 +508,7 @@ impl Supervisor {
             // Shutdown progress (virtual-time deadline).
             if let Some(s) = &self.shutdown {
                 match &self.workload {
-                    Some(w) if vnanos() >= s.kill_deadline => {
+                    Some(w) if monotonic_raw_ns() >= s.kill_deadline => {
                         // SAFETY: SIGKILL the supervised child; reap follows
                         // via SIGCHLD.
                         unsafe { libc::kill(w.pid, libc::SIGKILL) };
@@ -530,7 +537,7 @@ impl Supervisor {
                 // SAFETY: SIGTERM the supervised child.
                 unsafe { libc::kill(w.pid, libc::SIGTERM) };
                 self.shutdown = Some(ShutdownState {
-                    kill_deadline: vnanos() + 2_000_000_000,
+                    kill_deadline: monotonic_raw_ns() + 2_000_000_000,
                 });
             }
             None => self.shutdown = Some(ShutdownState { kill_deadline: 0 }),

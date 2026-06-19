@@ -1,0 +1,18 @@
+diff --git a/arch/x86/include/asm/timex.h b/arch/x86/include/asm/timex.h
+index 2389359d055e..f7691c119365 100644
+--- a/arch/x86/include/asm/timex.h
++++ b/arch/x86/include/asm/timex.h
+@@ -8,10 +8,12 @@ static inline unsigned long random_get_entropy(void)
+ {
+-	if (!IS_ENABLED(CONFIG_X86_TSC) &&
+-	    !cpu_feature_enabled(X86_FEATURE_TSC))
+-		return random_get_entropy_fallback();
+-	return rdtsc();
++	/*
++	 * The deterministic fixture hides TSC from CPUID, but CONFIG_X86_TSC
++	 * still makes upstream Linux sample RDTSC for entropy. KVM cannot make
++	 * that instruction-count deterministic, so use a fixed synthetic sample.
++	 */
++	return 0xd370d370UL;
+ }
+ #define random_get_entropy random_get_entropy

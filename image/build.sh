@@ -9,7 +9,7 @@
 #
 # The kernel pin (version + tarball SHA256) lives in image/KERNEL.md and is
 # duplicated here as the single source the script executes; bump both
-# together. Rebuilds are skipped when version+config are unchanged
+# together. Rebuilds are skipped when version+config+patches are unchanged
 # (build/.kernel-build-key). The kernel CMDLINE is not set here — owned by
 # determinism-hypervisor (see image/KERNEL.md).
 #
@@ -38,6 +38,7 @@ REQUIRED_SET=(
   "# CONFIG_SWAP is not set"
   "# CONFIG_RANDOMIZE_BASE is not set"
   "# CONFIG_RANDOMIZE_MEMORY is not set"
+  "# CONFIG_RANDOMIZE_KSTACK_OFFSET is not set"
   "# CONFIG_RELOCATABLE is not set"
   "# CONFIG_STRICT_DEVMEM is not set"
   "# CONFIG_NO_HZ_IDLE is not set"
@@ -71,6 +72,7 @@ REQUIRED_SET=(
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD="${SCRIPT_DIR}/build"
 SRC="${BUILD}/linux-${KERNEL_VERSION}"
+PATCH_DIR="${SCRIPT_DIR}/patches"
 NPROC="$(nproc)"
 DOCKER_IMAGE=ubuntu:24.04
 
@@ -88,7 +90,14 @@ have_native_toolchain() {
 # container — every path a containerized command touches must live there.
 run_build() {
   if have_native_toolchain; then
-    (cd "$SRC" && "$@")
+    (
+      cd "$SRC"
+      KBUILD_BUILD_TIMESTAMP="Thu Jan 1 00:00:00 UTC 1970" \
+        KBUILD_BUILD_USER=detguest \
+        KBUILD_BUILD_HOST=detguest \
+        KBUILD_BUILD_VERSION=1 \
+        "$@"
+    )
   else
     local img=detguest-kernel-build:24.04
     if ! docker image inspect "$img" >/dev/null 2>&1; then
@@ -103,7 +112,12 @@ run_build() {
       docker rm detguest-kbuild-tmp >/dev/null
     fi
     docker run --rm -v "${BUILD}:${BUILD}" -w "$SRC" \
-      -e HOME=/tmp -u "$(id -u):$(id -g)" "$img" "$@"
+      -e HOME=/tmp \
+      -e KBUILD_BUILD_TIMESTAMP="Thu Jan 1 00:00:00 UTC 1970" \
+      -e KBUILD_BUILD_USER=detguest \
+      -e KBUILD_BUILD_HOST=detguest \
+      -e KBUILD_BUILD_VERSION=1 \
+      -u "$(id -u):$(id -g)" "$img" "$@"
   fi
 }
 
@@ -122,10 +136,39 @@ fetch_kernel() {
   fi
 }
 
+kernel_patch_bytes() {
+  if [[ -d "$PATCH_DIR" ]]; then
+    find "$PATCH_DIR" -type f -name '*.patch' -print0 \
+      | LC_ALL=C sort -z \
+      | xargs -0r cat
+  fi
+}
+
+apply_kernel_patches() {
+  [[ -d "$PATCH_DIR" ]] || return 0
+  while IFS= read -r -d '' patch_file; do
+    local marker="${SRC}/.applied-$(basename "$patch_file").sha256"
+    local patch_hash
+    patch_hash="$(sha256sum "$patch_file" | cut -d' ' -f1)"
+    if [[ -f "$marker" && "$(cat "$marker")" == "$patch_hash" ]]; then
+      continue
+    fi
+    if patch -d "$SRC" -p1 --forward --batch --dry-run < "$patch_file" >/dev/null; then
+      log "applying kernel patch $(basename "$patch_file")"
+      patch -d "$SRC" -p1 --forward --batch < "$patch_file"
+    elif patch -d "$SRC" -p1 --reverse --batch --dry-run < "$patch_file" >/dev/null; then
+      log "kernel patch already applied: $(basename "$patch_file")"
+    else
+      die "kernel patch does not apply cleanly: $(basename "$patch_file")"
+    fi
+    echo "$patch_hash" > "$marker"
+  done < <(find "$PATCH_DIR" -type f -name '*.patch' -print0 | LC_ALL=C sort -z)
+}
+
 build_key() {
-  # Covers everything that shapes bzImage: the pin, the fragment, and this
-  # script itself (the config pipeline lives here).
-  { echo "$KERNEL_VERSION"; cat "${SCRIPT_DIR}/kernel.config" "${BASH_SOURCE[0]}"; } \
+  # Covers everything that shapes bzImage: the pin, the fragment, source
+  # patches, and this script itself (the config pipeline lives here).
+  { echo "$KERNEL_VERSION"; cat "${SCRIPT_DIR}/kernel.config"; kernel_patch_bytes; cat "${BASH_SOURCE[0]}"; } \
     | sha256sum | cut -d' ' -f1
 }
 
@@ -137,6 +180,7 @@ write_kernel_provenance() {
     echo "kernel_url=${KERNEL_URL}"
     echo "kernel_tarball_sha256=${KERNEL_SHA256}"
     echo "kernel_config_fragment_sha256=$(sha256sum "${SCRIPT_DIR}/kernel.config" | cut -d' ' -f1)"
+    echo "kernel_patches_sha256=$({ kernel_patch_bytes; } | sha256sum | cut -d' ' -f1)"
     echo "build_script_sha256=$(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)"
     echo "final_config_sha256=$(sha256sum "$final_config" | cut -d' ' -f1)"
     echo "build_key=$(build_key)"
@@ -173,6 +217,7 @@ cmd_kernel() {
     return 0
   fi
   fetch_kernel
+  apply_kernel_patches
   log "configuring (tinyconfig + fragment + olddefconfig)"
   # The fragment must be under ${BUILD} to be visible inside the container.
   cp "${SCRIPT_DIR}/kernel.config" "${BUILD}/kernel.config.fragment"
