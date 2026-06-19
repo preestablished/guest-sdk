@@ -16,6 +16,7 @@ use detguest_wire::WorkloadCtrl;
 
 use crate::boot::{BootManifest, Unit};
 use crate::channel::AgentChannel;
+use crate::control;
 
 /// LogLine level used for workload stdout lines (2 = info).
 pub const STDOUT_LEVEL: u8 = 2;
@@ -97,7 +98,7 @@ pub fn vnanos() -> u64 {
 /// Spawn `unit` (StartWorkload / autostart shared path — ARCHITECTURE.md §4
 /// step 9 and §6: argv comes from the boot manifest, never the wire):
 /// stdout/stderr pipes, `DETGUEST_CHANNEL_FD`, `RLIMIT_MEMLOCK=∞`, exec.
-pub fn spawn(unit: &Unit, channel_fd: RawFd) -> io::Result<Workload> {
+pub fn spawn(unit: &Unit, channel_fd: RawFd, control_fd: Option<RawFd>) -> io::Result<Workload> {
     let mut out_pipe = [0i32; 2];
     let mut err_pipe = [0i32; 2];
     // SAFETY: libc pipe2/fork/exec sequence; the child only calls
@@ -121,19 +122,46 @@ pub fn spawn(unit: &Unit, channel_fd: RawFd) -> io::Result<Workload> {
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in arg"))?,
             );
         }
-        let env = std::ffi::CString::new(format!("DETGUEST_CHANNEL_FD={channel_fd}")).unwrap();
+        let mut child_channel_fd = channel_fd;
+        let dup_channel_fd = if control_fd.is_some() && channel_fd == control::child_fd_number() {
+            let fd = libc::fcntl(
+                channel_fd,
+                libc::F_DUPFD_CLOEXEC,
+                control::child_fd_number() + 1,
+            );
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            child_channel_fd = fd;
+            Some(fd)
+        } else {
+            None
+        };
+        let env =
+            std::ffi::CString::new(format!("DETGUEST_CHANNEL_FD={child_channel_fd}")).unwrap();
 
         let pid = libc::fork();
         if pid < 0 {
+            if let Some(fd) = dup_channel_fd {
+                libc::close(fd);
+            }
             return Err(io::Error::last_os_error());
         }
         if pid == 0 {
             // Child. dup2 clears O_CLOEXEC on the duplicated ends.
             libc::dup2(out_pipe[1], 1);
             libc::dup2(err_pipe[1], 2);
+            if let Some(fd) = control_fd {
+                if fd != control::child_fd_number() {
+                    libc::dup2(fd, control::child_fd_number());
+                } else {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                }
+            }
             // Channel fd: clear CLOEXEC so the workload inherits it.
-            let flags = libc::fcntl(channel_fd, libc::F_GETFD);
-            libc::fcntl(channel_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+            let flags = libc::fcntl(child_channel_fd, libc::F_GETFD);
+            libc::fcntl(child_channel_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
             // RLIMIT_MEMLOCK=∞ (mlock of published regions, API.md §1.5).
             let lim = libc::rlimit {
                 rlim_cur: libc::RLIM_INFINITY,
@@ -146,6 +174,9 @@ pub fn spawn(unit: &Unit, channel_fd: RawFd) -> io::Result<Workload> {
             let envp: [*const libc::c_char; 2] = [env.as_ptr(), std::ptr::null()];
             libc::execve(exec.as_ptr(), argv.as_ptr(), envp.as_ptr());
             libc::_exit(127);
+        }
+        if let Some(fd) = dup_channel_fd {
+            libc::close(fd);
         }
         // Parent: close child ends; make read ends non-blocking.
         libc::close(out_pipe[1]);
@@ -253,6 +284,14 @@ impl Supervisor {
     /// StartWorkload and boot autostart — the autostart path involves NO
     /// ring-C record, ARCHITECTURE.md §4 step 7).
     pub fn start_unit(&mut self, unit_id: u32) -> io::Result<()> {
+        self.start_unit_inner(unit_id, None)
+    }
+
+    pub fn start_unit_with_control(&mut self, unit_id: u32, control_fd: RawFd) -> io::Result<()> {
+        self.start_unit_inner(unit_id, Some(control_fd))
+    }
+
+    fn start_unit_inner(&mut self, unit_id: u32, control_fd: Option<RawFd>) -> io::Result<()> {
         if self.workload.is_some() {
             // v1 supervises exactly one workload; silently replacing it
             // would leak the old process and emit a lying WorkloadStarted.
@@ -267,7 +306,7 @@ impl Supervisor {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown unit id"))?
             .clone();
         self.log_mask = unit.log_mask;
-        let w = spawn(&unit, self.channel.fd())?;
+        let w = spawn(&unit, self.channel.fd(), control_fd)?;
         // SAFETY: registering the pipe fds with our epoll instance.
         unsafe {
             for (fd, tok) in [(w.stdout, TOK_OUT), (w.stderr, TOK_ERR)] {
@@ -600,7 +639,7 @@ mod tests {
         let channel_fd = memfd("detguest-agent-spawn-test");
         let script = "\
 printf 'fd=%s\\n' \"$DETGUEST_CHANNEL_FD\"
-if : <&\"$DETGUEST_CHANNEL_FD\"; then
+if [ -e \"/proc/$$/fd/$DETGUEST_CHANNEL_FD\" ]; then
   printf 'fd-open\\n'
 else
   printf 'fd-closed\\n'
@@ -617,7 +656,7 @@ printf 'stderr-still-works\\n' >&2
             control: None,
         };
 
-        let workload = spawn(&unit, channel_fd).expect("spawn shell workload");
+        let workload = spawn(&unit, channel_fd, None).expect("spawn shell workload");
         let status = wait_for(workload.pid);
         let stdout = read_fd_to_string(workload.stdout);
         let stderr = read_fd_to_string(workload.stderr);

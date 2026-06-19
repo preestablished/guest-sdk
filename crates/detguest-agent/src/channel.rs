@@ -15,7 +15,7 @@ use detguest_wire::events::{encode_event, encoded_event_len, EventPayload};
 use detguest_wire::header::{
     self, ChannelHeader, CHANNEL_SIZE, FLAG_AGENT_READY, OFF_MANIFEST, OFF_RESERVED,
 };
-use detguest_wire::manifest::{init_manifest, MANIFEST_TOTAL_SIZE};
+use detguest_wire::manifest::{init_manifest, read_generation, MANIFEST_TOTAL_SIZE};
 use detguest_wire::record::EventKind;
 use detguest_wire::ring::{self, Consumer, Producer, RingFull};
 use detguest_wire::{ports, RingId};
@@ -149,6 +149,37 @@ impl AgentChannel {
     /// The mapped base (for pagemap translation of the channel GPA).
     pub fn base_ptr(&self) -> *const u8 {
         self.base
+    }
+
+    pub(crate) fn manifest(&self) -> &[u8] {
+        // SAFETY: in-bounds manifest area within the live channel mapping.
+        unsafe { std::slice::from_raw_parts(self.base.add(OFF_MANIFEST), MANIFEST_TOTAL_SIZE) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn manifest_mut(&mut self) -> &mut [u8] {
+        // SAFETY: in-bounds manifest area; tests and the SDK are the only
+        // writers after init, and production uses this only for snapshots.
+        unsafe { std::slice::from_raw_parts_mut(self.base.add(OFF_MANIFEST), MANIFEST_TOTAL_SIZE) }
+    }
+
+    pub(crate) fn copy_manifest_stable(&self) -> Result<Vec<u8>, detguest_wire::DecodeError> {
+        let manifest = self.manifest();
+        for _ in 0..1024 {
+            let before = read_generation(manifest)?;
+            if before % 2 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            let copy = manifest.to_vec();
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            let after = read_generation(manifest)?;
+            if before == after && after % 2 == 0 {
+                return Ok(copy);
+            }
+        }
+        Err(detguest_wire::DecodeError::BadField)
     }
 
     /// Set `header_flags.agent_ready` (ARCHITECTURE.md §4 step 6).

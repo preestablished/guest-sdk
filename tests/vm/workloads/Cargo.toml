@@ -28,3 +28,4 @@ path = "src/bin/m9_refwork_contract.rs"
 
 [dependencies]
 detguest-sdk = { path = "../../../crates/detguest-sdk" }
+libc = "0.2"

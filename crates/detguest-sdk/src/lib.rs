@@ -16,6 +16,7 @@ mod inject;
 mod intern;
 mod pio;
 mod regions;
+mod translate;
 
 pub use regions::{RegionError, RegionFlags, RegionHandle};
 
@@ -308,7 +309,11 @@ pub unsafe fn register_region(
     len: usize,
     flags: RegionFlags,
 ) -> Result<RegionHandle, RegionError> {
-    regions::register_region(name, layout_version, ptr, len, flags)
+    if let Some(mut state) = sdk_state() {
+        state.register_region(name, layout_version, ptr, len, flags)
+    } else {
+        regions::register_region(name, layout_version, ptr, len, flags)
+    }
 }
 
 fn sdk_state() -> Option<std::sync::MutexGuard<'static, SdkState>> {
@@ -341,6 +346,109 @@ impl SdkState {
             );
         }
         Some(interned.id)
+    }
+
+    unsafe fn register_region(
+        &mut self,
+        name: &'static str,
+        layout_version: u32,
+        ptr: *const u8,
+        len: usize,
+        flags: RegionFlags,
+    ) -> Result<RegionHandle, RegionError> {
+        regions::validate_region(name, ptr, len)?;
+        let extents = regions::pin_and_translate(ptr, len)?;
+        self.publish_region(name, layout_version, ptr, len, flags, &extents)
+    }
+
+    #[cfg(test)]
+    fn register_region_with_extents(
+        &mut self,
+        name: &'static str,
+        layout_version: u32,
+        ptr: *const u8,
+        len: usize,
+        flags: RegionFlags,
+        extents: &[detguest_wire::manifest::Extent],
+    ) -> Result<RegionHandle, RegionError> {
+        regions::validate_region(name, ptr, len)?;
+        self.publish_region(name, layout_version, ptr, len, flags, extents)
+    }
+
+    fn publish_region(
+        &mut self,
+        name: &'static str,
+        layout_version: u32,
+        ptr: *const u8,
+        len: usize,
+        flags: RegionFlags,
+        extents: &[detguest_wire::manifest::Extent],
+    ) -> Result<RegionHandle, RegionError> {
+        use detguest_wire::events::{EventPayload, RegionEvent};
+        use detguest_wire::manifest::{
+            writer_begin, writer_end, ManifestHeader, RegionEntry, EXTENT_CAPACITY, REGION_CAPACITY,
+        };
+
+        let name_id = self
+            .intern_name(name, 0)
+            .ok_or(RegionError::AgentUnavailable)?;
+        let packed_name =
+            RegionEntry::pack_name(name.as_bytes()).map_err(|_| RegionError::NameTooLong)?;
+        let manifest = self._channel.manifest_mut();
+        let mut hdr =
+            ManifestHeader::read_from(manifest).map_err(|_| RegionError::AgentUnavailable)?;
+        hdr.validate().map_err(|_| RegionError::AgentUnavailable)?;
+        if hdr.region_count as usize >= REGION_CAPACITY {
+            return Err(RegionError::ManifestFull);
+        }
+        if hdr.extent_count as usize + extents.len() > EXTENT_CAPACITY {
+            return Err(RegionError::TooManyExtents);
+        }
+
+        let region_id = hdr.region_count;
+        let extent_off = hdr.extent_count;
+        let odd_generation = writer_begin(manifest).map_err(|_| RegionError::AgentUnavailable)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        for (i, extent) in extents.iter().enumerate() {
+            extent
+                .write_to(manifest, extent_off as usize + i)
+                .expect("extent bounds checked before manifest write");
+        }
+        let entry = RegionEntry {
+            region_id,
+            name_id,
+            layout_version,
+            flags: flags.bits(),
+            gva: ptr as u64,
+            len: len as u64,
+            extent_off,
+            extent_n: extents.len() as u32,
+            name: packed_name,
+        };
+        entry
+            .write_to(manifest, region_id as usize)
+            .expect("region slot checked before manifest write");
+        hdr.generation = odd_generation;
+        hdr.region_count = hdr.region_count.saturating_add(1);
+        hdr.extent_count = hdr.extent_count.saturating_add(extents.len() as u32);
+        hdr.write_to(manifest)
+            .expect("manifest header bounds checked before manifest write");
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        let manifest_generation =
+            writer_end(manifest).map_err(|_| RegionError::AgentUnavailable)?;
+        let manifest_generation =
+            u32::try_from(manifest_generation).map_err(|_| RegionError::AgentUnavailable)?;
+
+        let ev = EventPayload::RegionRegister(RegionEvent {
+            region_id,
+            name_id,
+            layout_version,
+            manifest_generation,
+        });
+        self._channel
+            .emit_w_event_with_doorbell(vnanos(), 0, &ev, channel::EventClass::Critical)
+            .map_err(|_| RegionError::AgentUnavailable)?;
+        Ok(RegionHandle::new(region_id))
     }
 
     fn assert_always(&mut self, cond: bool, name: &'static str, details: fmt::Arguments<'_>) {
@@ -468,10 +576,13 @@ mod tests {
         MAX_LOG_MSG,
     };
     use detguest_wire::header::{
-        ChannelHeader, FLAG_WORKLOAD_ATTACHED, OFF_HEADER_FLAGS, OFF_RING_I_CONS, OFF_RING_I_DATA,
-        OFF_RING_I_PROD, OFF_RING_W_CONS, OFF_RING_W_DATA, OFF_RING_W_DROPPED_BYTES,
-        OFF_RING_W_DROPPED_BY_KIND, OFF_RING_W_DROPPED_RECORDS, OFF_RING_W_PROD, PROTO_VERSION,
-        RING_W_SIZE,
+        ChannelHeader, FLAG_WORKLOAD_ATTACHED, OFF_HEADER_FLAGS, OFF_MANIFEST, OFF_RING_I_CONS,
+        OFF_RING_I_DATA, OFF_RING_I_PROD, OFF_RING_W_CONS, OFF_RING_W_DATA,
+        OFF_RING_W_DROPPED_BYTES, OFF_RING_W_DROPPED_BY_KIND, OFF_RING_W_DROPPED_RECORDS,
+        OFF_RING_W_PROD, PROTO_VERSION, RING_W_SIZE,
+    };
+    use detguest_wire::manifest::{
+        init_manifest, Extent, ManifestHeader, RegionEntry, MANIFEST_TOTAL_SIZE,
     };
     use detguest_wire::record::{
         EventKind, RecordHeader, FLAG_REACHABLE_DECL, FLAG_TRUNCATED, MAX_RECORD_LEN,
@@ -506,6 +617,9 @@ mod tests {
         let mut bytes = [0u8; detguest_wire::header::OFF_RESERVED];
         header.write_to(&mut bytes).unwrap();
         file.write_all_at(&bytes, 0).unwrap();
+        let mut manifest = vec![0u8; MANIFEST_TOTAL_SIZE];
+        init_manifest(&mut manifest).unwrap();
+        file.write_all_at(&manifest, OFF_MANIFEST as u64).unwrap();
         file
     }
 
@@ -666,6 +780,88 @@ mod tests {
         .unwrap();
         assert_eq!(handle.region_id(), 0);
         handle.unregister();
+    }
+
+    #[test]
+    fn register_region_publishes_manifest_and_region_event() {
+        let file = test_channel_file(ChannelHeader::canonical());
+        let mut state = test_state(&file);
+        let bytes = [0xAAu8; 16];
+
+        let handle = state
+            .register_region_with_extents(
+                "wram",
+                1,
+                bytes.as_ptr(),
+                bytes.len(),
+                RegionFlags::HOT | RegionFlags::FRAMEBUFFER,
+                &[Extent {
+                    gpa: 0x2000,
+                    len: bytes.len() as u64,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(handle.region_id(), 0);
+        let mut manifest = vec![0u8; MANIFEST_TOTAL_SIZE];
+        file.read_exact_at(&mut manifest, OFF_MANIFEST as u64)
+            .unwrap();
+        let hdr = ManifestHeader::read_from(&manifest).unwrap();
+        hdr.validate().unwrap();
+        assert_eq!(hdr.generation, 2);
+        assert_eq!(hdr.region_count, 1);
+        assert_eq!(hdr.extent_count, 1);
+        let entry = RegionEntry::read_from(&manifest, 0).unwrap();
+        assert!(entry.is_live());
+        assert_eq!(entry.region_id, 0);
+        assert_eq!(entry.name_id, 1);
+        assert_eq!(entry.layout_version, 1);
+        assert_eq!(
+            entry.flags,
+            (RegionFlags::HOT | RegionFlags::FRAMEBUFFER).bits()
+        );
+        assert_eq!(entry.gva, bytes.as_ptr() as u64);
+        assert_eq!(entry.len, bytes.len() as u64);
+        assert_eq!(entry.extent_off, 0);
+        assert_eq!(entry.extent_n, 1);
+        assert_eq!(entry.name_bytes(), b"wram");
+        assert_eq!(
+            Extent::read_from(&manifest, 0).unwrap(),
+            Extent {
+                gpa: 0x2000,
+                len: bytes.len() as u64
+            }
+        );
+
+        let mut seen = 0;
+        for_each_ring_w_event(&file, |index, _hdr, payload| {
+            seen += 1;
+            match (index, payload) {
+                (
+                    0,
+                    EventPayload::NameIntern {
+                        name_id,
+                        name: b"wram",
+                    },
+                ) => assert_eq!(name_id, 1),
+                (
+                    1,
+                    EventPayload::RegionRegister(detguest_wire::events::RegionEvent {
+                        region_id,
+                        name_id,
+                        layout_version,
+                        manifest_generation,
+                    }),
+                ) => {
+                    assert_eq!(region_id, 0);
+                    assert_eq!(name_id, 1);
+                    assert_eq!(layout_version, 1);
+                    assert_eq!(manifest_generation, 2);
+                }
+                other => panic!("unexpected event at {index}: {other:?}"),
+            }
+        });
+        assert_eq!(seen, 2);
     }
 
     #[test]

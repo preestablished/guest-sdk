@@ -17,6 +17,7 @@
 pub mod boot;
 pub mod channel;
 pub mod commands;
+pub mod control;
 pub mod pio;
 pub mod runtime;
 pub mod supervise;

@@ -4,16 +4,22 @@
 //! Permitted-unsafe module: mount/reboot libc calls.
 #![allow(unsafe_code)]
 
-use std::io;
+use std::{io, os::fd::AsRawFd};
 
 use detguest_wire::events::{EventPayload, CAP_FORCED_QUIESCE, CAP_REVERIFY_REGIONS};
 use detguest_wire::header::CHANNEL_SIZE_PAGES;
 use detguest_wire::ports::{self, InitStatus};
 
-use crate::boot::{self, BootManifest};
+use crate::boot::{self, BootManifest, ExpectedRegion};
 use crate::channel::AgentChannel;
+use crate::control;
 use crate::supervise::{vnanos, Supervisor};
 use crate::{agent_version, pio, translate};
+
+#[cfg(test)]
+const READY_REGION_POLL_LIMIT: usize = 128;
+#[cfg(not(test))]
+const READY_REGION_POLL_LIMIT: usize = 50_000_000;
 
 /// Boot manifest path inside the initramfs (API.md §7).
 pub const BOOT_TOML_PATH: &str = "/etc/detguest/boot.toml";
@@ -152,51 +158,208 @@ pub fn bring_up_channel() -> io::Result<AgentChannel> {
 /// With no autostart unit: `Ready` fires immediately after Hello with
 /// `region_count = 0`. With one: start it agent-locally (no ring-C record),
 /// then gate on every expected region being live at its pinned
-/// layout_version. v1 M2 ships the empty-expected-regions path; a non-empty
-/// list cannot be satisfied before the M3 registration path exists, so it
-/// faults loudly rather than hanging the boot.
+/// layout_version.
 pub fn autostart_and_ready(sup: &mut Supervisor) -> Result<(), String> {
     let unit = match sup.manifest.autostart_unit {
         None => {
-            emit_ready(sup, 0xFFFF_FFFF);
+            let snapshot = ready_manifest(sup)?;
+            emit_ready(sup, 0xFFFF_FFFF, snapshot);
             return Ok(());
         }
         Some(u) => u,
     };
-    if !sup.manifest.expected_regions.is_empty() {
-        // M3: wait for manifest liveness (+ layout_version match) via the
-        // registration path; M2 images must use an empty list.
-        return Err(format!(
-            "expected_regions not satisfiable before the M3 registration path \
-             ({} regions listed)",
-            sup.manifest.expected_regions.len()
-        ));
-    }
-    if sup
+    let unit_control = sup
         .manifest
         .unit(unit)
         .and_then(|u| u.control.as_ref())
-        .is_some()
-    {
-        // §4.2 control-protocol leg is M4 work (reference-workload side).
-        return Err("unit.control protocol leg not implemented before M4".into());
+        .cloned();
+    if let Some(control) = unit_control.as_ref() {
+        let (sock, child_fd) =
+            control::socketpair().map_err(|e| format!("unit.control socketpair: {e}"))?;
+        sup.start_unit_with_control(unit, child_fd.as_raw_fd())
+            .map_err(|e| format!("autostart unit {unit}: {e}"))?;
+        drop(child_fd);
+        control::drive_refwork_start(&sock, control)?;
+    } else {
+        sup.start_unit(unit)
+            .map_err(|e| format!("autostart unit {unit}: {e}"))?;
     }
-    sup.start_unit(unit)
-        .map_err(|e| format!("autostart unit {unit}: {e}"))?;
-    emit_ready(sup, unit);
+    let expected_regions = sup.manifest.expected_regions.clone();
+    let snapshot = wait_for_expected_regions(&sup.channel, &expected_regions)?;
+    emit_expected_region_evidence(sup, &expected_regions, snapshot)?;
+    emit_ready(sup, unit, snapshot);
     Ok(())
 }
 
-fn emit_ready(sup: &mut Supervisor, unit: u32) {
-    // Manifest generation is 0 (even) until the first registration; the
-    // region count is the number of live manifest entries (0 in M2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadyManifest {
+    region_count: u32,
+    manifest_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegionEvidence {
+    region_id: u32,
+    name_id: u32,
+    name: Vec<u8>,
+    layout_version: u32,
+    manifest_generation: u32,
+}
+
+fn ready_manifest(sup: &Supervisor) -> Result<ReadyManifest, String> {
+    let bytes = sup
+        .channel
+        .copy_manifest_stable()
+        .map_err(|e| format!("read manifest before Ready: {e:?}"))?;
+    let hdr = detguest_wire::manifest::ManifestHeader::read_from(&bytes)
+        .map_err(|e| format!("decode manifest before Ready: {e:?}"))?;
+    hdr.validate()
+        .map_err(|e| format!("validate manifest before Ready: {e:?}"))?;
+    Ok(ReadyManifest {
+        region_count: hdr.region_count,
+        manifest_generation: hdr.generation,
+    })
+}
+
+fn expected_regions_ready(
+    channel: &AgentChannel,
+    expected_regions: &[ExpectedRegion],
+) -> Result<ReadyManifest, String> {
+    let (snapshot, _evidence) = expected_region_evidence(channel, expected_regions)?;
+    Ok(snapshot)
+}
+
+fn expected_region_evidence(
+    channel: &AgentChannel,
+    expected_regions: &[ExpectedRegion],
+) -> Result<(ReadyManifest, Vec<RegionEvidence>), String> {
+    let bytes = channel
+        .copy_manifest_stable()
+        .map_err(|e| format!("read manifest before Ready: {e:?}"))?;
+    let hdr = detguest_wire::manifest::ManifestHeader::read_from(&bytes)
+        .map_err(|e| format!("decode manifest before Ready: {e:?}"))?;
+    hdr.validate()
+        .map_err(|e| format!("validate manifest before Ready: {e:?}"))?;
+    let manifest_generation = u32::try_from(hdr.generation).map_err(|_| {
+        format!(
+            "manifest generation {} exceeds RegionRegister payload",
+            hdr.generation
+        )
+    })?;
+    let mut missing = Vec::new();
+    let mut evidence = Vec::new();
+    for expected in expected_regions {
+        let mut found = None;
+        for i in 0..hdr.region_count as usize {
+            let entry = detguest_wire::manifest::RegionEntry::read_from(&bytes, i)
+                .map_err(|e| format!("decode region manifest entry {i}: {e:?}"))?;
+            if entry.is_live()
+                && entry.layout_version == expected.layout_version
+                && entry.name_bytes() == expected.name.as_bytes()
+            {
+                found = Some(RegionEvidence {
+                    region_id: entry.region_id,
+                    name_id: entry.name_id,
+                    name: entry.name_bytes().to_vec(),
+                    layout_version: entry.layout_version,
+                    manifest_generation,
+                });
+                break;
+            }
+        }
+        if let Some(found) = found {
+            evidence.push(found);
+        } else {
+            missing.push(format!("{}@{}", expected.name, expected.layout_version));
+        }
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "expected_regions pending before Ready: {}",
+            missing.join(", ")
+        ));
+    }
+    let snapshot = ReadyManifest {
+        region_count: hdr.region_count,
+        manifest_generation: hdr.generation,
+    };
+    Ok((snapshot, evidence))
+}
+
+fn wait_for_expected_regions(
+    channel: &AgentChannel,
+    expected_regions: &[ExpectedRegion],
+) -> Result<ReadyManifest, String> {
+    if expected_regions.is_empty() {
+        let bytes = channel
+            .copy_manifest_stable()
+            .map_err(|e| format!("read manifest before Ready: {e:?}"))?;
+        let hdr = detguest_wire::manifest::ManifestHeader::read_from(&bytes)
+            .map_err(|e| format!("decode manifest before Ready: {e:?}"))?;
+        hdr.validate()
+            .map_err(|e| format!("validate manifest before Ready: {e:?}"))?;
+        return Ok(ReadyManifest {
+            region_count: hdr.region_count,
+            manifest_generation: hdr.generation,
+        });
+    }
+    let mut last_err = String::new();
+    for _ in 0..READY_REGION_POLL_LIMIT {
+        match expected_regions_ready(channel, expected_regions) {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(err) => last_err = err,
+        }
+        // Give the just-forked workload a deterministic chance to publish.
+        unsafe {
+            libc::sched_yield();
+        }
+    }
+    Err(last_err)
+}
+
+fn emit_expected_region_evidence(
+    sup: &mut Supervisor,
+    expected_regions: &[ExpectedRegion],
+    snapshot: ReadyManifest,
+) -> Result<(), String> {
+    if expected_regions.is_empty() {
+        return Ok(());
+    }
+    let (fresh, evidence) = expected_region_evidence(&sup.channel, expected_regions)?;
+    if fresh != snapshot {
+        return Err("manifest changed while preparing Ready evidence".into());
+    }
+    for region in evidence {
+        sup.channel.emit(
+            vnanos(),
+            0,
+            &EventPayload::NameIntern {
+                name_id: region.name_id,
+                name: &region.name,
+            },
+        );
+        sup.channel.emit(
+            vnanos(),
+            0,
+            &EventPayload::RegionRegister(detguest_wire::events::RegionEvent {
+                region_id: region.region_id,
+                name_id: region.name_id,
+                layout_version: region.layout_version,
+                manifest_generation: region.manifest_generation,
+            }),
+        );
+    }
+    Ok(())
+}
+
+fn emit_ready(sup: &mut Supervisor, unit: u32, snapshot: ReadyManifest) {
     sup.channel.emit_with_doorbell(
         vnanos(),
         0,
         &EventPayload::Ready {
             unit,
-            region_count: 0,
-            manifest_generation: 0,
+            region_count: snapshot.region_count,
+            manifest_generation: snapshot.manifest_generation,
         },
     );
 }
@@ -260,6 +423,7 @@ const _: u16 = ports::PORT_IDENT;
 mod tests {
     use super::*;
     use crate::boot::{ExpectedRegion, Unit, UnitControl};
+    use detguest_wire::manifest::{writer_begin, writer_end, Extent, ManifestHeader, RegionEntry};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static DOORBELLS: AtomicU32 = AtomicU32::new(0);
@@ -276,7 +440,7 @@ mod tests {
             autostart_unit: Some(0),
             units: vec![Unit {
                 id: 0,
-                exec: "/does/not/matter".to_string(),
+                exec: "/bin/true".to_string(),
                 args: Vec::new(),
                 log_mask: 0x1F,
                 control,
@@ -285,9 +449,112 @@ mod tests {
         }
     }
 
+    fn write_live_region(channel: &mut AgentChannel, name: &str, layout_version: u32) {
+        let manifest = channel.manifest_mut();
+        let odd = writer_begin(manifest).unwrap();
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Extent {
+            gpa: 0x2000,
+            len: 16,
+        }
+        .write_to(manifest, 0)
+        .unwrap();
+        RegionEntry {
+            region_id: 0,
+            name_id: 1,
+            layout_version,
+            flags: 0,
+            gva: 0x1000,
+            len: 16,
+            extent_off: 0,
+            extent_n: 1,
+            name: RegionEntry::pack_name(name.as_bytes()).unwrap(),
+        }
+        .write_to(manifest, 0)
+        .unwrap();
+        let mut hdr = ManifestHeader::read_from(manifest).unwrap();
+        hdr.generation = odd;
+        hdr.region_count = 1;
+        hdr.extent_count = 1;
+        hdr.write_to(manifest).unwrap();
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        writer_end(manifest).unwrap();
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum TestPayload {
+        NameIntern {
+            name_id: u32,
+            name: Vec<u8>,
+        },
+        RegionRegister {
+            region_id: u32,
+            name_id: u32,
+            layout_version: u32,
+            manifest_generation: u32,
+        },
+        Ready {
+            unit: u32,
+            region_count: u32,
+            manifest_generation: u64,
+        },
+        Other(u32),
+    }
+
+    fn ring_a_payloads(channel: &AgentChannel) -> Vec<TestPayload> {
+        let prod = unsafe {
+            (channel
+                .base_ptr()
+                .add(detguest_wire::header::OFF_RING_A_PROD) as *const u32)
+                .read_volatile()
+        } as usize;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                channel
+                    .base_ptr()
+                    .add(detguest_wire::header::OFF_RING_A_DATA),
+                prod,
+            )
+        };
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let (hdr, payload) = detguest_wire::events::decode_event(&bytes[at..]).unwrap();
+            out.push(match payload {
+                EventPayload::NameIntern { name_id, name } => TestPayload::NameIntern {
+                    name_id,
+                    name: name.to_vec(),
+                },
+                EventPayload::RegionRegister(region) => TestPayload::RegionRegister {
+                    region_id: region.region_id,
+                    name_id: region.name_id,
+                    layout_version: region.layout_version,
+                    manifest_generation: region.manifest_generation,
+                },
+                EventPayload::Ready {
+                    unit,
+                    region_count,
+                    manifest_generation,
+                } => TestPayload::Ready {
+                    unit,
+                    region_count,
+                    manifest_generation,
+                },
+                _ => TestPayload::Other(hdr.kind as u32),
+            });
+            at += hdr.len as usize;
+        }
+        out
+    }
+
+    fn ring_a_has_ready(channel: &AgentChannel) -> bool {
+        ring_a_payloads(channel)
+            .iter()
+            .any(|payload| matches!(payload, TestPayload::Ready { .. }))
+    }
+
     #[test]
-    fn non_empty_expected_regions_fault_before_ready_for_now() {
-        let before = DOORBELLS.load(Ordering::Relaxed);
+    fn expected_regions_pending_starts_unit_but_blocks_ready() {
         let mut sup = Supervisor::new(
             crate::channel::test_channel(test_doorbell),
             manifest(
@@ -302,18 +569,64 @@ mod tests {
 
         let err = autostart_and_ready(&mut sup).unwrap_err();
 
-        assert!(err.contains("expected_regions not satisfiable"));
-        assert!(sup.workload.is_none(), "must fail before fork/exec");
+        assert!(err.contains("expected_regions pending before Ready"));
+        assert!(sup.workload.is_some(), "autostart must happen before gate");
+        assert!(!ring_a_has_ready(&sup.channel), "must not emit Ready");
+    }
+
+    #[test]
+    fn expected_regions_ready_emit_real_manifest_snapshot() {
+        let before = DOORBELLS.load(Ordering::Relaxed);
+        let mut sup = Supervisor::new(
+            crate::channel::test_channel(test_doorbell),
+            BootManifest {
+                autostart_unit: None,
+                units: Vec::new(),
+                expected_regions: Vec::new(),
+            },
+        )
+        .unwrap();
+        write_live_region(&mut sup.channel, "wram", 1);
+        let expected = [ExpectedRegion {
+            name: "wram".to_string(),
+            layout_version: 1,
+        }];
+
+        let snapshot = expected_regions_ready(&sup.channel, &expected).unwrap();
+        emit_expected_region_evidence(&mut sup, &expected, snapshot).unwrap();
+        emit_ready(&mut sup, 0, snapshot);
+
+        assert_eq!(snapshot.region_count, 1);
+        assert_eq!(snapshot.manifest_generation, 2);
+        assert!(
+            DOORBELLS.load(Ordering::Relaxed) > before,
+            "Ready must doorbell"
+        );
+        let payloads = ring_a_payloads(&sup.channel);
         assert_eq!(
-            DOORBELLS.load(Ordering::Relaxed),
-            before,
-            "must not emit Ready"
+            payloads,
+            vec![
+                TestPayload::NameIntern {
+                    name_id: 1,
+                    name: b"wram".to_vec(),
+                },
+                TestPayload::RegionRegister {
+                    region_id: 0,
+                    name_id: 1,
+                    layout_version: 1,
+                    manifest_generation: 2,
+                },
+                TestPayload::Ready {
+                    unit: 0,
+                    region_count: 1,
+                    manifest_generation: 2,
+                },
+            ]
         );
     }
 
     #[test]
-    fn unit_control_faults_before_m4_for_now() {
-        let before = DOORBELLS.load(Ordering::Relaxed);
+    fn unit_control_faults_before_ready_when_workload_does_not_reply() {
         let mut sup = Supervisor::new(
             crate::channel::test_channel(test_doorbell),
             manifest(
@@ -329,12 +642,11 @@ mod tests {
 
         let err = autostart_and_ready(&mut sup).unwrap_err();
 
-        assert!(err.contains("unit.control protocol leg not implemented before M4"));
-        assert!(sup.workload.is_none(), "must fail before fork/exec");
-        assert_eq!(
-            DOORBELLS.load(Ordering::Relaxed),
-            before,
-            "must not emit Ready"
+        assert!(err.contains("recv refwork HelloAck"), "{err}");
+        assert!(
+            sup.workload.is_some(),
+            "control fault happens after autostart"
         );
+        assert!(!ring_a_has_ready(&sup.channel), "must not emit Ready");
     }
 }

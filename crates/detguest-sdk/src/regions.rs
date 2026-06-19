@@ -1,8 +1,11 @@
 use std::{fmt, ops};
 
 use detguest_wire::manifest::{
-    MAX_REGION_NAME, REGION_FLAG_FRAMEBUFFER, REGION_FLAG_HOST_WRITABLE, REGION_FLAG_HOT,
+    Extent, EXTENT_CAPACITY, MAX_REGION_NAME, REGION_FLAG_FRAMEBUFFER, REGION_FLAG_HOST_WRITABLE,
+    REGION_FLAG_HOT,
 };
+
+use crate::translate;
 
 /// Region publication flags.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -110,6 +113,10 @@ pub struct RegionHandle {
 }
 
 impl RegionHandle {
+    pub(crate) fn new(region_id: u32) -> RegionHandle {
+        RegionHandle { region_id }
+    }
+
     /// Manifest region slot id.
     pub fn region_id(&self) -> u32 {
         self.region_id
@@ -130,12 +137,83 @@ pub(crate) unsafe fn register_region(
     len: usize,
     flags: RegionFlags,
 ) -> Result<RegionHandle, RegionError> {
+    validate_region(name, ptr, len)?;
+    let _ = (layout_version, flags);
+    Ok(RegionHandle::new(0))
+}
+
+pub(crate) fn validate_region(
+    name: &'static str,
+    ptr: *const u8,
+    len: usize,
+) -> Result<(), RegionError> {
     if name.len() > MAX_REGION_NAME {
         return Err(RegionError::NameTooLong);
     }
     if len != 0 && ptr.is_null() {
         return Err(RegionError::NotPinned);
     }
-    let _ = (layout_version, ptr, len, flags);
-    Ok(RegionHandle { region_id: 0 })
+    Ok(())
+}
+
+pub(crate) unsafe fn pin_and_translate(
+    ptr: *const u8,
+    len: usize,
+) -> Result<Vec<Extent>, RegionError> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if libc::mlock(ptr.cast(), len) != 0 {
+        return Err(RegionError::NotPinned);
+    }
+    let pagemap = translate::open_pagemap().map_err(|_| RegionError::AgentUnavailable)?;
+    build_extents(
+        |vaddr| translate::gva_to_gpa(&pagemap, vaddr),
+        ptr as u64,
+        len,
+    )
+}
+
+pub(crate) fn build_extents(
+    mut translate: impl FnMut(u64) -> Result<u64, translate::TranslateError>,
+    start: u64,
+    len: usize,
+) -> Result<Vec<Extent>, RegionError> {
+    let mut remaining = u64::try_from(len).map_err(|_| RegionError::TooManyExtents)?;
+    let mut vaddr = start;
+    let mut extents: Vec<Extent> = Vec::new();
+    while remaining > 0 {
+        let gpa = translate(vaddr).map_err(map_translate_error)?;
+        let page_remaining = 4096 - (vaddr & 0xFFF);
+        let chunk = remaining.min(page_remaining);
+        if let Some(last) = extents.last_mut() {
+            if last.gpa.checked_add(last.len) == Some(gpa) {
+                last.len = last
+                    .len
+                    .checked_add(chunk)
+                    .ok_or(RegionError::TooManyExtents)?;
+            } else {
+                extents.push(Extent { gpa, len: chunk });
+            }
+        } else {
+            extents.push(Extent { gpa, len: chunk });
+        }
+        if extents.len() > EXTENT_CAPACITY {
+            return Err(RegionError::TooManyExtents);
+        }
+        vaddr = vaddr
+            .checked_add(chunk)
+            .ok_or(RegionError::TooManyExtents)?;
+        remaining -= chunk;
+    }
+    Ok(extents)
+}
+
+fn map_translate_error(err: translate::TranslateError) -> RegionError {
+    match err {
+        translate::TranslateError::NotPresent { .. }
+        | translate::TranslateError::Swapped { .. }
+        | translate::TranslateError::PfnHidden { .. } => RegionError::NotPinned,
+        translate::TranslateError::Io(_) => RegionError::AgentUnavailable,
+    }
 }

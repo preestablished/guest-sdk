@@ -119,6 +119,7 @@ name = "detguest-workloads"
 version = "0.1.0"
 dependencies = [
  "detguest-sdk",
+ "libc",
 ]
 
 [[package]]
