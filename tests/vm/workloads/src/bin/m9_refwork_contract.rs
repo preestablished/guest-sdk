@@ -3,19 +3,24 @@
 //! This is a deterministic stand-in for the full reference-workload harness
 //! while the emulator-side control state machine is still landing. It publishes
 //! the minimal fd-3 control handshake, publishes the canonical M9 regions
-//! expected by the hypervisor fixture contract, and then parks forever so the
-//! agent can gate Ready on those registrations.
+//! expected by the hypervisor fixture contract, and then enters a deterministic
+//! post-Start frame loop so the hypervisor can exercise post-READY landing,
+//! frame, and replay gates.
 
-use std::thread;
+use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 
 use detguest_sdk::{self as sdk, RegionFlags};
 
 const CONTROL_FD: i32 = 3;
 const PROTO_VERSION: u64 = 1;
+const WRAM_LEN: usize = 4096;
+const FRAMEBUFFER_LEN: usize = 4096;
+const META_LEN: usize = 256;
+const WORK_UNITS_PER_FRAME: usize = 4096;
 
-static WRAM: [u8; 4096] = [0; 4096];
-static FRAMEBUFFER: [u8; 4096] = [0; 4096];
-static META: [u8; 256] = [0; 256];
+static mut WRAM: [u8; WRAM_LEN] = [0; WRAM_LEN];
+static mut FRAMEBUFFER: [u8; FRAMEBUFFER_LEN] = [0; FRAMEBUFFER_LEN];
+static mut META: [u8; META_LEN] = [0; META_LEN];
 
 fn main() {
     let _ = sdk::init();
@@ -23,8 +28,44 @@ fn main() {
     publish_regions();
     send_datagram(&[0x08, 0x00]); // Ready { frame: 0 }
     expect_start();
+    run_frame_loop();
+}
+
+fn run_frame_loop() -> ! {
+    let mut frame = 0u32;
+    let mut acc = 0x4d39_0000_0000_0001u64;
     loop {
-        thread::park();
+        for step in 0..WORK_UNITS_PER_FRAME {
+            acc = acc
+                .rotate_left(7)
+                .wrapping_add((frame as u64) << 32)
+                .wrapping_add(step as u64)
+                ^ 0xa5a5_5a5a_1020_3040;
+            let wram_index = ((acc as usize) ^ step) & (WRAM_LEN - 1);
+            let framebuffer_index =
+                ((acc.rotate_right(17) as usize) ^ (step << 1)) & (FRAMEBUFFER_LEN - 1);
+            let meta_index = (step ^ frame as usize) & (META_LEN - 1);
+            unsafe {
+                bump_byte(addr_of_mut!(WRAM).cast::<u8>(), wram_index, acc as u8);
+                bump_byte(
+                    addr_of_mut!(FRAMEBUFFER).cast::<u8>(),
+                    framebuffer_index,
+                    acc.rotate_right(8) as u8,
+                );
+                bump_byte(
+                    addr_of_mut!(META).cast::<u8>(),
+                    meta_index,
+                    acc.rotate_right(16) as u8,
+                );
+            }
+        }
+        write_frame_meta(frame, acc);
+        sdk::coverage_beacon(frame & 0x3f);
+        if frame & 0x0f == 0 {
+            sdk::quiesce_check();
+        }
+        sdk::frame_mark();
+        frame = frame.wrapping_add(1);
     }
 }
 
@@ -160,16 +201,44 @@ fn publish_regions() {
     // SAFETY: these static byte arrays are mapped for the process lifetime and
     // never move, satisfying the SDK region registration contract.
     unsafe {
-        let _wram =
-            sdk::register_region("wram", 1, WRAM.as_ptr(), WRAM.len(), RegionFlags::empty());
+        let _wram = sdk::register_region(
+            "wram",
+            1,
+            addr_of_mut!(WRAM).cast::<u8>(),
+            WRAM_LEN,
+            RegionFlags::empty(),
+        );
         let _framebuffer = sdk::register_region(
             "framebuffer",
             1,
-            FRAMEBUFFER.as_ptr(),
-            FRAMEBUFFER.len(),
+            addr_of_mut!(FRAMEBUFFER).cast::<u8>(),
+            FRAMEBUFFER_LEN,
             RegionFlags::FRAMEBUFFER,
         );
-        let _meta =
-            sdk::register_region("meta", 1, META.as_ptr(), META.len(), RegionFlags::empty());
+        let _meta = sdk::register_region(
+            "meta",
+            1,
+            addr_of_mut!(META).cast::<u8>(),
+            META_LEN,
+            RegionFlags::empty(),
+        );
+    }
+}
+
+unsafe fn bump_byte(base: *mut u8, index: usize, value: u8) {
+    let cell = base.add(index);
+    let prev = read_volatile(cell);
+    write_volatile(cell, prev.wrapping_add(value).wrapping_add(1));
+}
+
+fn write_frame_meta(frame: u32, acc: u64) {
+    unsafe {
+        let meta = addr_of_mut!(META).cast::<u8>();
+        for (offset, byte) in frame.to_le_bytes().into_iter().enumerate() {
+            write_volatile(meta.add(offset), byte);
+        }
+        for (offset, byte) in acc.to_le_bytes().into_iter().enumerate() {
+            write_volatile(meta.add(8 + offset), byte);
+        }
     }
 }
