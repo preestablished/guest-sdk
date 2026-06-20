@@ -7,7 +7,10 @@
 //! post-Start frame loop so the hypervisor can exercise post-READY landing,
 //! frame, and replay gates.
 
-use core::ptr::{addr_of_mut, read_volatile, write_volatile};
+use core::ptr::{addr_of_mut, read_volatile, write_volatile, NonNull};
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
 use detguest_sdk::{self as sdk, RegionFlags};
 
@@ -16,11 +19,41 @@ const PROTO_VERSION: u64 = 1;
 const WRAM_LEN: usize = 4096;
 const FRAMEBUFFER_LEN: usize = 4096;
 const META_LEN: usize = 256;
+const SECTOR_SIZE: usize = 512;
 const WORK_UNITS_PER_FRAME: usize = 4096;
+const PVBLK_TEST_SECTOR: u64 = 8;
+const META_IO_MAGIC_OFF: usize = 32;
+const META_IO_FRAME_OFF: usize = 40;
+const META_IO_CHECKSUM_OFF: usize = 48;
+
+const PV_BLK_BASE: libc::off_t = 0xD000_4000;
+const PV_BLK_SIZE: usize = 0x1000;
+const PV_BLK_REG_SECTOR: usize = 0x08;
+const PV_BLK_REG_BUF_GPA: usize = 0x10;
+const PV_BLK_REG_COUNT: usize = 0x18;
+const PV_BLK_REG_CMD: usize = 0x1C;
+const PV_BLK_REG_STATUS: usize = 0x20;
+const PV_BLK_CMD_READ: u32 = 1;
+const PV_BLK_CMD_WRITE: u32 = 2;
+const PV_BLK_CMD_FLUSH: u32 = 3;
+const PV_BLK_STATUS_OK: u32 = 0;
+
+const PM_PRESENT: u64 = 1 << 63;
+const PM_SWAPPED: u64 = 1 << 62;
+const PM_PFN_MASK: u64 = (1 << 55) - 1;
 
 static mut WRAM: [u8; WRAM_LEN] = [0; WRAM_LEN];
 static mut FRAMEBUFFER: [u8; FRAMEBUFFER_LEN] = [0; FRAMEBUFFER_LEN];
 static mut META: [u8; META_LEN] = [0; META_LEN];
+
+#[repr(align(4096))]
+struct DiskBuffer {
+    _bytes: [u8; SECTOR_SIZE],
+}
+
+static mut DISK_BUF: DiskBuffer = DiskBuffer {
+    _bytes: [0; SECTOR_SIZE],
+};
 
 fn main() {
     let _ = sdk::init();
@@ -34,6 +67,8 @@ fn main() {
 fn run_frame_loop() -> ! {
     let mut frame = 0u32;
     let mut acc = 0x4d39_0000_0000_0001u64;
+    let mut pvblk = PvBlkClient::new();
+    let mut io_checksum = None;
     loop {
         for step in 0..WORK_UNITS_PER_FRAME {
             acc = acc
@@ -59,7 +94,14 @@ fn run_frame_loop() -> ! {
                 );
             }
         }
+        if frame == 0 {
+            let checksum = pvblk.write_read_once(frame, acc);
+            io_checksum = Some(checksum);
+        }
         write_frame_meta(frame, acc);
+        if let Some(checksum) = io_checksum {
+            write_io_meta(0, checksum);
+        }
         sdk::coverage_beacon(frame & 0x3f);
         if frame & 0x0f == 0 {
             sdk::quiesce_check();
@@ -67,6 +109,144 @@ fn run_frame_loop() -> ! {
         sdk::frame_mark();
         frame = frame.wrapping_add(1);
     }
+}
+
+struct PvBlkClient {
+    mmio: NonNull<u8>,
+    buf_gpa: u64,
+}
+
+impl PvBlkClient {
+    fn new() -> PvBlkClient {
+        let buf = addr_of_mut!(DISK_BUF).cast::<u8>();
+        unsafe {
+            for i in 0..SECTOR_SIZE {
+                write_volatile(buf.add(i), 0);
+            }
+            if libc::mlock(buf.cast(), SECTOR_SIZE) != 0 {
+                panic!(
+                    "mlock pv-blk buffer failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        let buf_gpa = gva_to_gpa(buf as u64);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_SYNC)
+            .open("/dev/mem")
+            .expect("open /dev/mem for pv-blk");
+        let ptr = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                PV_BLK_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                PV_BLK_BASE,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            panic!("mmap pv-blk failed: {}", std::io::Error::last_os_error());
+        }
+        PvBlkClient {
+            mmio: NonNull::new(ptr.cast::<u8>()).expect("mmap never returns null on success"),
+            buf_gpa,
+        }
+    }
+
+    fn write_read_once(&mut self, frame: u32, acc: u64) -> u64 {
+        let expected = fill_disk_pattern(frame, acc);
+        self.command(PV_BLK_CMD_WRITE, PVBLK_TEST_SECTOR, 1);
+        zero_disk_buffer();
+        self.command(PV_BLK_CMD_READ, PVBLK_TEST_SECTOR, 1);
+        let actual = checksum_disk_buffer();
+        assert_eq!(actual, expected, "pv-blk readback checksum drift");
+        self.command(PV_BLK_CMD_FLUSH, PVBLK_TEST_SECTOR, 1);
+        actual
+    }
+
+    fn command(&mut self, cmd: u32, sector: u64, count: u32) {
+        self.write_u64(PV_BLK_REG_SECTOR, sector);
+        self.write_u64(PV_BLK_REG_BUF_GPA, self.buf_gpa);
+        self.write_u32(PV_BLK_REG_COUNT, count);
+        self.write_u32(PV_BLK_REG_CMD, cmd);
+        let status = self.read_u32(PV_BLK_REG_STATUS);
+        assert_eq!(status, PV_BLK_STATUS_OK, "pv-blk command {cmd} failed");
+    }
+
+    fn read_u32(&self, offset: usize) -> u32 {
+        unsafe { read_volatile(self.mmio.as_ptr().add(offset).cast::<u32>()) }
+    }
+
+    fn write_u32(&mut self, offset: usize, value: u32) {
+        unsafe {
+            write_volatile(self.mmio.as_ptr().add(offset).cast::<u32>(), value);
+        }
+    }
+
+    fn write_u64(&mut self, offset: usize, value: u64) {
+        unsafe {
+            write_volatile(self.mmio.as_ptr().add(offset).cast::<u64>(), value);
+        }
+    }
+}
+
+impl Drop for PvBlkClient {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.mmio.as_ptr().cast(), PV_BLK_SIZE);
+        }
+    }
+}
+
+fn fill_disk_pattern(frame: u32, acc: u64) -> u64 {
+    let mut checksum = 0x7062_6c6b_5f69_6f31u64;
+    let buf = addr_of_mut!(DISK_BUF).cast::<u8>();
+    for i in 0..SECTOR_SIZE {
+        let byte = (acc.rotate_left((i & 63) as u32) as u8)
+            .wrapping_add(frame as u8)
+            .wrapping_add((i as u8).wrapping_mul(17));
+        unsafe {
+            write_volatile(buf.add(i), byte);
+        }
+        checksum = checksum.rotate_left(5) ^ u64::from(byte).wrapping_add(i as u64);
+    }
+    checksum
+}
+
+fn zero_disk_buffer() {
+    let buf = addr_of_mut!(DISK_BUF).cast::<u8>();
+    for i in 0..SECTOR_SIZE {
+        unsafe {
+            write_volatile(buf.add(i), 0);
+        }
+    }
+}
+
+fn checksum_disk_buffer() -> u64 {
+    let mut checksum = 0x7062_6c6b_5f69_6f31u64;
+    let buf = addr_of_mut!(DISK_BUF).cast::<u8>();
+    for i in 0..SECTOR_SIZE {
+        let byte = unsafe { read_volatile(buf.add(i)) };
+        checksum = checksum.rotate_left(5) ^ u64::from(byte).wrapping_add(i as u64);
+    }
+    checksum
+}
+
+fn gva_to_gpa(vaddr: u64) -> u64 {
+    let pagemap = File::open("/proc/self/pagemap").expect("open /proc/self/pagemap");
+    let mut entry = [0u8; 8];
+    pagemap
+        .read_exact_at(&mut entry, (vaddr / 4096) * 8)
+        .expect("read pagemap entry");
+    let raw = u64::from_le_bytes(entry);
+    assert_eq!(raw & PM_SWAPPED, 0, "pv-blk buffer is swapped");
+    assert_ne!(raw & PM_PRESENT, 0, "pv-blk buffer is not present");
+    let pfn = raw & PM_PFN_MASK;
+    assert_ne!(pfn, 0, "pagemap hid pv-blk buffer PFN");
+    (pfn << 12) + (vaddr & 0xFFF)
 }
 
 fn drive_control() {
@@ -239,6 +419,21 @@ fn write_frame_meta(frame: u32, acc: u64) {
         }
         for (offset, byte) in acc.to_le_bytes().into_iter().enumerate() {
             write_volatile(meta.add(8 + offset), byte);
+        }
+    }
+}
+
+fn write_io_meta(frame: u32, checksum: u64) {
+    unsafe {
+        let meta = addr_of_mut!(META).cast::<u8>();
+        for (offset, byte) in b"PVBLKIO1".iter().copied().enumerate() {
+            write_volatile(meta.add(META_IO_MAGIC_OFF + offset), byte);
+        }
+        for (offset, byte) in frame.to_le_bytes().into_iter().enumerate() {
+            write_volatile(meta.add(META_IO_FRAME_OFF + offset), byte);
+        }
+        for (offset, byte) in checksum.to_le_bytes().into_iter().enumerate() {
+            write_volatile(meta.add(META_IO_CHECKSUM_OFF + offset), byte);
         }
     }
 }
