@@ -11,10 +11,10 @@ pub(crate) const PV_PAD_WORDS: usize = PV_PAD_SIZE / std::mem::size_of::<u32>();
 #[cfg(test)]
 pub(crate) const PVPAD_PAD0_WORD: usize = 0x08 / std::mem::size_of::<u32>();
 #[cfg(test)]
-pub(crate) const PVPAD_FRAME_COUNTER_WORD: usize = 0x18 / std::mem::size_of::<u32>();
+pub(crate) const PVPAD_FRAME_COUNTER_WORD: usize = 0x1C / std::mem::size_of::<u32>();
 
 const PVPAD_PAD0_OFF: usize = 0x08;
-const PVPAD_FRAME_COUNTER_OFF: usize = 0x18;
+const PVPAD_FRAME_COUNTER_OFF: usize = 0x1C;
 const PVPAD_PAD_COUNT: u8 = 4;
 
 /// Process-wide detcall and pv-pad setup.

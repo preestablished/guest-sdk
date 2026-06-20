@@ -14,7 +14,7 @@ use super::VmHarness;
 
 /// pv-pad MMIO latch stub (determinism-hypervisor ARCHITECTURE.md §6.4 owns
 /// the real device; this repo only cites the addresses). Base GPA
-/// 0xD000_1000; PAD0..PAD3 at +0x08 + 4*port; FRAME_COUNTER at +0x18.
+/// 0xD000_1000; PAD0..PAD3 at +0x08 + 4*port; FRAME_COUNTER at +0x1C.
 pub struct PvPad {
     /// Latched pad values returned by PAD0..PAD3 reads.
     pub pads: [u32; 4],
@@ -25,9 +25,9 @@ pub struct PvPad {
 /// pv-pad MMIO base GPA (cited from the hypervisor's device map).
 pub const PVPAD_BASE: u64 = 0xD000_1000;
 const PVPAD_PAD0_OFF: u64 = 0x08;
-const PVPAD_FRAME_COUNTER_OFF: u64 = 0x18;
+const PVPAD_FRAME_COUNTER_OFF: u64 = 0x1C;
 /// One past the last register we decode.
-const PVPAD_END_OFF: u64 = 0x1C;
+const PVPAD_END_OFF: u64 = 0x20;
 
 impl PvPad {
     /// Schedule a pad value (the "PAD_SET landing" stand-in for M3 tests).
