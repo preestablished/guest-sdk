@@ -178,11 +178,16 @@ bitflags::bitflags! {
 
 /// Publish `[ptr, ptr+len)` to the host under `name`.
 ///
-/// The SDK mlocks and prefaults the range, then asks the agent to translate
-/// GVA→GPA via /proc/<pid>/pagemap and publish the extents in the region
-/// manifest (ARCHITECTURE.md §5). Blocks (deterministically, on the agent IPC
-/// socket) until the manifest is updated and the `RegionRegister` event is on
-/// ring A.
+/// The SDK pins the range with plain `mlock` (populates and pins; no
+/// `MLOCK_ONFAULT` — faults are taken *now*, at a deterministic point) and
+/// prefaults it with one volatile read per 4 KiB page, then asks the agent —
+/// the only manifest writer — to translate GVA→GPA via /proc/<pid>/pagemap
+/// and publish the extents in the region manifest (ARCHITECTURE.md §5).
+/// Blocks (deterministically, on the agent IPC socket — §1.5.1) until the
+/// agent's reply; the agent has already written the manifest under the
+/// seqlock and put `NameIntern` + `RegionRegister` on ring A by then.
+/// Standalone mode (no channel, hence no agent) validates the inputs and
+/// returns `AgentUnavailable`.
 ///
 /// Requirements on the memory:
 /// - lifetime: must outlive the registration (until `unregister` or exit);
@@ -196,7 +201,9 @@ bitflags::bitflags! {
 ///
 /// Errors: `ManifestFull` (64 regions max), `TooManyExtents` (region would
 /// exceed the manifest extent pool), `NotPinned` (pagemap shows non-present or
-/// swapped pages), `NameTooLong` (> 56 bytes), `AgentUnavailable`.
+/// swapped pages), `NameTooLong` (> 56 bytes), `AgentUnavailable` (no agent,
+/// transport failure, or any agent-side status the SDK cannot act on —
+/// mapping table in §1.5.1).
 ///
 /// # Safety
 /// `ptr..ptr+len` must remain valid, mapped, and non-relocating for the life
@@ -212,11 +219,98 @@ pub unsafe fn register_region(
 pub struct RegionHandle { /* region_id: u32 */ }
 impl RegionHandle {
     pub fn region_id(&self) -> u32;
-    /// Explicit unregister (also done on Drop): agent marks the manifest entry
-    /// dead (flags bit 31), bumps generation, emits RegionUpdate.
+    /// Explicit unregister (also done on Drop): sends UnregisterRegion; the
+    /// agent marks the manifest entry dead (flags bit 31) under the seqlock
+    /// and bumps the generation. Because Drop unregisters, workloads MUST
+    /// hold their handles for as long as the region should stay
+    /// host-readable (typically the process lifetime, via `std::mem::forget`
+    /// or a long-lived binding). The memory stays mlocked; the SDK never
+    /// munlocks (pages may back other regions).
     pub fn unregister(self);
 }
 ```
+
+#### 1.5.1 agent.sock registration protocol (normative)
+
+Transport: AF_UNIX `SOCK_SEQPACKET` at `AGENT_SOCK_PATH = /run/detguest/agent.sock`
+(bound by the agent before the autostart unit spawns, so the path exists before any
+workload runs). **One datagram = one message**; no datagram exceeds
+`REGIONIPC_MAX_DATAGRAM = 128` bytes (the largest message is a RegisterRegion with a
+full 56-byte name: 94 bytes). All integers little-endian; codecs are hand-written in
+`detguest-wire::regionipc` and never panic on arbitrary bytes.
+
+Every message starts with an 8-byte header:
+
+```
+0  u32  magic    = 0x5252_4744   ("DGRR" LE)
+4  u16  version  = 1
+6  u16  kind     1 RegisterRegion, 2 UnregisterRegion (SDK→agent);
+                 3 Reply (agent→SDK)
+```
+
+```
+RegisterRegion (kind 1)              length = 38 + name_len
+  8   u32  flags            RegionFlags bits; bit 31 (DEAD) must be clear
+  12  u32  layout_version
+  16  u32  name_id          caller-interned; never 0
+  20  u64  gva              region base in the caller's address space
+  28  u64  len              bytes; never 0
+  36  u16  name_len         1..=56
+  38  ..   name bytes       (byte string at this layer; UTF-8 policy is the
+                            manifest's)
+
+UnregisterRegion (kind 2)            length = 12
+  8   u32  region_id        manifest slot id from the register Reply
+
+Reply (kind 3)                       length = 28
+  8   u16  status           table below
+  10  u16  _reserved        = 0
+  12  u32  region_id        valid iff status == 0
+  16  u32  name_id          echo of the request's name_id; valid iff status == 0
+  20  u64  manifest_generation   post-write (even) generation; valid iff status == 0
+```
+
+Lengths are exact: trailing bytes, truncation, bad magic/version/kind, a zero
+`name_id`/`len`, or a set DEAD bit are decode failures — the agent answers
+`BAD_REQUEST` and the connection survives.
+
+Status codes and their `RegionError` mapping in the SDK:
+
+| status | name | meaning | `RegionError` |
+|---|---|---|---|
+| 0 | `OK` | registered/unregistered | — |
+| 1 | `MANIFEST_FULL` | no free region slot (64 max) | `ManifestFull` |
+| 2 | `TOO_MANY_EXTENTS` | would exceed the manifest extent pool | `TooManyExtents` |
+| 3 | `NOT_PINNED` | pagemap shows non-present/swapped bytes | `NotPinned` |
+| 4 | `NAME_TOO_LONG` | name exceeds the manifest field (structurally unreachable over the wire — the codec caps names at 56 bytes) | `NameTooLong` |
+| 5 | `BAD_REQUEST` | malformed request datagram (SDK bug) | `AgentUnavailable` |
+| 6 | `UNKNOWN_PID` | peer pid is not the supervised workload | `AgentUnavailable` |
+| 7 | `UNKNOWN_REGION` | unregister of an unknown/already-dead region id | `AgentUnavailable` |
+| 8 | `INTERNAL` | agent-side I/O failure | `AgentUnavailable` |
+
+Session model and rules:
+
+- **Pid binding via `SO_PEERCRED`.** The caller's pid never travels in a message;
+  the agent reads it from the accepted connection's socket credentials and rejects
+  any register/unregister whose peer pid is not the supervised workload
+  (`UNKNOWN_PID`). The agent accepts at most 4 concurrent connections; further
+  connects are dropped immediately (a connection storm is a guest bug).
+- **One cached connection, send-one-recv-one, no timeouts.** The SDK connects
+  lazily, keeps one connection for the process, and does strict blocking
+  request/reply on it. No timeouts by design (determinism): a hung agent means a
+  hung workload, which the supervise tier owns. Any transport failure maps to
+  `AgentUnavailable` and drops the cached connection so the next call reconnects.
+- **`name_id` is allocated by the requester.** The SDK's intern table is the single
+  name-id authority — the host folds `NameIntern` records from rings A and W into
+  one map, so a second (agent-side) allocator would collide. The agent echoes the
+  id in the Reply and in its ring-A evidence events.
+- **Ring-A evidence.** On a successful registration the agent emits `NameIntern` +
+  `RegionRegister` on ring A (doorbell) at registration time. The pre-Ready
+  expected-region evidence re-emission (one `NameIntern` + `RegionRegister` per
+  expected region, just before `Ready` — ARCHITECTURE.md §4.1) is retained, so the
+  host sees those events twice for expected regions. The duplicates are intentional:
+  registration-time events give live evidence; the pre-Ready batch keeps the Ready
+  gate self-describing.
 
 ### 1.6 Controller input + frame boundary (pv-pad latch)
 
@@ -623,7 +717,23 @@ handler drains ring W inside the exit and must find the query.
 | `Resume{token}` (ring I) | consumed by SDK: unpark from `quiesce_check` | none |
 | `Shutdown{mode}` | graceful: SIGTERM workload, 2 s virtual-time grace, then SIGKILL, emit `WorkloadExited`, `reboot(RB_POWER_OFF)`; immediate: skip grace | `WorkloadExited` + VM power-off exit |
 | `SetLogMask{mask}` | adjust which LogLine levels/streams are produced (reduces droppable traffic) | none |
-| `ReverifyRegions` | re-walk pagemap for all live regions; emit `RegionUpdate` per region whose extents changed (P0 alarm) or are unchanged (generation echo) | `RegionUpdate` events |
+| `ReverifyRegions` | re-walk pagemap for every live region in the agent's registration ledger; emit one `RegionUpdate` per region (semantics below) | `RegionUpdate` events (one doorbell closes the sweep) |
+
+`ReverifyRegions` semantics (the §5 pinning canary, per live region):
+
+- **Extents hold** (re-walk matches the ledger): emit `RegionUpdate` echoing the
+  current manifest generation. No manifest write, no alarm.
+- **Extents drifted** (range still translates, different extents): P0 — emit an
+  agent `LogLine` (stream 3, level 0) alarm, rewrite the manifest entry's extents
+  under the seqlock, then emit `RegionUpdate` with the new generation. Drift under
+  the pinning rules indicates a kernel-config regression.
+- **Range unmappable** (pagemap walk fails — workload dead, pages reclaimed): P0 —
+  emit the `LogLine` alarm, mark the manifest entry DEAD under the seqlock, emit
+  `RegionUpdate`. (Also the fallback if a drift rewrite cannot fit the extent pool.)
+
+Dead regions are skipped. A single doorbell rides the last `RegionUpdate` so the
+host drains the sweep as one complete batch; an empty ledger emits nothing (no
+events, no doorbell).
 
 Boot-time autostart (the boot manifest's configured unit — §7) reuses the
 `StartWorkload` code path agent-locally with **no** ring-C record, and — for a unit

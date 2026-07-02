@@ -319,9 +319,9 @@ For a unit whose boot-manifest entry declares a control protocol (API.md §7
 2. **`LoadGame{dev_path}` →** (`dev_path` = the boot manifest's `game_dev`); awaits
    `GameLoaded`.
 3. **Region registration (harness-driven):** the agent services the harness's
-   `RegisterRegion` messages as they arrive, performing the same pagemap
-   translation + manifest publication as the SDK path (§5), then awaits the harness's
-   socket-level `Ready{frame: 0}` — sent only after all its registrations
+   `RegisterRegion` requests as they arrive over agent.sock (the §5 publication path:
+   pagemap translation + manifest write; the harness links the SDK), then awaits the
+   harness's socket-level `Ready{frame: 0}` — sent only after all its registrations
    (reference-workload API.md §3.2). That socket-level `Ready` is the **harness's**
    message; it is distinct from the agent's ring-A `Ready` event and is never visible
    to the host.
@@ -336,6 +336,12 @@ For a unit whose boot-manifest entry declares a control protocol (API.md §7
    root snapshot is taken with the harness already inside the loop, and **every
    restored fork resumes there** — the worker-driver path never pushes `Start` (or any
    other command); the first host action after any restore is landing `PAD_SET`s.
+
+Every "awaits" above is a **bounded `MSG_DONTWAIT` poll** of the control socket, not
+a blocking recv: between empty polls the agent services region IPC and
+`sched_yield`s (§5 "IPC servicing sites"), so a workload blocked on a register reply
+between control replies cannot deadlock the boot; exceeding the spin cap is a boot
+fault (workload dead or wedged), not an indefinite hang.
 
 Suite-mode traffic (`HashRequest`/`HashReport`) and `Shutdown` are steady-state
 messages after READY, driven per reference-workload §3.2; they never participate in
@@ -368,12 +374,17 @@ must also be guaranteed not to move or swap.
 
 1. **Workload side (`detguest-sdk::register_region`)**: the workload calls
    `register_region(name, layout_version, ptr, len, flags)`. The SDK:
-   - `mlock2(ptr, len, 0)` — populates and pins every page (no `MLOCK_ONFAULT`; we
-     want faults taken *now*, at a deterministic point, not later),
-   - touches each page with a volatile read (belt-and-braces prefault check),
+   - `mlock(ptr, len)` — populates and pins every page (plain `mlock`, not
+     `mlock2(…, MLOCK_ONFAULT)`; we want faults taken *now*, at a deterministic
+     point, not later),
+   - prefaults with **one volatile read per 4 KiB page** (belt-and-braces — the
+     agent independently proves residency via pagemap; the mlock claim is not
+     trusted),
    - sends a `RegisterRegion` request to the agent over the agent IPC socket
-     (`/run/detguest/agent.sock`, `SOCK_SEQPACKET`) carrying `{name, layout_version,
-     gva, len, flags, pid}`.
+     (`/run/detguest/agent.sock`, `SOCK_SEQPACKET` — wire protocol in API.md §1.5.1)
+     carrying `{name, name_id, layout_version, gva, len, flags}`. The pid never
+     travels in a message: the agent binds it via `SO_PEERCRED` on the accepted
+     connection and rejects any peer that is not the supervised workload.
 2. **Agent side (translation)**: the agent reads `/proc/<pid>/pagemap` for
    `[gva, gva+len)`:
    - each 8-byte entry: bit 63 = present, bits 0–54 = PFN. Any non-present or
@@ -382,18 +393,42 @@ must also be guaranteed not to move or swap.
      the GPA space the hypervisor exposes — identity by construction of the VM memory
      map).
    - consecutive PFNs are coalesced into extents `{gpa, len}`.
-3. **Publication**: the agent writes the region into the **manifest area** of the
-   channel page under the seqlock discipline (increment `generation` to odd, write
-   entry + extents, increment to even), then emits a `RegionRegister` event (critical)
-   on ring A referencing the manifest slot, then doorbells. The host can now resolve
+3. **Publication**: the agent — the **only** manifest writer — writes the region into
+   the **manifest area** of the channel page under the seqlock discipline (increment
+   `generation` to odd, write entry + extents, increment to even), emits `NameIntern`
+   + `RegionRegister` (critical) on ring A referencing the manifest slot, doorbells,
+   and appends a `RegionRecord` (name, name_id, layout_version, pid, gva, len,
+   extents) to its in-memory registration ledger. The host can now resolve
    `name → [extents]` at any time by reading the manifest — including immediately after
    restoring any snapshot, with no event replay needed, because the manifest lives in
-   guest RAM and is part of every snapshot.
+   guest RAM and is part of every snapshot. The ledger is agent heap, i.e. also guest
+   RAM: it survives snapshot/restore/fork with everything else, which is exactly why
+   `ReverifyRegions` can re-walk pagemap on a restored guest without asking the
+   workload anything.
 4. **Host side (`detguest-host::manifest`)**: `Manifest::read(gm)` does a seqlock-
    consistent read (retry while `generation` is odd or changes). `resolve(name)` returns
    `Vec<Extent>` plus `layout_version`. `read_region(gm, name, offset, buf)` walks
    extents and issues `GuestMem::read` per extent — this is the primitive the
    hypervisor's `ReadGuestMemory` and the feature-map reader use.
+
+### IPC servicing sites (why registration cannot deadlock the boot)
+
+The agent is single-threaded, and the workload blocks on its register reply — so an
+agent that blocks on the workload's progress while a register request is pending
+would deadlock the boot. The agent.sock server is therefore serviced (non-blocking
+accept + drain of every readable request datagram) from **three** places:
+
+1. the **supervise epoll loop** (the listener and accepted connections are epoll
+   members — steady-state, post-Ready registrations),
+2. the **expected-regions Ready wait** (before the epoll loop runs, this wait IS the
+   IPC service loop — polled between manifest checks),
+3. the **control-recv idle loop** (§4.2): every empty poll of the control socket
+   services region IPC, because the workload registers regions *between* control
+   replies (e.g. after `GameLoaded`, before its socket-level `Ready`).
+
+Site 3 is what closes the register-during-control-Ready deadlock: the control-socket
+reply wait is a bounded `MSG_DONTWAIT` poll (service IPC + `sched_yield` between
+polls, spin cap ⇒ boot fault instead of hanging forever), never a blocking recv.
 
 ### Pinning requirements (normative, enforced by the guest image)
 
@@ -416,8 +451,14 @@ must also be guaranteed not to move or swap.
   vCPU/MMU state; on restore, every GVA→GPA mapping and every manifest byte is
   bit-identical by definition. The pinning rules above only defend against PFN movement
   *within* a single live run. The agent supports a `ReverifyRegions` command (host →
-  ring C) that re-walks pagemap and emits `RegionUpdate` if anything moved (a P0 bug if
-  it ever fires — it indicates a kernel-config regression).
+  ring C) that re-walks pagemap for every live region in its ledger and emits one
+  `RegionUpdate` per region: a generation echo when the extents hold; a P0 agent
+  `LogLine` alarm + in-place manifest extent rewrite when they drifted (a kernel-config
+  regression if it ever fires); a P0 alarm + DEAD manifest entry when the range no
+  longer translates (workload dead, pages reclaimed). One doorbell closes the sweep.
+  Full semantics in API.md §6. Because the ledger is guest RAM, this works unchanged
+  on a freshly restored/forked guest — the acceptance suite runs it after every
+  restore as the pinning canary.
 - **Layout versioning**: `layout_version` is bumped by the workload when the *internal
   structure* of a region changes (e.g., emulator changes its WRAM arena layout).
   `state-scorer` feature maps pin a `layout_version` and the hypervisor refuses feature

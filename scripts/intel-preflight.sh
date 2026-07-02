@@ -142,19 +142,29 @@ else
   fail "perf_event_paranoid = ${para:-unreadable} (need ≤ 1 for PERF_COUNT_HW_INSTRUCTIONS in a guest)"
 fi
 
-echo "[preflight] hugepages (2 MiB channel page for in-VM guests' host side)"
-HP_2M="/sys/kernel/mm/hugepages/hugepages-2048kB"
-if [[ -d "$HP_2M" ]]; then
-  ok "2 MiB hugepage support present"
-  nr=$(cat "${HP_2M}/nr_hugepages" 2>/dev/null)
-  free=$(cat "${HP_2M}/free_hugepages" 2>/dev/null)
-  if [[ "${nr:-}" =~ ^[0-9]+$ && "${free:-}" =~ ^[0-9]+$ && "$nr" -gt 0 && "$free" -gt 0 ]]; then
-    ok "2 MiB hugepage pool has ${free}/${nr} pages free"
+# HOST 2 MiB hugepages are NOT needed by anything in tests/vm: the harness
+# backs guest RAM with a plain anonymous mmap, and the agent's hugetlbfs
+# channel page comes from the GUEST-internal pool (`hugepages=4` on the
+# guest cmdline, satisfied inside the VM). The check remains for the
+# determinism-hypervisor repo's harness, which does map host hugepages —
+# opt in with --require-host-hugepages when preflighting for that use.
+if [[ " ${*:-} " == *" --require-host-hugepages "* ]]; then
+  echo "[preflight] host hugepages (2 MiB pool for the hypervisor harness)"
+  HP_2M="/sys/kernel/mm/hugepages/hugepages-2048kB"
+  if [[ -d "$HP_2M" ]]; then
+    ok "2 MiB hugepage support present"
+    nr=$(cat "${HP_2M}/nr_hugepages" 2>/dev/null)
+    free=$(cat "${HP_2M}/free_hugepages" 2>/dev/null)
+    if [[ "${nr:-}" =~ ^[0-9]+$ && "${free:-}" =~ ^[0-9]+$ && "$nr" -gt 0 && "$free" -gt 0 ]]; then
+      ok "2 MiB hugepage pool has ${free}/${nr} pages free"
+    else
+      fail "2 MiB hugepage pool empty (${free:-?}/${nr:-?} free/total) — reserve pages with hugepages=N or vm.nr_hugepages"
+    fi
   else
-    fail "2 MiB hugepage pool empty (${free:-?}/${nr:-?} free/total) — reserve pages with hugepages=N or vm.nr_hugepages"
+    fail "no 2 MiB hugepage support"
   fi
 else
-  fail "no 2 MiB hugepage support"
+  note "host hugepage check skipped (guest-sdk tests need none; pass --require-host-hugepages for the hypervisor harness)"
 fi
 
 echo "[preflight] Rust toolchain"
@@ -220,7 +230,7 @@ elif [[ -n "${DETGUEST_REPLAY_TOOL:-}" ]]; then
 else
   note "determinism_replay not on PATH — M5 replay gate remains blocked by guest-sdk-ext-hyp-determinism-replay-linux"
 fi
-note "snapshot/fork/restore provider is external determinism-hypervisor; local harness exposes only KVM boot and pv-pad stubs"
+note "local harness provides KVM snapshot/fork/restore (tests/vm/src/harness/snapshot.rs — M4 acceptance tier); production snapshots remain determinism-hypervisor's"
 
 if [[ $FAIL -ne 0 ]]; then
   echo "[preflight] FAILED — the in-VM tier cannot run on this machine"
