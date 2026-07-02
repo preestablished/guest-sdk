@@ -17,7 +17,11 @@ use detguest_sdk::{self as sdk, RegionFlags};
 const CONTROL_FD: i32 = 3;
 const PROTO_VERSION: u64 = 1;
 const WRAM_LEN: usize = 4096;
-const FRAMEBUFFER_LEN: usize = 4096;
+// D7 layout_version 1 contract (determinism-hypervisor 5698d7e): geometry
+// derives from layout_version — XRGB8888, 256x224, stride 1024, EXACTLY
+// 229,376 bytes. Anything else is rejected with FailedPrecondition. NOT a
+// power of two: framebuffer indices use `%`, not a mask.
+const FRAMEBUFFER_LEN: usize = 229_376;
 const META_LEN: usize = 256;
 const SECTOR_SIZE: usize = 512;
 const WORK_UNITS_PER_FRAME: usize = 4096;
@@ -78,7 +82,7 @@ fn run_frame_loop() -> ! {
                 ^ 0xa5a5_5a5a_1020_3040;
             let wram_index = ((acc as usize) ^ step) & (WRAM_LEN - 1);
             let framebuffer_index =
-                ((acc.rotate_right(17) as usize) ^ (step << 1)) & (FRAMEBUFFER_LEN - 1);
+                ((acc.rotate_right(17) as usize) ^ (step << 1)) % FRAMEBUFFER_LEN;
             let meta_index = (step ^ frame as usize) & (META_LEN - 1);
             unsafe {
                 bump_byte(addr_of_mut!(WRAM).cast::<u8>(), wram_index, acc as u8);
@@ -381,27 +385,35 @@ fn publish_regions() {
     // SAFETY: these static byte arrays are mapped for the process lifetime and
     // never move, satisfying the SDK region registration contract.
     unsafe {
-        let _wram = sdk::register_region(
+        let wram = sdk::register_region(
             "wram",
             1,
             addr_of_mut!(WRAM).cast::<u8>(),
             WRAM_LEN,
             RegionFlags::empty(),
-        );
-        let _framebuffer = sdk::register_region(
+        )
+        .expect("register wram");
+        let framebuffer = sdk::register_region(
             "framebuffer",
             1,
             addr_of_mut!(FRAMEBUFFER).cast::<u8>(),
             FRAMEBUFFER_LEN,
             RegionFlags::FRAMEBUFFER,
-        );
-        let _meta = sdk::register_region(
+        )
+        .expect("register framebuffer");
+        let meta = sdk::register_region(
             "meta",
             1,
             addr_of_mut!(META).cast::<u8>(),
             META_LEN,
             RegionFlags::empty(),
-        );
+        )
+        .expect("register meta");
+        // Dropping a handle unregisters (DEADs) its region; these live until
+        // power-off by design, so leak all three deliberately.
+        std::mem::forget(wram);
+        std::mem::forget(framebuffer);
+        std::mem::forget(meta);
     }
 }
 

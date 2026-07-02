@@ -6,6 +6,8 @@
 //! detcall handler delegates channel work to `detguest-host` so the harness
 //! exercises the real host crate, not a reimplementation.
 
+use std::collections::BTreeMap;
+
 use detguest_host::Channel;
 use detguest_wire::header::CHANNEL_SIZE_PAGES;
 use detguest_wire::ports;
@@ -15,11 +17,15 @@ use super::VmHarness;
 /// pv-pad MMIO latch stub (determinism-hypervisor ARCHITECTURE.md §6.4 owns
 /// the real device; this repo only cites the addresses). Base GPA
 /// 0xD000_1000; PAD0..PAD3 at +0x08 + 4*port; FRAME_COUNTER at +0x1C.
+#[derive(Clone)]
 pub struct PvPad {
     /// Latched pad values returned by PAD0..PAD3 reads.
     pub pads: [u32; 4],
     /// Last FRAME_COUNTER value written by the guest.
     pub frame_counter: u32,
+    /// Per-frame input schedule: frame → latch operations, applied on the
+    /// guest's FRAME_COUNTER writes (see [`PvPad::schedule`]).
+    schedule: BTreeMap<u32, Vec<(u8, u32)>>,
 }
 
 /// pv-pad MMIO base GPA (cited from the hypervisor's device map).
@@ -34,12 +40,48 @@ impl PvPad {
     pub fn set_pad(&mut self, port: usize, value: u32) {
         self.pads[port] = value;
     }
+
+    /// Schedule `value` on `port` to become visible to `poll_input` during
+    /// guest frame `frame`.
+    ///
+    /// Latch timing contract: the SDK's `frame_mark` at the end of workload
+    /// frame `F-1` writes FRAME_COUNTER value `F`, and the work period that
+    /// follows (all `poll_input` calls included) is workload frame `F`. The
+    /// harness latches the values scheduled for frame `F` inside that write's
+    /// exit — so exactly the polls of frame `F` observe them. Values
+    /// scheduled for frames the guest already passed are applied (in frame
+    /// order, latest wins) on the next FRAME_COUNTER write. Frame 0 is not
+    /// schedulable (no FRAME_COUNTER write precedes it); use `set_pad`.
+    pub fn schedule(&mut self, frame: u32, port: u8, value: u32) {
+        self.schedule.entry(frame).or_default().push((port, value));
+    }
+
+    /// Apply every schedule entry due at (or before) FRAME_COUNTER value
+    /// `written`, in ascending frame order (latest wins per port).
+    fn latch_due(&mut self, written: u32) {
+        // split_off(written + 1) keeps frames > written scheduled; everything
+        // else is due now. `written == u32::MAX` cannot leave a remainder.
+        let later = match written.checked_add(1) {
+            Some(next) => self.schedule.split_off(&next),
+            None => BTreeMap::new(),
+        };
+        let due = std::mem::replace(&mut self.schedule, later);
+        for (_frame, ops) in due {
+            for (port, value) in ops {
+                if let Some(pad) = self.pads.get_mut(port as usize) {
+                    *pad = value;
+                }
+            }
+        }
+    }
 }
 
 const SERIAL_BASE: u16 = 0x3F8;
 const SERIAL_END: u16 = 0x400;
 
-/// All mutable PIO/MMIO device state.
+/// All mutable PIO/MMIO device state. `Clone` so a `VmSnapshot` can carry
+/// the detcall latches + pv-pad (including the input schedule) verbatim.
+#[derive(Clone)]
 pub struct PioState {
     /// CHANNEL_INIT GPA latches (API.md §5).
     pub init_lo: u32,
@@ -62,6 +104,7 @@ impl PioState {
             pvpad: PvPad {
                 pads: [0; 4],
                 frame_counter: 0,
+                schedule: BTreeMap::new(),
             },
         }
     }
@@ -180,6 +223,9 @@ fn apply_pvpad_write(pv: &mut PvPad, addr: u64, value: u32) -> Option<u32> {
     let off = addr.checked_sub(PVPAD_BASE)?;
     if off == PVPAD_FRAME_COUNTER_OFF && off < PVPAD_END_OFF {
         pv.frame_counter = value;
+        // Latch the input schedule for the frame this write opens (see
+        // `PvPad::schedule` for the exact timing contract).
+        pv.latch_due(value);
         return Some(value);
     }
     None
@@ -189,14 +235,20 @@ fn apply_pvpad_write(pv: &mut PvPad, addr: u64, value: u32) -> Option<u32> {
 mod tests {
     use super::*;
 
+    fn fresh_pvpad() -> PvPad {
+        PioState::new().pvpad
+    }
+
+    /// Simulate the guest's end-of-frame FRAME_COUNTER write.
+    fn write_frame_counter(pv: &mut PvPad, value: u32) -> Option<u32> {
+        apply_pvpad_write(pv, PVPAD_BASE + PVPAD_FRAME_COUNTER_OFF, value)
+    }
+
     #[test]
     fn frame_counter_write_updates_latch_and_requests_drain() {
-        let mut pv = PvPad {
-            pads: [0; 4],
-            frame_counter: 0,
-        };
+        let mut pv = fresh_pvpad();
 
-        let drain_frame = apply_pvpad_write(&mut pv, PVPAD_BASE + PVPAD_FRAME_COUNTER_OFF, 42);
+        let drain_frame = write_frame_counter(&mut pv, 42);
 
         assert_eq!(drain_frame, Some(42));
         assert_eq!(pv.frame_counter, 42);
@@ -204,14 +256,71 @@ mod tests {
 
     #[test]
     fn non_frame_counter_pvpad_write_does_not_request_drain() {
-        let mut pv = PvPad {
-            pads: [0; 4],
-            frame_counter: 7,
-        };
+        let mut pv = fresh_pvpad();
+        pv.frame_counter = 7;
 
         let drain_frame = apply_pvpad_write(&mut pv, PVPAD_BASE + PVPAD_PAD0_OFF, 99);
 
         assert_eq!(drain_frame, None);
         assert_eq!(pv.frame_counter, 7);
+    }
+
+    /// Scripted FRAME_COUNTER sequence: the value scheduled for frame K is
+    /// latched exactly by the write of value K (the write that opens frame
+    /// K's work period), so frame K's `poll_input` sees it.
+    #[test]
+    fn schedule_latches_on_the_frame_counter_write_that_opens_the_frame() {
+        let mut pv = fresh_pvpad();
+        pv.schedule(2, 0, 0xAA);
+        pv.schedule(3, 0, 0xBB);
+        pv.schedule(3, 1, 0x11);
+
+        // Guest ends frame 0: write 1 opens frame 1 — nothing due yet.
+        write_frame_counter(&mut pv, 1);
+        assert_eq!(pv.pads, [0, 0, 0, 0], "frame 1 polls see nothing");
+
+        // Write 2 opens frame 2: frame 2's value is now visible.
+        write_frame_counter(&mut pv, 2);
+        assert_eq!(
+            pv.pads,
+            [0xAA, 0, 0, 0],
+            "frame 2 polls see frame 2's value"
+        );
+
+        // Write 3 opens frame 3: both ports latch.
+        write_frame_counter(&mut pv, 3);
+        assert_eq!(
+            pv.pads,
+            [0xBB, 0x11, 0, 0],
+            "frame 3 polls see frame 3's values"
+        );
+
+        // Write 4: nothing scheduled — the latch is sticky.
+        write_frame_counter(&mut pv, 4);
+        assert_eq!(pv.pads, [0xBB, 0x11, 0, 0]);
+    }
+
+    #[test]
+    fn schedule_skipped_frames_apply_in_order_latest_wins() {
+        let mut pv = fresh_pvpad();
+        pv.schedule(2, 0, 0x22);
+        pv.schedule(4, 0, 0x44);
+        pv.schedule(6, 0, 0x66);
+
+        // The guest jumps straight to write 5 (e.g. a child restored past
+        // frames 2 and 4): both due entries apply, in frame order.
+        write_frame_counter(&mut pv, 5);
+        assert_eq!(pv.pads[0], 0x44, "latest due frame wins");
+
+        write_frame_counter(&mut pv, 6);
+        assert_eq!(pv.pads[0], 0x66);
+    }
+
+    #[test]
+    fn schedule_out_of_range_port_is_ignored() {
+        let mut pv = fresh_pvpad();
+        pv.schedule(1, 7, 0xDEAD);
+        write_frame_counter(&mut pv, 1);
+        assert_eq!(pv.pads, [0, 0, 0, 0]);
     }
 }

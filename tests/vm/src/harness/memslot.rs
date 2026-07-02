@@ -27,6 +27,11 @@ impl MemSlot {
         MemSlot { base, len }
     }
 
+    /// Length of the slot in bytes (the guest RAM size).
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
     fn range(&self, gpa: u64, n: usize) -> Result<usize, MemError> {
         let off = usize::try_from(gpa).map_err(|_| MemError::Overflow)?;
         if off.checked_add(n).is_none() || off + n > self.len {

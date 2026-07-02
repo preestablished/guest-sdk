@@ -11,6 +11,7 @@
 pub mod icount;
 pub mod memslot;
 pub mod pio;
+pub mod snapshot;
 pub mod x86;
 
 use std::fs::File;
@@ -94,8 +95,8 @@ pub enum StopReason {
 
 /// The harness VM.
 pub struct VmHarness {
-    _kvm: Kvm,
-    _vm: VmFd,
+    kvm: Kvm,
+    vm: VmFd,
     vcpu: Option<VcpuFd>,
     guest_mem: GuestMemoryMmap,
     mem: MemSlot,
@@ -112,44 +113,79 @@ pub struct VmHarness {
     pub icount: GuestIcount,
 }
 
+/// The common "create vm + tss + irqchip + PIT2 + memslot" setup shared by
+/// [`VmHarness::new`] (boot path) and [`VmHarness::from_snapshot`]
+/// (state-restore path).
+struct VmCore {
+    kvm: Kvm,
+    vm: VmFd,
+    guest_mem: GuestMemoryMmap,
+    mem: MemSlot,
+}
+
+fn create_vm_core(mem_size: usize) -> io::Result<VmCore> {
+    let kvm = Kvm::new().map_err(io::Error::from)?;
+    let vm = kvm.create_vm().map_err(io::Error::from)?;
+    // Legacy Intel requirement: TSS + identity map out of the way of RAM
+    // we use (above 128 MiB would collide with nothing, but the
+    // conventional 0xfffbc000 area below 4 GiB works with any RAM size).
+    vm.set_tss_address(0xfffb_d000).map_err(io::Error::from)?;
+    vm.create_irq_chip().map_err(io::Error::from)?;
+    // SPEAKER_DUMMY is load-bearing: without it, port 0x61 (PIT refresh
+    // toggle) exits to userspace, our constant answer never toggles, and
+    // the kernel's PIT-polled TSC calibration spins forever (a flaky
+    // boot hang whenever fast TSC calibration fails).
+    let pit = kvm_bindings::kvm_pit_config {
+        flags: kvm_bindings::KVM_PIT_SPEAKER_DUMMY,
+        ..Default::default()
+    };
+    vm.create_pit2(pit).map_err(io::Error::from)?;
+
+    let guest_mem: GuestMemoryMmap = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size)])
+        .map_err(|e| io::Error::other(format!("guest memory: {e}")))?;
+    let host_addr = guest_mem
+        .get_host_address(GuestAddress(0))
+        .map_err(|e| io::Error::other(format!("host addr: {e}")))?;
+    let slot = kvm_bindings::kvm_userspace_memory_region {
+        slot: 0,
+        flags: 0,
+        guest_phys_addr: 0,
+        memory_size: mem_size as u64,
+        userspace_addr: host_addr as u64,
+    };
+    // SAFETY: the region maps a live GuestMemoryMmap allocation that
+    // outlives the VM (owned by the harness struct).
+    unsafe { vm.set_user_memory_region(slot).map_err(io::Error::from)? };
+    let mem = MemSlot::new(host_addr, mem_size);
+    Ok(VmCore {
+        kvm,
+        vm,
+        guest_mem,
+        mem,
+    })
+}
+
+/// Create vCPU 0 with the full supported-CPUID table (identical in the boot
+/// and restore paths — CPUID determines guest-visible feature bits).
+fn create_vcpu_with_cpuid(kvm: &Kvm, vm: &VmFd) -> io::Result<VcpuFd> {
+    let vcpu = vm.create_vcpu(0).map_err(io::Error::from)?;
+    let cpuid = kvm
+        .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+        .map_err(io::Error::from)?;
+    vcpu.set_cpuid2(&cpuid).map_err(io::Error::from)?;
+    Ok(vcpu)
+}
+
 impl VmHarness {
     /// Build and fully configure the VM (memory, kernel, initramfs, boot
     /// params, long-mode vCPU state, irqchip+PIT, perf counter).
     pub fn new(cfg: &VmConfig) -> io::Result<VmHarness> {
-        let kvm = Kvm::new().map_err(io::Error::from)?;
-        let vm = kvm.create_vm().map_err(io::Error::from)?;
-        // Legacy Intel requirement: TSS + identity map out of the way of RAM
-        // we use (above 128 MiB would collide with nothing, but the
-        // conventional 0xfffbc000 area below 4 GiB works with any RAM size).
-        vm.set_tss_address(0xfffb_d000).map_err(io::Error::from)?;
-        vm.create_irq_chip().map_err(io::Error::from)?;
-        // SPEAKER_DUMMY is load-bearing: without it, port 0x61 (PIT refresh
-        // toggle) exits to userspace, our constant answer never toggles, and
-        // the kernel's PIT-polled TSC calibration spins forever (a flaky
-        // boot hang whenever fast TSC calibration fails).
-        let pit = kvm_bindings::kvm_pit_config {
-            flags: kvm_bindings::KVM_PIT_SPEAKER_DUMMY,
-            ..Default::default()
-        };
-        vm.create_pit2(pit).map_err(io::Error::from)?;
-
-        let guest_mem: GuestMemoryMmap =
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), cfg.mem_size)])
-                .map_err(|e| io::Error::other(format!("guest memory: {e}")))?;
-        let host_addr = guest_mem
-            .get_host_address(GuestAddress(0))
-            .map_err(|e| io::Error::other(format!("host addr: {e}")))?;
-        let slot = kvm_bindings::kvm_userspace_memory_region {
-            slot: 0,
-            flags: 0,
-            guest_phys_addr: 0,
-            memory_size: cfg.mem_size as u64,
-            userspace_addr: host_addr as u64,
-        };
-        // SAFETY: the region maps a live GuestMemoryMmap allocation that
-        // outlives the VM (owned by this struct).
-        unsafe { vm.set_user_memory_region(slot).map_err(io::Error::from)? };
-        let mem = MemSlot::new(host_addr, cfg.mem_size);
+        let VmCore {
+            kvm,
+            vm,
+            guest_mem,
+            mem,
+        } = create_vm_core(cfg.mem_size)?;
 
         // ---- load kernel (bzImage), initramfs, cmdline, boot params ----
         let mut kernel = File::open(&cfg.bzimage)?;
@@ -205,11 +241,7 @@ impl VmHarness {
         .map_err(|e| io::Error::other(format!("boot params: {e}")))?;
 
         // ---- vCPU: CPUID + 64-bit long mode entry ----
-        let vcpu = vm.create_vcpu(0).map_err(io::Error::from)?;
-        let cpuid = kvm
-            .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
-            .map_err(io::Error::from)?;
-        vcpu.set_cpuid2(&cpuid).map_err(io::Error::from)?;
+        let vcpu = create_vcpu_with_cpuid(&kvm, &vm)?;
         x86::setup_long_mode(&vcpu, &guest_mem)?;
         let mut regs = vcpu.get_regs().map_err(io::Error::from)?;
         regs.rip = loaded.kernel_load.0 + 0x200; // 64-bit entry point
@@ -222,8 +254,8 @@ impl VmHarness {
         install_vcpu_kick_handler();
 
         Ok(VmHarness {
-            _kvm: kvm,
-            _vm: vm,
+            kvm,
+            vm,
             vcpu: Some(vcpu),
             guest_mem,
             mem,
@@ -386,6 +418,15 @@ impl VmHarness {
     }
 
     pub(crate) fn mem(&self) -> MemSlot {
+        self.mem
+    }
+
+    /// A `GuestMem` view of guest RAM for host-side reads that must NOT run
+    /// the vCPU or touch the rings (e.g. `detguest-host` `read_manifest` /
+    /// `read_region` from an integration test — the M4 "platform
+    /// readability" discipline). Copies are only safe while the vCPU is
+    /// stopped, i.e. between `run_until` calls (ARCHITECTURE.md §2).
+    pub fn guest_mem_view(&self) -> MemSlot {
         self.mem
     }
 

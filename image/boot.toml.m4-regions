@@ -1,0 +1,27 @@
+# M4 region-publication acceptance fixture (Ms4 plan package 06 §B).
+#
+# Staged into the initramfs as /etc/detguest/boot.toml by tests/vm. Plain
+# autostart (no [unit.control]); Ready is gated on the three expected
+# regions being live in the detchannel manifest — every boot of this fixture
+# is therefore a regression test for the region-registration path.
+boot_toml_version = 1
+
+[autostart]
+unit = 0
+
+[[unit]]
+id = 0
+exec = "/opt/m4-regions"
+log_mask = 0x1F
+
+[[expected_region]]
+name = "wram"
+layout_version = 1
+
+[[expected_region]]
+name = "framebuffer"
+layout_version = 1
+
+[[expected_region]]
+name = "meta"
+layout_version = 1
