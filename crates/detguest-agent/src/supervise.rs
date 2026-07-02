@@ -216,6 +216,9 @@ pub struct Supervisor {
     pub log_mask: u32,
     /// Graceful-shutdown countdown, when active.
     pub shutdown: Option<ShutdownState>,
+    /// Region-registration IPC server + ledger (bound by `runtime::run`;
+    /// `None` only in tests that don't exercise regions).
+    pub(crate) region_ipc: Option<crate::region_ipc::RegionIpc>,
     /// Outstanding FORCED-quiesce token (v1: at most one).
     forced_token: u64,
     epfd: RawFd,
@@ -227,6 +230,8 @@ const TOK_SIG: u64 = 1;
 const TOK_TIMER: u64 = 2;
 const TOK_OUT: u64 = 3;
 const TOK_ERR: u64 = 4;
+const TOK_REGION_LISTENER: u64 = 5;
+const TOK_REGION_CONN: u64 = 6;
 
 impl Supervisor {
     /// Build the loop fds: blocked-SIGCHLD signalfd + 10 ms periodic timerfd
@@ -279,12 +284,49 @@ impl Supervisor {
                 workload: None,
                 log_mask: 0x1F,
                 shutdown: None,
+                region_ipc: None,
                 forced_token: 0,
                 epfd,
                 sigfd,
                 timerfd,
             })
         }
+    }
+
+    /// Install the region IPC server and register its listener with the
+    /// epoll loop (runtime calls this before the autostart unit spawns).
+    pub(crate) fn install_region_ipc(&mut self, ipc: crate::region_ipc::RegionIpc) {
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: TOK_REGION_LISTENER,
+        };
+        // SAFETY: registering the listener fd with our epoll instance.
+        unsafe {
+            libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_ADD, ipc.listener_fd(), &mut ev);
+        }
+        self.region_ipc = Some(ipc);
+    }
+
+    /// Accept + drain pending region-IPC requests (non-blocking; the
+    /// deadlock-avoidance primitive — called from the epoll loop, the
+    /// expected-regions wait, and the control-recv idle loop).
+    pub(crate) fn service_region_ipc(&mut self) -> io::Result<()> {
+        let Some(mut ipc) = self.region_ipc.take() else {
+            return Ok(());
+        };
+        let pid = self.workload.as_ref().map(|w| w.pid);
+        let result = ipc.service(&mut self.channel, pid, Some((self.epfd, TOK_REGION_CONN)));
+        self.region_ipc = Some(ipc);
+        result
+    }
+
+    /// `ReverifyRegions` dispatch (ring C → [`crate::commands`]).
+    pub(crate) fn reverify_regions(&mut self) {
+        let Some(mut ipc) = self.region_ipc.take() else {
+            return; // no server bound (tests): nothing registered, no-op
+        };
+        ipc.reverify(&mut self.channel);
+        self.region_ipc = Some(ipc);
     }
 
     /// Start `unit` and emit `WorkloadStarted` (shared by ring-C
@@ -502,9 +544,15 @@ impl Supervisor {
                             }
                         }
                     }
+                    TOK_REGION_LISTENER | TOK_REGION_CONN => {
+                        self.service_region_ipc()?;
+                    }
                     _ => {}
                 }
             }
+            // Region IPC every pass (same deterministic cadence as ring C):
+            // covers requests that raced the epoll registration.
+            self.service_region_ipc()?;
             // Shutdown progress (virtual-time deadline).
             if let Some(s) = &self.shutdown {
                 match &self.workload {

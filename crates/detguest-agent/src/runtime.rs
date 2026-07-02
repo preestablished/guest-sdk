@@ -179,13 +179,19 @@ pub fn autostart_and_ready(sup: &mut Supervisor) -> Result<(), String> {
         sup.start_unit_with_control(unit, child_fd.as_raw_fd())
             .map_err(|e| format!("autostart unit {unit}: {e}"))?;
         drop(child_fd);
-        control::drive_refwork_start(&sock, control)?;
+        // The workload registers regions over agent.sock between control
+        // replies (e.g. GameLoaded → Ready): service region IPC while
+        // waiting or the boot deadlocks (ARCHITECTURE.md §5).
+        control::drive_refwork_start(&sock, control, || {
+            sup.service_region_ipc()
+                .map_err(|e| format!("region IPC service: {e}"))
+        })?;
     } else {
         sup.start_unit(unit)
             .map_err(|e| format!("autostart unit {unit}: {e}"))?;
     }
     let expected_regions = sup.manifest.expected_regions.clone();
-    let snapshot = wait_for_expected_regions(&sup.channel, &expected_regions)?;
+    let snapshot = wait_for_expected_regions(sup, &expected_regions)?;
     emit_expected_region_evidence(sup, &expected_regions, snapshot)?;
     emit_ready(sup, unit, snapshot);
     Ok(())
@@ -287,11 +293,16 @@ fn expected_region_evidence(
 }
 
 fn wait_for_expected_regions(
-    channel: &AgentChannel,
+    sup: &mut Supervisor,
     expected_regions: &[ExpectedRegion],
 ) -> Result<ReadyManifest, String> {
     if expected_regions.is_empty() {
-        let bytes = channel
+        // Even with nothing to gate on, drain any register requests that
+        // raced the autostart so a fast workload isn't left blocked.
+        sup.service_region_ipc()
+            .map_err(|e| format!("region IPC service: {e}"))?;
+        let bytes = sup
+            .channel
             .copy_manifest_stable()
             .map_err(|e| format!("read manifest before Ready: {e:?}"))?;
         let hdr = detguest_wire::manifest::ManifestHeader::read_from(&bytes)
@@ -305,7 +316,11 @@ fn wait_for_expected_regions(
     }
     let mut last_err = String::new();
     for _ in 0..READY_REGION_POLL_LIMIT {
-        match expected_regions_ready(channel, expected_regions) {
+        // Registrations arrive over agent.sock; the supervise epoll loop is
+        // not running yet, so this wait IS the IPC service loop.
+        sup.service_region_ipc()
+            .map_err(|e| format!("region IPC service: {e}"))?;
+        match expected_regions_ready(&sup.channel, expected_regions) {
             Ok(snapshot) => return Ok(snapshot),
             Err(err) => last_err = err,
         }
@@ -392,6 +407,12 @@ pub fn run() -> ! {
             power_off();
         }
     };
+    // agent.sock must exist before any workload runs (§5): a guest without
+    // the region path must not reach Ready.
+    match crate::region_ipc::RegionIpc::bind() {
+        Ok(ipc) => sup.install_region_ipc(ipc),
+        Err(e) => boot_fault(&mut sup.channel, &format!("bind agent.sock: {e}")),
+    }
     if let Err(detail) = autostart_and_ready(&mut sup) {
         boot_fault(&mut sup.channel, &detail);
     }

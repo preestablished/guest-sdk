@@ -14,13 +14,13 @@ use std::{
 
 pub use detguest_wire::FaultDecision;
 
+mod agent_client;
 mod beacons;
 mod channel;
 mod inject;
 mod intern;
 mod pio;
 mod regions;
-mod translate;
 
 pub use regions::{RegionError, RegionFlags, RegionHandle};
 
@@ -292,12 +292,18 @@ pub fn stats() -> SdkStats {
 
 /// Publish `[ptr, ptr+len)` to the host under `name`.
 ///
-/// In standalone mode this validates the stable public inputs and returns a
-/// no-op handle so workloads can run unmodified outside the platform.
+/// The real path (API.md §1.5): mlock + prefault in this process, then
+/// register with the agent over `/run/detguest/agent.sock` — the agent
+/// translates via pagemap and writes the manifest. Standalone mode (no
+/// channel, hence no agent) returns [`RegionError::AgentUnavailable`].
+///
+/// The returned handle unregisters on drop (the manifest entry goes DEAD):
+/// hold it for as long as the region should stay host-readable — typically
+/// the process lifetime, via `std::mem::forget`.
 ///
 /// # Safety
 /// `ptr..ptr+len` must remain valid, mapped, and non-relocating for the life
-/// of the returned handle once platform registration is implemented.
+/// of the returned handle.
 pub unsafe fn register_region(
     name: &'static str,
     layout_version: u32,
@@ -308,7 +314,10 @@ pub unsafe fn register_region(
     if let Some(mut state) = sdk_state() {
         state.register_region(name, layout_version, ptr, len, flags)
     } else {
-        regions::register_region(name, layout_version, ptr, len, flags)
+        // No channel ⇒ not under the agent ⇒ nowhere to publish. Validate
+        // first so input bugs surface identically in both modes.
+        regions::validate_region(name, ptr, len)?;
+        Err(RegionError::AgentUnavailable)
     }
 }
 
@@ -352,99 +361,41 @@ impl SdkState {
         len: usize,
         flags: RegionFlags,
     ) -> Result<RegionHandle, RegionError> {
-        regions::validate_region(name, ptr, len)?;
-        let extents = regions::pin_and_translate(ptr, len)?;
-        self.publish_region(name, layout_version, ptr, len, flags, &extents)
-    }
-
-    #[cfg(test)]
-    fn register_region_with_extents(
-        &mut self,
-        name: &'static str,
-        layout_version: u32,
-        ptr: *const u8,
-        len: usize,
-        flags: RegionFlags,
-        extents: &[detguest_wire::manifest::Extent],
-    ) -> Result<RegionHandle, RegionError> {
-        regions::validate_region(name, ptr, len)?;
-        self.publish_region(name, layout_version, ptr, len, flags, extents)
-    }
-
-    fn publish_region(
-        &mut self,
-        name: &'static str,
-        layout_version: u32,
-        ptr: *const u8,
-        len: usize,
-        flags: RegionFlags,
-        extents: &[detguest_wire::manifest::Extent],
-    ) -> Result<RegionHandle, RegionError> {
         use detguest_wire::events::{EventPayload, RegionEvent};
-        use detguest_wire::manifest::{
-            writer_begin, writer_end, ManifestHeader, RegionEntry, EXTENT_CAPACITY, REGION_CAPACITY,
-        };
 
+        regions::validate_region(name, ptr, len)?;
+        regions::pin_and_prefault(ptr, len)?;
+        // The SDK intern table is the single name_id authority (the host
+        // folds ring-A and ring-W NameIntern into one map); this also emits
+        // the ring-W NameIntern exactly as before.
         let name_id = self
             .intern_name(name, 0)
             .ok_or(RegionError::AgentUnavailable)?;
-        let packed_name =
-            RegionEntry::pack_name(name.as_bytes()).map_err(|_| RegionError::NameTooLong)?;
-        let manifest = self._channel.manifest_mut();
-        let mut hdr =
-            ManifestHeader::read_from(manifest).map_err(|_| RegionError::AgentUnavailable)?;
-        hdr.validate().map_err(|_| RegionError::AgentUnavailable)?;
-        if hdr.region_count as usize >= REGION_CAPACITY {
-            return Err(RegionError::ManifestFull);
-        }
-        if hdr.extent_count as usize + extents.len() > EXTENT_CAPACITY {
-            return Err(RegionError::TooManyExtents);
-        }
-
-        let region_id = hdr.region_count;
-        let extent_off = hdr.extent_count;
-        let odd_generation = writer_begin(manifest).map_err(|_| RegionError::AgentUnavailable)?;
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        for (i, extent) in extents.iter().enumerate() {
-            extent
-                .write_to(manifest, extent_off as usize + i)
-                .expect("extent bounds checked before manifest write");
-        }
-        let entry = RegionEntry {
-            region_id,
-            name_id,
-            layout_version,
+        // The agent translates via /proc/<pid>/pagemap and writes the
+        // manifest under the seqlock — it is the only manifest writer.
+        let reply = agent_client::call(&detguest_wire::regionipc::Request::Register {
             flags: flags.bits(),
+            layout_version,
+            name_id,
             gva: ptr as u64,
             len: len as u64,
-            extent_off,
-            extent_n: extents.len() as u32,
-            name: packed_name,
-        };
-        entry
-            .write_to(manifest, region_id as usize)
-            .expect("region slot checked before manifest write");
-        hdr.generation = odd_generation;
-        hdr.region_count = hdr.region_count.saturating_add(1);
-        hdr.extent_count = hdr.extent_count.saturating_add(extents.len() as u32);
-        hdr.write_to(manifest)
-            .expect("manifest header bounds checked before manifest write");
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            name: name.as_bytes(),
+        })?;
+        if reply.status != detguest_wire::regionipc::STATUS_OK {
+            return Err(agent_client::status_to_error(reply.status));
+        }
         let manifest_generation =
-            writer_end(manifest).map_err(|_| RegionError::AgentUnavailable)?;
-        let manifest_generation =
-            u32::try_from(manifest_generation).map_err(|_| RegionError::AgentUnavailable)?;
-
+            u32::try_from(reply.manifest_generation).map_err(|_| RegionError::AgentUnavailable)?;
         let ev = EventPayload::RegionRegister(RegionEvent {
-            region_id,
-            name_id,
+            region_id: reply.region_id,
+            name_id: reply.name_id,
             layout_version,
             manifest_generation,
         });
         self._channel
             .emit_w_event_with_doorbell(vnanos(), 0, &ev, channel::EventClass::Critical)
             .map_err(|_| RegionError::AgentUnavailable)?;
-        Ok(RegionHandle::new(region_id))
+        Ok(RegionHandle::new(reply.region_id))
     }
 
     fn assert_always(&mut self, cond: bool, name: &'static str, details: fmt::Arguments<'_>) {
@@ -577,9 +528,7 @@ mod tests {
         OFF_RING_W_DROPPED_BYTES, OFF_RING_W_DROPPED_BY_KIND, OFF_RING_W_DROPPED_RECORDS,
         OFF_RING_W_PROD, PROTO_VERSION, RING_W_SIZE,
     };
-    use detguest_wire::manifest::{
-        init_manifest, Extent, ManifestHeader, RegionEntry, MANIFEST_TOTAL_SIZE,
-    };
+    use detguest_wire::manifest::{init_manifest, MANIFEST_TOTAL_SIZE};
     use detguest_wire::record::{
         EventKind, RecordHeader, FLAG_REACHABLE_DECL, FLAG_TRUNCATED, MAX_RECORD_LEN,
     };
@@ -762,9 +711,11 @@ mod tests {
     }
 
     #[test]
-    fn standalone_region_registration_returns_noop_handle() {
+    fn standalone_region_registration_is_agent_unavailable() {
+        // No agent to publish through ⇒ honest error, never a fake handle
+        // (the old no-op handle path is gone — Ms4).
         let byte = 7u8;
-        let handle = unsafe {
+        let err = unsafe {
             register_region(
                 "region",
                 1,
@@ -773,65 +724,83 @@ mod tests {
                 RegionFlags::HOT | RegionFlags::FRAMEBUFFER,
             )
         }
-        .unwrap();
-        assert_eq!(handle.region_id(), 0);
-        handle.unregister();
+        .unwrap_err();
+        assert_eq!(err, RegionError::AgentUnavailable);
+        // Input validation still fires first, identically to under-agent.
+        let err =
+            unsafe { register_region("region", 1, &byte as *const u8, 0, RegionFlags::empty()) }
+                .unwrap_err();
+        assert_eq!(err, RegionError::NotPinned);
     }
 
     #[test]
-    fn register_region_publishes_manifest_and_region_event() {
+    fn register_region_pins_calls_agent_and_emits_region_event() {
+        let _serial = crate::agent_client::TEST_SERIAL.lock().unwrap();
         let file = test_channel_file(ChannelHeader::canonical());
         let mut state = test_state(&file);
         let bytes = [0xAAu8; 16];
 
-        let handle = state
-            .register_region_with_extents(
+        // In-process agent stand-in on a temp socket path.
+        let path = format!("/tmp/detguest-sdk-lib-test-{}.sock", std::process::id());
+        let reply = detguest_wire::regionipc::Reply {
+            status: detguest_wire::regionipc::STATUS_OK,
+            region_id: 0,
+            name_id: 1,
+            manifest_generation: 2,
+        };
+        let server = crate::agent_client::tests::spawn_test_server(&path, reply);
+        std::env::set_var("DETGUEST_AGENT_SOCK", &path);
+
+        let handle = unsafe {
+            state.register_region(
                 "wram",
                 1,
                 bytes.as_ptr(),
                 bytes.len(),
                 RegionFlags::HOT | RegionFlags::FRAMEBUFFER,
-                &[Extent {
-                    gpa: 0x2000,
-                    len: bytes.len() as u64,
-                }],
             )
-            .unwrap();
-
+        }
+        .unwrap();
         assert_eq!(handle.region_id(), 0);
-        let mut manifest = vec![0u8; MANIFEST_TOTAL_SIZE];
-        file.read_exact_at(&mut manifest, OFF_MANIFEST as u64)
-            .unwrap();
-        let hdr = ManifestHeader::read_from(&manifest).unwrap();
-        hdr.validate().unwrap();
-        assert_eq!(hdr.generation, 2);
-        assert_eq!(hdr.region_count, 1);
-        assert_eq!(hdr.extent_count, 1);
-        let entry = RegionEntry::read_from(&manifest, 0).unwrap();
-        assert!(entry.is_live());
-        assert_eq!(entry.region_id, 0);
-        assert_eq!(entry.name_id, 1);
-        assert_eq!(entry.layout_version, 1);
-        assert_eq!(
-            entry.flags,
-            (RegionFlags::HOT | RegionFlags::FRAMEBUFFER).bits()
-        );
-        assert_eq!(entry.gva, bytes.as_ptr() as u64);
-        assert_eq!(entry.len, bytes.len() as u64);
-        assert_eq!(entry.extent_off, 0);
-        assert_eq!(entry.extent_n, 1);
-        assert_eq!(entry.name_bytes(), b"wram");
-        assert_eq!(
-            Extent::read_from(&manifest, 0).unwrap(),
-            Extent {
-                gpa: 0x2000,
-                len: bytes.len() as u64
+        // Dropping the handle sends the best-effort Unregister (and lets the
+        // server see EOF once we drop the cached client below).
+        drop(handle);
+        crate::agent_client::drop_cached_client_for_test();
+        std::env::remove_var("DETGUEST_AGENT_SOCK");
+
+        // The agent stand-in received the real request: mlock'd + prefaulted
+        // range, interned name_id, then the Unregister from the drop.
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 2);
+        match detguest_wire::regionipc::decode_request(&seen[0]).unwrap() {
+            detguest_wire::regionipc::Request::Register {
+                flags,
+                layout_version,
+                name_id,
+                gva,
+                len,
+                name,
+            } => {
+                assert_eq!(flags, (RegionFlags::HOT | RegionFlags::FRAMEBUFFER).bits());
+                assert_eq!(layout_version, 1);
+                assert_eq!(name_id, 1);
+                assert_eq!(gva, bytes.as_ptr() as u64);
+                assert_eq!(len, 16);
+                assert_eq!(name, b"wram");
             }
+            other => panic!("expected Register, got {other:?}"),
+        }
+        assert_eq!(
+            detguest_wire::regionipc::decode_request(&seen[1]).unwrap(),
+            detguest_wire::regionipc::Request::Unregister { region_id: 0 }
         );
 
-        let mut seen = 0;
+        // Ring W stream shape preserved: NameIntern then RegionRegister with
+        // the agent-returned ids (the manifest itself is agent-written now —
+        // that coverage lives in detguest-agent's region_ipc tests).
+        let mut seen_events = 0;
         for_each_ring_w_event(&file, |index, _hdr, payload| {
-            seen += 1;
+            seen_events += 1;
             match (index, payload) {
                 (
                     0,
@@ -857,7 +826,8 @@ mod tests {
                 other => panic!("unexpected event at {index}: {other:?}"),
             }
         });
-        assert_eq!(seen, 2);
+        assert_eq!(seen_events, 2);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

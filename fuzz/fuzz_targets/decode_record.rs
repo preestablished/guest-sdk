@@ -30,6 +30,10 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
+    // Region-registration IPC datagram decoders (agent.sock).
+    let _ = detguest_wire::regionipc::decode_request(data);
+    let _ = detguest_wire::regionipc::decode_reply(data);
+
     // Channel/manifest structure parsers used on the attach path.
     if let Ok(h) = detguest_wire::header::ChannelHeader::read_from(data) {
         let _ = h.validate();

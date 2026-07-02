@@ -15,6 +15,18 @@ use crate::boot::UnitControl;
 const CONTROL_FD: i32 = 3;
 const MAX_DATAGRAM: usize = 4096;
 
+/// Reply-wait spin cap. Each iteration is a non-blocking recv + the idle
+/// callback (region-IPC servicing) + sched_yield — roughly a microsecond —
+/// so the prod cap represents minutes, sized against the slowest legitimate
+/// leg (a reference workload's LoadGame doing real device I/O), not against
+/// region publication. Hitting it means the workload is dead or wedged:
+/// boot-fault instead of hanging the boot forever (this is a deliberate
+/// semantic change from the old indefinitely-blocking recv).
+#[cfg(test)]
+const CONTROL_RECV_POLL_LIMIT: usize = 512;
+#[cfg(not(test))]
+const CONTROL_RECV_POLL_LIMIT: usize = 200_000_000;
+
 #[derive(Debug)]
 pub(crate) struct ControlSocket {
     fd: OwnedFd,
@@ -50,9 +62,15 @@ pub(crate) fn child_fd_number() -> i32 {
     CONTROL_FD
 }
 
+/// Drive the boot-time control leg. `idle` runs on every empty poll of the
+/// control socket — the workload registers regions over agent.sock *between*
+/// these replies (e.g. after GameLoaded, before Ready), so the caller passes
+/// a region-IPC servicing closure here; a blocking recv would deadlock the
+/// boot (ARCHITECTURE.md §5).
 pub(crate) fn drive_refwork_start(
     sock: &ControlSocket,
     control: &UnitControl,
+    mut idle: impl FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
     if control.protocol != "refwork-ctl" {
         return Err(format!(
@@ -74,7 +92,7 @@ pub(crate) fn drive_refwork_start(
     sock.send(&encode_hello(proto_version))
         .map_err(|e| format!("send refwork Hello: {e}"))?;
     match sock
-        .recv()
+        .recv(&mut idle)
         .map_err(|e| format!("recv refwork HelloAck: {e}"))?
     {
         ControlReply::HelloAck {
@@ -96,7 +114,7 @@ pub(crate) fn drive_refwork_start(
     sock.send(&encode_load_game(game_dev))
         .map_err(|e| format!("send refwork LoadGame: {e}"))?;
     match sock
-        .recv()
+        .recv(&mut idle)
         .map_err(|e| format!("recv refwork GameLoaded: {e}"))?
     {
         ControlReply::GameLoaded => {}
@@ -107,7 +125,7 @@ pub(crate) fn drive_refwork_start(
     }
 
     match sock
-        .recv()
+        .recv(&mut idle)
         .map_err(|e| format!("recv refwork Ready: {e}"))?
     {
         ControlReply::Ready { frame: 0 } => {}
@@ -147,19 +165,46 @@ impl ControlSocket {
         Ok(())
     }
 
-    fn recv(&self) -> io::Result<ControlReply> {
+    /// Bounded non-blocking reply wait: poll with `MSG_DONTWAIT`, running
+    /// `idle` (region-IPC servicing) + `sched_yield` between polls so a
+    /// workload blocked on a register reply cannot deadlock this wait.
+    fn recv(&self, idle: &mut impl FnMut() -> Result<(), String>) -> io::Result<ControlReply> {
         let mut buf = [0u8; MAX_DATAGRAM];
-        let n = unsafe { libc::recv(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
+        for _ in 0..CONTROL_RECV_POLL_LIMIT {
+            // SAFETY: non-blocking recv into a local buffer.
+            let n = unsafe {
+                libc::recv(
+                    self.fd.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::WouldBlock {
+                    return Err(err);
+                }
+                idle().map_err(io::Error::other)?;
+                // SAFETY: plain sched_yield between polls.
+                unsafe {
+                    libc::sched_yield();
+                }
+                continue;
+            }
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "control socket closed",
+                ));
+            }
+            return decode_reply(&buf[..n as usize])
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
         }
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "control socket closed",
-            ));
-        }
-        decode_reply(&buf[..n as usize]).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "control reply poll limit exceeded (workload dead or wedged)",
+        ))
     }
 }
 

@@ -67,7 +67,7 @@ mod tests {
     fn beacon_counts_saturate() {
         let mut beacons = BeaconCounters::default();
         beacons.counts[3] = u32::MAX;
-        assert_eq!(beacons.hit(3).first_hit, true);
+        assert!(beacons.hit(3).first_hit);
         assert_eq!(beacons.count(3), u32::MAX);
     }
 }

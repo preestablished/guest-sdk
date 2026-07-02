@@ -75,10 +75,10 @@ pub fn handle(sup: &mut Supervisor, cmd: Command) -> io::Result<bool> {
             sup.log_mask = mask;
         }
         Command::ReverifyRegions => {
-            // M2 functional stub (bead 6c0): no SDK regions exist yet, so a
-            // pagemap re-walk has nothing to verify; emit nothing. The full
-            // re-walk + RegionUpdate emission lands with the M3 registration
-            // path. Receiving the command must not fault — and does not.
+            // API.md §6: re-walk pagemap for every live region; RegionUpdate
+            // echo when extents hold, P0 alarm + rewrite/DEAD when they
+            // don't. The ledger lives on the region IPC server (§5).
+            sup.reverify_regions();
         }
     }
     Ok(false)
@@ -97,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn reverify_regions_is_currently_noop_without_regions() {
+    fn reverify_regions_with_no_ledger_emits_nothing() {
         let before = DOORBELLS.load(Ordering::Relaxed);
         let mut sup = crate::supervise::Supervisor::new(
             crate::channel::test_channel(test_doorbell),

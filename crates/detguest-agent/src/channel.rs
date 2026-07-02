@@ -156,10 +156,10 @@ impl AgentChannel {
         unsafe { std::slice::from_raw_parts(self.base.add(OFF_MANIFEST), MANIFEST_TOTAL_SIZE) }
     }
 
-    #[cfg(test)]
     pub(crate) fn manifest_mut(&mut self) -> &mut [u8] {
-        // SAFETY: in-bounds manifest area; tests and the SDK are the only
-        // writers after init, and production uses this only for snapshots.
+        // SAFETY: in-bounds manifest area; the agent is the ONLY manifest
+        // writer (seqlock discipline, detguest-wire::manifest) — production
+        // writes happen in region_ipc under writer_begin/writer_end.
         unsafe { std::slice::from_raw_parts_mut(self.base.add(OFF_MANIFEST), MANIFEST_TOTAL_SIZE) }
     }
 

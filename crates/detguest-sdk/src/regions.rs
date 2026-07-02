@@ -1,11 +1,10 @@
 use std::{fmt, ops};
 
 use detguest_wire::manifest::{
-    Extent, EXTENT_CAPACITY, MAX_REGION_NAME, REGION_FLAG_FRAMEBUFFER, REGION_FLAG_HOST_WRITABLE,
-    REGION_FLAG_HOT,
+    MAX_REGION_NAME, REGION_FLAG_FRAMEBUFFER, REGION_FLAG_HOST_WRITABLE, REGION_FLAG_HOT,
 };
 
-use crate::translate;
+use crate::agent_client;
 
 /// Region publication flags.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -107,14 +106,25 @@ impl fmt::Display for RegionError {
 impl std::error::Error for RegionError {}
 
 /// Published region handle.
+///
+/// Dropping the handle (or calling [`RegionHandle::unregister`]) sends a
+/// best-effort `UnregisterRegion` to the agent, which marks the manifest
+/// entry DEAD — so workloads MUST hold their handles for as long as the
+/// region should stay host-readable (typically the process lifetime, via
+/// `std::mem::forget` or a long-lived binding). The memory itself stays
+/// mlocked; the SDK never munlocks (pages may back other regions).
 #[derive(Debug)]
 pub struct RegionHandle {
     region_id: u32,
+    live: bool,
 }
 
 impl RegionHandle {
     pub(crate) fn new(region_id: u32) -> RegionHandle {
-        RegionHandle { region_id }
+        RegionHandle {
+            region_id,
+            live: true,
+        }
     }
 
     /// Manifest region slot id.
@@ -122,24 +132,25 @@ impl RegionHandle {
         self.region_id
     }
 
-    /// Explicitly unregister this region.
-    pub fn unregister(self) {}
+    /// Explicitly unregister this region (best-effort, like drop).
+    pub fn unregister(mut self) {
+        self.send_unregister();
+    }
+
+    fn send_unregister(&mut self) {
+        if self.live {
+            self.live = false;
+            let _ = agent_client::call(&detguest_wire::regionipc::Request::Unregister {
+                region_id: self.region_id,
+            });
+        }
+    }
 }
 
 impl Drop for RegionHandle {
-    fn drop(&mut self) {}
-}
-
-pub(crate) unsafe fn register_region(
-    name: &'static str,
-    layout_version: u32,
-    ptr: *const u8,
-    len: usize,
-    flags: RegionFlags,
-) -> Result<RegionHandle, RegionError> {
-    validate_region(name, ptr, len)?;
-    let _ = (layout_version, flags);
-    Ok(RegionHandle::new(0))
+    fn drop(&mut self) {
+        self.send_unregister();
+    }
 }
 
 pub(crate) fn validate_region(
@@ -150,70 +161,32 @@ pub(crate) fn validate_region(
     if name.len() > MAX_REGION_NAME {
         return Err(RegionError::NameTooLong);
     }
-    if len != 0 && ptr.is_null() {
+    if len == 0 || ptr.is_null() {
+        // A zero-length publication is meaningless to the host and
+        // unsupported by the IPC codec.
         return Err(RegionError::NotPinned);
     }
     Ok(())
 }
 
-pub(crate) unsafe fn pin_and_translate(
-    ptr: *const u8,
-    len: usize,
-) -> Result<Vec<Extent>, RegionError> {
-    if len == 0 {
-        return Ok(Vec::new());
-    }
+/// Pin `[ptr, ptr+len)` (mlock populates and pins) and prefault every page
+/// with a volatile read so the agent's pagemap walk sees each page resident
+/// (ARCHITECTURE.md §5 step 1). The agent independently proves residency —
+/// this mlock claim is not trusted.
+///
+/// # Safety
+/// `ptr..ptr+len` must be a valid mapped range owned by the caller.
+pub(crate) unsafe fn pin_and_prefault(ptr: *const u8, len: usize) -> Result<(), RegionError> {
     if libc::mlock(ptr.cast(), len) != 0 {
         return Err(RegionError::NotPinned);
     }
-    let pagemap = translate::open_pagemap().map_err(|_| RegionError::AgentUnavailable)?;
-    build_extents(
-        |vaddr| translate::gva_to_gpa(&pagemap, vaddr),
-        ptr as u64,
-        len,
-    )
-}
-
-pub(crate) fn build_extents(
-    mut translate: impl FnMut(u64) -> Result<u64, translate::TranslateError>,
-    start: u64,
-    len: usize,
-) -> Result<Vec<Extent>, RegionError> {
-    let mut remaining = u64::try_from(len).map_err(|_| RegionError::TooManyExtents)?;
-    let mut vaddr = start;
-    let mut extents: Vec<Extent> = Vec::new();
-    while remaining > 0 {
-        let gpa = translate(vaddr).map_err(map_translate_error)?;
-        let page_remaining = 4096 - (vaddr & 0xFFF);
-        let chunk = remaining.min(page_remaining);
-        if let Some(last) = extents.last_mut() {
-            if last.gpa.checked_add(last.len) == Some(gpa) {
-                last.len = last
-                    .len
-                    .checked_add(chunk)
-                    .ok_or(RegionError::TooManyExtents)?;
-            } else {
-                extents.push(Extent { gpa, len: chunk });
-            }
-        } else {
-            extents.push(Extent { gpa, len: chunk });
-        }
-        if extents.len() > EXTENT_CAPACITY {
-            return Err(RegionError::TooManyExtents);
-        }
-        vaddr = vaddr
-            .checked_add(chunk)
-            .ok_or(RegionError::TooManyExtents)?;
-        remaining -= chunk;
+    let mut at = 0usize;
+    while at < len {
+        core::ptr::read_volatile(ptr.add(at));
+        at = at.saturating_add(4096 - ((ptr as usize + at) & 0xFFF));
     }
-    Ok(extents)
-}
-
-fn map_translate_error(err: translate::TranslateError) -> RegionError {
-    match err {
-        translate::TranslateError::NotPresent { .. }
-        | translate::TranslateError::Swapped { .. }
-        | translate::TranslateError::PfnHidden { .. } => RegionError::NotPinned,
-        translate::TranslateError::Io(_) => RegionError::AgentUnavailable,
-    }
+    // The final byte of a range ending mid-page is covered by that page's
+    // touch above; touch the last byte explicitly for belt-and-braces.
+    core::ptr::read_volatile(ptr.add(len - 1));
+    Ok(())
 }

@@ -28,6 +28,7 @@ pub mod header;
 pub mod manifest;
 pub mod ports;
 pub mod record;
+pub mod regionipc;
 pub mod ring;
 
 pub use events::{Command, EventPayload, WorkloadCtrl};

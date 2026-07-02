@@ -10,10 +10,9 @@ use detguest_wire::{
     events::{decode_workload_ctrl, encode_event, encoded_event_len, EventPayload, WorkloadCtrl},
     header::{
         ChannelHeader, RingId, CHANNEL_MAGIC, CHANNEL_SIZE, FLAG_WORKLOAD_ATTACHED,
-        OFF_HEADER_FLAGS, OFF_MANIFEST, OFF_RING_W_DROPPED_BYTES, OFF_RING_W_DROPPED_BY_KIND,
+        OFF_HEADER_FLAGS, OFF_RING_W_DROPPED_BYTES, OFF_RING_W_DROPPED_BY_KIND,
         OFF_RING_W_DROPPED_RECORDS, PROTO_VERSION,
     },
-    manifest::MANIFEST_TOTAL_SIZE,
     record::{EventKind, MAX_RECORD_LEN},
     ring::{Consumer, Producer, RingFull},
     DecodeError,
@@ -66,10 +65,6 @@ impl MappedPage {
 
     fn bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
-    }
-
-    fn bytes_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
 
@@ -153,10 +148,6 @@ impl MappedChannel {
 
     pub(crate) fn poll_workload_ctrl(&mut self) -> Result<Option<WorkloadCtrl>, InitError> {
         poll_workload_ctrl(&mut self.ring_i)
-    }
-
-    pub(crate) fn manifest_mut(&mut self) -> &mut [u8] {
-        &mut self.page.bytes_mut()[OFF_MANIFEST..OFF_MANIFEST + MANIFEST_TOTAL_SIZE]
     }
 }
 
