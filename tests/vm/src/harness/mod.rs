@@ -11,6 +11,7 @@
 pub mod icount;
 pub mod memslot;
 pub mod pio;
+pub mod pvblk;
 pub mod snapshot;
 pub mod x86;
 
@@ -30,6 +31,7 @@ use detguest_host::{Channel, GuestEvent, InjectResponder, RecordingSink, TableFa
 use self::icount::GuestIcount;
 use self::memslot::MemSlot;
 use self::pio::{PioState, PvPad};
+use self::pvblk::PvBlkModel;
 
 /// Guest physical layout constants.
 const BOOT_PARAMS_ADDR: u64 = 0x7000;
@@ -375,15 +377,28 @@ impl VmHarness {
                     pio::handle_out(self, port, v);
                 }
                 VcpuExit::MmioRead(addr, data) => {
-                    let v = pio::pvpad_read(self, addr);
-                    let n = data.len().min(4);
-                    data[..n].copy_from_slice(&v.to_le_bytes()[..n]);
+                    // pv-blk gets the RAW slice (the agent's SECTOR/BUF_GPA
+                    // accesses are single 8-byte ops — truncating them to
+                    // the low 4 bytes would silently zero the high halves),
+                    // and only when a test attached a device; otherwise the
+                    // window keeps today's pvpad-path behavior (reads 0).
+                    if pvblk::in_window(addr) && self.pio.pvblk.is_some() {
+                        pvblk::pvblk_read(self, addr, data);
+                    } else {
+                        let v = pio::pvpad_read(self, addr);
+                        let n = data.len().min(4);
+                        data[..n].copy_from_slice(&v.to_le_bytes()[..n]);
+                    }
                 }
                 VcpuExit::MmioWrite(addr, data) => {
-                    let mut bytes = [0u8; 4];
-                    let n = data.len().min(4);
-                    bytes[..n].copy_from_slice(&data[..n]);
-                    pio::pvpad_write(self, addr, u32::from_le_bytes(bytes));
+                    if pvblk::in_window(addr) && self.pio.pvblk.is_some() {
+                        pvblk::pvblk_write(self, addr, data);
+                    } else {
+                        let mut bytes = [0u8; 4];
+                        let n = data.len().min(4);
+                        bytes[..n].copy_from_slice(&data[..n]);
+                        pio::pvpad_write(self, addr, u32::from_le_bytes(bytes));
+                    }
                 }
                 VcpuExit::Hlt | VcpuExit::Shutdown => {
                     // Power-off path: without ACPI, RB_POWER_OFF halts; with
@@ -433,6 +448,20 @@ impl VmHarness {
     /// The pv-pad latch stub (schedule pad values for `poll_input` tests).
     pub fn pvpad(&mut self) -> &mut PvPad {
         &mut self.pio.pvpad
+    }
+
+    /// Attach a read-only pv-blk device model over `backing` at the
+    /// hypervisor's game-device window (`pvblk::PVBLK_BASE`). Without this
+    /// call the window behaves exactly as before (reads 0 / writes
+    /// dropped), so existing tests stay bit-identical.
+    pub fn attach_pv_blk(&mut self, backing: Vec<u8>) {
+        self.pio.pvblk = Some(PvBlkModel::new(backing));
+    }
+
+    /// The attached pv-blk model, if any (test assertions on latched
+    /// registers/STATUS), mirroring [`VmHarness::pvpad`].
+    pub fn pv_blk(&mut self) -> Option<&mut PvBlkModel> {
+        self.pio.pvblk.as_mut()
     }
 }
 

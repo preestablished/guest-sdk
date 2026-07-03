@@ -12,6 +12,7 @@ use detguest_host::Channel;
 use detguest_wire::header::CHANNEL_SIZE_PAGES;
 use detguest_wire::ports;
 
+use super::pvblk::PvBlkModel;
 use super::VmHarness;
 
 /// pv-pad MMIO latch stub (determinism-hypervisor ARCHITECTURE.md §6.4 owns
@@ -92,6 +93,10 @@ pub struct PioState {
     pub inject_answer: u32,
     /// The pv-pad latch stub.
     pub pvpad: PvPad,
+    /// The pv-blk device model, present only when a test attached one via
+    /// [`VmHarness::attach_pv_blk`] — with `None`, the pv-blk window keeps
+    /// today's behavior exactly (reads 0 / writes dropped).
+    pub pvblk: Option<PvBlkModel>,
 }
 
 impl PioState {
@@ -106,6 +111,7 @@ impl PioState {
                 frame_counter: 0,
                 schedule: BTreeMap::new(),
             },
+            pvblk: None,
         }
     }
 }
