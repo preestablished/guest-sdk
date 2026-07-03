@@ -30,6 +30,10 @@ path = "src/bin/m9_refwork_contract.rs"
 name = "m4-regions"
 path = "src/bin/m4_regions.rs"
 
+[[bin]]
+name = "game-load-check"
+path = "src/bin/game_load_check.rs"
+
 [dependencies]
 detguest-sdk = { path = "../../../crates/detguest-sdk" }
 libc = "0.2"

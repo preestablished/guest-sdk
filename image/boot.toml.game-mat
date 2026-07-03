@@ -1,0 +1,28 @@
+# Game-materialization acceptance fixture (plan
+# phase3-game-device-materialization package 04).
+#
+# Staged into the initramfs as /etc/detguest/boot.toml. game_source =
+# "pv-blk" makes the agent materialize the game image from the pv-blk MMIO
+# device to /run/detguest/game.img before driving LoadGame (API.md §7.1);
+# the workload verifies the materialized bytes and publishes `meta` so the
+# boot exercises the production shape: materialize → control leg → region
+# gate → Ready.
+boot_toml_version = 1
+
+[autostart]
+unit = 0
+
+[[unit]]
+id = 0
+exec = "/opt/game-load-check"
+log_mask = 0x1F
+
+[unit.control]
+protocol = "refwork-ctl"
+proto_version = 1
+game_dev = "/dev/vdb"
+game_source = "pv-blk"
+
+[[expected_region]]
+name = "meta"
+layout_version = 1
