@@ -174,6 +174,23 @@ pub fn autostart_and_ready(sup: &mut Supervisor) -> Result<(), String> {
         .and_then(|u| u.control.as_ref())
         .cloned();
     if let Some(control) = unit_control.as_ref() {
+        // Resolve the LoadGame path BEFORE the unit is spawned, so a pv-blk
+        // materialization fault never leaves an orphan workload running
+        // (API.md §7.1: game_source = "pv-blk" ⇒ the agent reads the game
+        // image out of the pv-blk device into a file the unit can read).
+        let game_path: &str = match control.game_source {
+            Some(boot::GameSource::PvBlk) => {
+                crate::pvblk::materialize(crate::pvblk::GAME_IMG_PATH)
+                    .map_err(|e| format!("materialize game from pv-blk: {e}"))?;
+                crate::pvblk::GAME_IMG_PATH
+            }
+            // §7.2 guarantees game_dev for refwork-ctl; a non-refwork
+            // protocol without one still faults in the protocol check.
+            None => control
+                .game_dev
+                .as_deref()
+                .ok_or_else(|| "refwork-ctl requires game_dev".to_string())?,
+        };
         let (sock, child_fd) =
             control::socketpair().map_err(|e| format!("unit.control socketpair: {e}"))?;
         sup.start_unit_with_control(unit, child_fd.as_raw_fd())
@@ -182,10 +199,16 @@ pub fn autostart_and_ready(sup: &mut Supervisor) -> Result<(), String> {
         // The workload registers regions over agent.sock between control
         // replies (e.g. GameLoaded → Ready): service region IPC while
         // waiting or the boot deadlocks (ARCHITECTURE.md §5).
-        control::drive_refwork_start(&sock, control, || {
+        control::drive_refwork_start(&sock, control, game_path, || {
             sup.service_region_ipc()
                 .map_err(|e| format!("region IPC service: {e}"))
         })?;
+        // The harness holds its own copy by GameLoaded; drop the RAM-backed
+        // file so the game exists once at steady state.
+        if control.game_source.is_some() {
+            std::fs::remove_file(crate::pvblk::GAME_IMG_PATH)
+                .map_err(|e| format!("unlink {}: {e}", crate::pvblk::GAME_IMG_PATH))?;
+        }
     } else {
         sup.start_unit(unit)
             .map_err(|e| format!("autostart unit {unit}: {e}"))?;
@@ -655,6 +678,7 @@ mod tests {
                     protocol: "refwork-ctl".to_string(),
                     proto_version: 1,
                     game_dev: Some("/dev/vdb".to_string()),
+                    game_source: None,
                 }),
                 Vec::new(),
             ),

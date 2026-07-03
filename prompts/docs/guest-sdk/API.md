@@ -787,8 +787,16 @@ game_dev = "/dev/vdb"            #   transport are reference-workload API.md §3
                                  #   (postcard CtlMsg over socketpair(AF_UNIX,
                                  #   SOCK_SEQPACKET), child end inherited as fd 3;
                                  #   proto_version pinned here must match §3.1).
-                                 #   `game_dev` is the LoadGame.dev_path the agent
-                                 #   sends (the virtio-blk game image device).
+                                 #   `game_dev` is the logical game-device name; it
+                                 #   is the LoadGame.dev_path the agent sends unless
+                                 #   `game_source` overrides it (below).
+game_source = "pv-blk"           # optional. Present ("pv-blk" is the only v1 value)
+                                 #   => before LoadGame the agent materializes the
+                                 #   game image from the pv-blk MMIO device into
+                                 #   /run/detguest/game.img and sends THAT path as
+                                 #   LoadGame.dev_path (the guest kernel has no block
+                                 #   driver; no /dev/vdb node ever exists). Absent =>
+                                 #   `game_dev` is sent verbatim.
 
 [[expected_region]]              # 0..N. The READY gate (ARCHITECTURE.md §4.1/§4.2):
 name = "wram"                    #   Ready is withheld until every listed region is
@@ -818,6 +826,19 @@ into its image).
 - `[unit.control]`: `protocol` is an open identifier (v1 defines only `refwork-ctl` =
   reference-workload API.md §3); `proto_version` must equal the value the agent speaks;
   `game_dev` required for `refwork-ctl`.
+- `[unit.control].game_source`: optional; v1 value set is exactly `{"pv-blk"}` — any
+  other value is a boot fault (§7.3). Present ⇒ the agent reads the whole game image
+  out of the pv-blk MMIO device (sequential sector reads; the device ABI has no
+  capacity register, so the first `BAD_REQUEST` marks the tail), writes it to
+  `/run/detguest/game.img`, verifies the written file against the device-stream
+  checksum, sends that path as `LoadGame.dev_path`, and unlinks the file after the
+  control leg completes. Size cap 32 MiB (boot fault above). The device addresses
+  whole 512-byte sectors only — a non-512-multiple staged image silently loses its
+  partial tail, and the agent **cannot detect that**; alignment must be validated
+  where the image is staged. Absent ⇒ `game_dev` is sent verbatim (the behavior
+  before this field existed). No `boot_toml_version` bump: the addition is
+  optional-key/backward-compatible, and the agent and boot.toml ship in the same
+  immutable initramfs, so parser/manifest version skew is structurally impossible.
 - `[[expected_region]]`: `name` ≤ 56 bytes (the manifest cap, §4.1); `layout_version`
   must match the manifest entry exactly — a mismatch is a boot fault (§7.3), never a
   silent downgrade. The list may be empty (e.g. the trivial M2 test workload).
@@ -826,7 +847,10 @@ into its image).
 
 ### 7.3 Boot fault path
 
-Any §7.2 violation, and any failure of the §4.2 protocol leg before `Ready`
+Any §7.2 violation, any `game_source` materialization failure (pv-blk device absent
+— wrong bus MAGIC — read status error, materialized-file checksum drift, size cap
+exceeded, empty device; all `pv-blk:`-prefixed LogLines, distinct from the
+harness's cannot-read-path fault), and any failure of the §4.2 protocol leg before `Ready`
 (ARCHITECTURE.md §4.2 error rules): the agent never emits `Ready`; it emits the detail
 as an agent `LogLine`, emits `WorkloadExited` (critical) if a unit was running, and
 powers off (`reboot(RB_POWER_OFF)`). The orchestrator's bootstrap `Run(until READY)`

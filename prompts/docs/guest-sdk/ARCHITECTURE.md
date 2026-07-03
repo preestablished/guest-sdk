@@ -294,8 +294,11 @@ keys on a single, reproducible guest event. This repo defines it:
   land `PAD_SET` records before it has drained `Ready`, and the pv-pad latches hold
   their reset value (0). Autostart is agent-local precisely so no host command precedes
   READY, and the §4.2 control-protocol exchange is in-guest socketpair traffic — not
-  host input. Therefore the icount at the `Ready` doorbell exit is a pure function of
-  the WorkloadImage — **bit-reproducible across boots of the same image**. That icount
+  host input (as is the §4.2 pv-blk materialization: guest-initiated MMIO against an
+  immutable, content-addressed device image). Therefore the icount at the `Ready`
+  doorbell exit is a pure function of the WorkloadImage — plus, when
+  `game_source = "pv-blk"` is configured, the content-addressed game image (both
+  pinned inputs) — **bit-reproducible across boots of the same images**. That icount
   is the deterministic READY point; the root snapshot taken there is identical for
   identical images. READY therefore implies: regions live, workload started (and
   `Start` already issued), zero host input consumed.
@@ -314,9 +317,19 @@ its harness side.
 For a unit whose boot-manifest entry declares a control protocol (API.md §7
 `[unit.control]`), the agent, after fork+exec (autostart or ring-C `StartWorkload`):
 
+0. **Game materialization (when `game_source = "pv-blk"`, API.md §7.1; before the
+   unit is spawned):** the agent reads the whole game image out of the pv-blk MMIO
+   device into `/run/detguest/game.img` — sequential sector reads with the first
+   `BAD_REQUEST` as the tail signal (the device ABI has no capacity register),
+   checksum-verified against the written file. Deterministic by construction:
+   single-threaded, pre-Ready, pure guest↔device MMIO (§7 rules), no retry — any
+   failure is a `pv-blk:`-named §7.3 boot fault, and no orphan unit exists because
+   the unit has not been spawned yet. The file is unlinked after step 4 (the harness
+   holds its own copy by `GameLoaded`).
 1. **`Hello{proto_version}` →** (from the boot manifest's pinned value); awaits
    `HelloAck`. Version mismatch ⇒ error path below.
-2. **`LoadGame{dev_path}` →** (`dev_path` = the boot manifest's `game_dev`); awaits
+2. **`LoadGame{dev_path}` →** (`dev_path` = the boot manifest's `game_dev`, or the
+   materialized `/run/detguest/game.img` under `game_source = "pv-blk"`); awaits
    `GameLoaded`.
 3. **Region registration (harness-driven):** the agent services the harness's
    `RegisterRegion` requests as they arrive over agent.sock (the §5 publication path:

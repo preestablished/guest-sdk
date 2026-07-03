@@ -62,14 +62,17 @@ pub(crate) fn child_fd_number() -> i32 {
     CONTROL_FD
 }
 
-/// Drive the boot-time control leg. `idle` runs on every empty poll of the
-/// control socket — the workload registers regions over agent.sock *between*
-/// these replies (e.g. after GameLoaded, before Ready), so the caller passes
-/// a region-IPC servicing closure here; a blocking recv would deadlock the
-/// boot (ARCHITECTURE.md §5).
+/// Drive the boot-time control leg. `game_path` is the LoadGame.dev_path to
+/// send — resolved by the caller (verbatim `game_dev`, or the materialized
+/// image path under `game_source = "pv-blk"`; API.md §7.1). `idle` runs on
+/// every empty poll of the control socket — the workload registers regions
+/// over agent.sock *between* these replies (e.g. after GameLoaded, before
+/// Ready), so the caller passes a region-IPC servicing closure here; a
+/// blocking recv would deadlock the boot (ARCHITECTURE.md §5).
 pub(crate) fn drive_refwork_start(
     sock: &ControlSocket,
     control: &UnitControl,
+    game_path: &str,
     mut idle: impl FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
     if control.protocol != "refwork-ctl" {
@@ -84,10 +87,6 @@ pub(crate) fn drive_refwork_start(
             control.proto_version
         )
     })?;
-    let game_dev = control
-        .game_dev
-        .as_deref()
-        .ok_or_else(|| "refwork-ctl requires game_dev".to_string())?;
 
     sock.send(&encode_hello(proto_version))
         .map_err(|e| format!("send refwork Hello: {e}"))?;
@@ -111,7 +110,7 @@ pub(crate) fn drive_refwork_start(
         other => return Err(format!("expected refwork HelloAck, got {other:?}")),
     }
 
-    sock.send(&encode_load_game(game_dev))
+    sock.send(&encode_load_game(game_path))
         .map_err(|e| format!("send refwork LoadGame: {e}"))?;
     match sock
         .recv(&mut idle)
@@ -328,6 +327,17 @@ mod tests {
             encode_load_game("/dev/vdb"),
             [0x01, 0x08, b'/', b'd', b'e', b'v', b'/', b'v', b'd', b'b']
         );
+    }
+
+    #[test]
+    fn load_game_golden_for_the_materialized_path() {
+        // The exact bytes a workload sees under game_source = "pv-blk"
+        // (API.md §7.1): tag 0x01, varint length, then the path.
+        let path = crate::pvblk::GAME_IMG_PATH;
+        let mut want = vec![0x01, path.len() as u8];
+        want.extend_from_slice(path.as_bytes());
+        assert_eq!(encode_load_game(path), want);
+        assert_eq!(path.len(), 22); // varint stays single-byte
     }
 
     #[test]

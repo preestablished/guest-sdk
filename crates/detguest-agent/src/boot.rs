@@ -32,8 +32,22 @@ pub struct UnitControl {
     pub protocol: String,
     /// Must equal the version the agent speaks.
     pub proto_version: u32,
-    /// The LoadGame.dev_path the agent sends (required for refwork-ctl).
+    /// The logical game device name (required for refwork-ctl). Sent
+    /// verbatim as LoadGame.dev_path unless `game_source` overrides it.
     pub game_dev: Option<String>,
+    /// Where the game bytes come from. `Some(PvBlk)` ⇒ the agent
+    /// materializes the image from the pv-blk MMIO device to
+    /// `pvblk::GAME_IMG_PATH` before LoadGame and sends that path; `None`
+    /// ⇒ `game_dev` is sent verbatim (the pre-materialization behavior).
+    pub game_source: Option<GameSource>,
+}
+
+/// `[unit.control].game_source` values (API.md §7.2; an enum so unknown
+/// values die in the parser, not deep in the boot sequence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameSource {
+    /// Materialize from the pv-blk MMIO device.
+    PvBlk,
 }
 
 /// `[[expected_region]]` — the READY gate (ARCHITECTURE.md §4.1/§4.2).
@@ -181,10 +195,27 @@ pub fn parse(text: &str) -> Result<BootManifest, BootFault> {
                             "unit[{i}].control: game_dev required for refwork-ctl (§7.2)"
                         )));
                     }
+                    let game_source = match ct.get("game_source") {
+                        None => None,
+                        Some(v) => match v.as_str() {
+                            Some("pv-blk") => Some(GameSource::PvBlk),
+                            Some(other) => {
+                                return Err(fault(format!(
+                                    "unit[{i}].control: unknown game_source {other:?} (v1 knows \"pv-blk\")"
+                                )))
+                            }
+                            None => {
+                                return Err(fault(format!(
+                                    "unit[{i}].control: game_source must be a string"
+                                )))
+                            }
+                        },
+                    };
                     Some(UnitControl {
                         protocol,
                         proto_version,
                         game_dev,
+                        game_source,
                     })
                 }
             };
@@ -658,6 +689,41 @@ layout_version = 1
         )
         .unwrap_err();
         assert!(e.0.contains("game_dev"), "{e:?}");
+        // unknown game_source value
+        let e = parse(
+            "boot_toml_version = 1\n[[unit]]\nid = 0\nexec = \"/x\"\n[unit.control]\nprotocol = \"refwork-ctl\"\nproto_version = 1\ngame_dev = \"/dev/vdb\"\ngame_source = \"floppy\"\n",
+        )
+        .unwrap_err();
+        assert!(e.0.contains("game_source"), "{e:?}");
+        assert!(e.0.contains("floppy"), "{e:?}");
+        // non-string game_source
+        let e = parse(
+            "boot_toml_version = 1\n[[unit]]\nid = 0\nexec = \"/x\"\n[unit.control]\nprotocol = \"refwork-ctl\"\nproto_version = 1\ngame_dev = \"/dev/vdb\"\ngame_source = 1\n",
+        )
+        .unwrap_err();
+        assert!(e.0.contains("game_source"), "{e:?}");
+    }
+
+    #[test]
+    fn game_source_pv_blk_parses_and_defaults_to_none() {
+        let m = parse(
+            "boot_toml_version = 1\n[[unit]]\nid = 0\nexec = \"/x\"\n[unit.control]\nprotocol = \"refwork-ctl\"\nproto_version = 1\ngame_dev = \"/dev/vdb\"\ngame_source = \"pv-blk\"\n",
+        )
+        .unwrap();
+        let c = m.unit(0).unwrap().control.as_ref().unwrap();
+        assert_eq!(c.game_source, Some(GameSource::PvBlk));
+        assert_eq!(c.game_dev.as_deref(), Some("/dev/vdb"));
+
+        // Absent field => None: the pre-materialization behavior, so every
+        // committed fixture (m2/m4/m9) parses unchanged.
+        let m = parse(
+            "boot_toml_version = 1\n[[unit]]\nid = 0\nexec = \"/x\"\n[unit.control]\nprotocol = \"refwork-ctl\"\nproto_version = 1\ngame_dev = \"/dev/vdb\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            m.unit(0).unwrap().control.as_ref().unwrap().game_source,
+            None
+        );
     }
 
     #[test]
