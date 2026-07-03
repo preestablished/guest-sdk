@@ -9,30 +9,39 @@ convention.
 ## New guest workload: `tests/vm/workloads/src/bin/game_load_check.rs`
 
 A synthetic refwork-ctl unit (fd-3 SEQPACKET, same wire shapes as
-`m9_refwork_contract.rs` `drive_control`, lines 264-294) that *actually reads
-the game file*:
+`m9_refwork_contract.rs` `drive_control`, lines 256-272 + the send helpers
+below it) that *actually reads the game file*:
 
 1. `Hello{v}` → `HelloAck{v}`.
 2. `LoadGame{dev_path}`: assert `dev_path == "/run/detguest/game.img"`
    (pins the materialized-path contract the way m9 pins `/dev/vdb`);
-   `std::fs::read` it; compute the shared checksum (the `pvblk` module's
-   algorithm — seed `0x7062_6c6b_5f69_6f31`, rotate-left-5 fold, stream
-   offsets; keep the constants in the workload in sync by comment-reference,
-   the crates don't link); print one line to stdout:
+   `std::fs::read` it. The workload **embeds its own expectation**: it
+   regenerates the shared test pattern (`byte[i] = ((i*7) ^ (i>>8)) as u8`,
+   32 768 bytes — the formula is the contract between test and workload) and
+   compares length and checksum (the `pvblk` algorithm — seed
+   `0x7062_6c6b_5f69_6f31`, rotate-left-5 fold, stream offsets — reimplemented
+   here; tests/vm does not link `detguest-agent`, so the pinned golden `const`
+   from `01-…` is the drift guard). On any divergence or read error it
+   replies `Fault{detail}` instead of `GameLoaded` (which the agent turns
+   into a loud boot fault, `control.rs:120-124`) — Negative 2 depends on
+   this self-check. On success it prints one line to stdout:
    `game bytes=<len> checksum=0x<sum:016x>` (stdout becomes host-visible
-   `LogLine`s via the supervise pipes — the `print-lines` precedent). On any
-   mismatch/read error reply `Fault{detail}` instead of `GameLoaded` (which
-   the agent turns into a loud boot fault, `control.rs:120-124`).
-3. `GameLoaded` → `Ready{frame:0}` → wait `Start`, then park (block forever;
-   no region registration — this test isolates the game path).
+   `LogLine`s via the supervise pipes — the `print-lines` precedent).
+3. Register one region (`meta`-style, via `detguest-sdk::register_region` +
+   `mem::forget`, as `m9_refwork_contract.rs` `publish_regions` does) —
+   the fixture keeps one `[[expected_region]]` so the test exercises the
+   production shape (materialize → control leg → region gate → Ready), the
+   boot-sequence interaction Ms4 history says is where bugs live.
+4. `GameLoaded` → `Ready{frame:0}` → wait `Start`, then park (block
+   forever).
 
 Register the bin in `tests/vm/workloads/Cargo.toml` next to
 `m9-refwork-contract`.
 
 ## Boot fixture: `image/boot.toml.game-mat`
 
-Clone of `boot.toml.m9-refwork-contract` minus the `[[expected_region]]`
-blocks, with:
+Clone of `boot.toml.m9-refwork-contract` keeping **one** `[[expected_region]]`
+(the workload's single region), with:
 
 ```toml
 exec = "/opt/game-load-check"
@@ -41,6 +50,10 @@ protocol = "refwork-ctl"
 proto_version = 1
 game_dev = "/dev/vdb"
 game_source = "pv-blk"
+
+[[expected_region]]
+name = "meta"
+layout_version = 1
 ```
 
 ## Test: `tests/vm/tests/game_materialization.rs`
@@ -60,15 +73,15 @@ sector-swap / truncation / phantom-zero-read bugs shift the checksum.
 
 - `Hello` → `WorkloadStarted` → a `LogLine` matching
   `game bytes=32768 checksum=0x…` where the checksum equals the host-side
-  computation over the same pattern **by the same function** (import from
-  `detguest-agent`'s pvblk module if the test can link it, else reimplement
-  against the pinned constants) → `Ready`.
+  computation over the same pattern (reimplemented in the test against the
+  pinned constants, and equal to the golden `const` from `01-…` — tests/vm
+  does not link `detguest-agent`) → `Ready`.
 - Negative-control assertions inline (convention:
   `m4_acceptance.rs:402-414`, `m4_snapshot.rs:261-268` — comment names the
   broken implementation each catches):
   - checksum ≠ checksum of 32 KiB of zeros (catches a materializer that
     writes the right length from a phantom device);
-  - `bytes=32768` exactly (catches capacity-probe off-by-one);
+  - `bytes=32768` exactly (catches size-discovery off-by-one);
   - no P0 agent LogLine before Ready (stream AGENT, level 0 — filter as in
     `m4_acceptance.rs:241-254`).
 

@@ -27,6 +27,11 @@ existing goldens stand, and adopting the new path is a single reviewable line
 in reference-workload's `image/boot.toml`. The schema is ours (API.md §7:
 "this repo owns the format; the agent is its only parser").
 
+No `boot_toml_version` bump: the addition is optional-key/backward-compatible,
+and — decisively — the agent and boot.toml ship in the *same* immutable
+initramfs (API.md §7 preamble), so parser/manifest version skew is
+structurally impossible. State this rationale in the API.md §7.2 note.
+
 Materialized path constant: `/run/detguest/game.img` — alongside
 `agent.sock` in the agent-owned runtime dir (`detguest-wire`
 `regionipc.rs:19`). Define it next to the socket path or in `pvblk.rs`;
@@ -44,7 +49,7 @@ either way one constant, no string dupes.
   `game_dev required for refwork-ctl (§7.2)` check at `boot.rs:179-183`.
 - `game_dev` remains required for `refwork-ctl` (unchanged rule).
 
-Parser tests (extend the existing in-module suite, cf. `boot.rs:655-707`):
+Parser tests (extend the existing in-module suite, `boot.rs:569-715`):
 valid `game_source = "pv-blk"` round-trips to `Some(GameSource::PvBlk)`;
 absent ⇒ `None`; unknown value ⇒ error naming the field and value; existing
 fixture-shaped documents still parse with `game_source: None`.
@@ -62,9 +67,18 @@ let load_path: &str = match control.game_source {
             .map_err(|e| format!("materialize game from pv-blk: {e}"))?;
         GAME_IMG_PATH
     }
-    None => control.game_dev.as_deref().expect_or_fault(...), // existing §7.2 guarantee
+    // The parser guarantees game_dev for refwork-ctl (§7.2); still return
+    // Err(...) — not unwrap — if absent (a non-refwork protocol with no
+    // game_dev must fault in the protocol check, same precedence as today).
+    None => control.game_dev.as_deref().ok_or("...")?,
 };
 ```
+
+After `drive_refwork_start` returns Ok (post-`Start`, pre-`Ready`), if the
+path was materialized: `remove_file(GAME_IMG_PATH)` — the harness read the
+file by `GameLoaded` and holds its own copy; steady-state RAM keeps one copy
+(00-overview decision 5). A failed unlink is a boot fault (something is
+deeply wrong with the rootfs).
 
 Then pass `load_path` into the control leg. Two options for the plumbing;
 take the first unless it fights the code:
@@ -111,11 +125,16 @@ the exact bytes the reference workload will see after adoption.
 - §7.3: add pv-blk materialization failure (absent device, read status,
   checksum drift, size cap) to the enumerated boot-fault causes.
 
-`prompts/docs/guest-sdk/ARCHITECTURE.md` §4.2 (control leg, line ~305):
-insert the materialization step between unit-config resolution and the
-`LoadGame` send, with the determinism note (pre-Ready, single-threaded, pure
-MMIO, no retry — cf. §7 rules at lines 525-566 and the no-retry rule at
-line 359).
+`prompts/docs/guest-sdk/ARCHITECTURE.md`:
+
+- §4.2 (control leg, line ~305): insert the materialization step between
+  unit-config resolution and the `LoadGame` send, with the determinism note
+  (pre-Ready, single-threaded, pure MMIO, no retry — cf. §7 rules at lines
+  525-566 and the no-retry rule at line 359).
+- §4.1 (~lines 292-301): the READY-icount purity statement ("a pure function
+  of the WorkloadImage") must now read "of the WorkloadImage **and the
+  content-addressed game image**" when `game_source` is configured — the
+  materialization command count depends on the image size.
 
 ## Done when
 

@@ -42,18 +42,26 @@ implementer sees the whole shape first.
    trait so the probe/read/verify logic is host-unit-testable, same pattern as
    the injectable translator in `region_ipc`/`translate`. See `01-…`.
 
-3. **Size discovery: capacity probing within the existing device ABI.** The
+3. **Size discovery: sequential reads within the existing device ABI.** The
    pv-blk guest ABI (determinism-hypervisor `crates/dh-devices/src/blk.rs`)
    exposes **no capacity register** — registers are SECTOR/BUF_GPA/COUNT/CMD/
    STATUS only, and out-of-range reads fail with `STATUS_BAD_REQUEST`
-   (`blk.rs:137-147`). Rather than asking the hypervisor for an ABI addition
-   (re-pin, snapshot-section churn, mid-phase), the agent finds the capacity
-   deterministically with a doubling-then-binary-search of 1-sector reads
-   (~2·log₂(capacity) commands; capacity is fixed per run so the sequence is
-   bit-reproducible). Consequence to state loudly in the resolution: the device
-   only addresses whole sectors (`capacity = len_bytes / 512`, `blk.rs:114-117`),
-   so **staged game images must be a multiple of 512 bytes** or the tail is
-   silently unaddressable. See `01-…` §Capacity and `05-…`.
+   (`blk.rs:137-152`). Rather than asking the hypervisor for an ABI addition
+   (re-pin, snapshot-section churn, mid-phase), the agent reads forward from
+   sector 0 and treats the first `BAD_REQUEST` as the tail, narrowing to the
+   exact end with ≤ 3 shrinking reads (deterministic: the command sequence is
+   a pure function of the image size). Consequences to state loudly in the
+   resolution: the device only addresses whole sectors
+   (`capacity = len_bytes / 512`, `blk.rs:114-117`), so a non-512-multiple
+   image loses its tail **and the agent cannot detect that** — `BAD_REQUEST`
+   is the only past-the-end signal, so the lost bytes are invisible to any
+   guest-side probe. Alignment must be validated where the image is staged
+   (bridge side; see `05-…`). In practice valid ROMs are safe by
+   construction: refwork's `Cartridge::from_rom` requires a power-of-two
+   length ≥ 32 KiB, and since capacity truncates and never pads, the
+   materialized bytes of a valid ROM are byte-identical to the staged file
+   (their `blake3` cart hash is unperturbed). See `01-…` §Size discovery and
+   `05-…`.
 
 4. **Device presence check via the bus MAGIC register.** The MMIO bus serves
    `0x00 MAGIC` = device id (u32 read; pv-blk is `DEVICE_ID_PV_BLK = 0x0005`,
@@ -65,8 +73,13 @@ implementer sees the whole shape first.
 5. **Reads only — the agent never writes the game device.** Materialization
    must not dirty the pv-blk overlay (dirty clusters enlarge hypervisor
    snapshot sections). No CMD_WRITE, no CMD_FLUSH. Integrity is a streaming
-   checksum over the read plus a second full read pass compared against the
-   first (the fixture's readback-checksum precedent, made non-panicking).
+   checksum over the device read, verified by re-reading the **materialized
+   file** (the artifact the harness actually consumes — this catches
+   short/garbled file writes, which a re-read of a deterministic device
+   would not). The fixture's readback-checksum precedent, made
+   non-panicking. The agent unlinks the file after the control leg completes
+   (the harness has its own copy by `GameLoaded`), keeping steady-state RAM
+   to one copy.
 
 6. **Materialize before the unit is spawned** (in `autostart_and_ready`,
    `crates/detguest-agent/src/runtime.rs:162-198`, before the socketpair/
@@ -119,7 +132,11 @@ reference-workload side is instructions in the handback, not edits by us.
    observed (pv-blk-named fault, no `Ready`).
 3. Probe expectation documented: under `boot_probe` with the rebuilt
    package-04 image the last event becomes the agent's pv-blk-named fault
-   (device-less harness) — layer-visible progress per the request.
+   (device-less harness) — layer-visible progress per the request. Optional
+   but preferred: observe it rather than predict it — locally (and
+   *uncommitted*, per the non-goals) bump reference-workload's
+   `image/guest-sdk.lock` + add the `game_source` line, rebuild their image,
+   and run the request's two-minute probe recipe before handback.
 4. `03-resolution.md` filed with commits, semantics, lock-bump instructions.
 
 ## Top risks and mitigations
@@ -130,9 +147,11 @@ reference-workload side is instructions in the handback, not edits by us.
    a missing device is `BusError::Unmapped` → injected guest fault, but in
    production the device is always present; do not try to make the agent
    survive that path. Documented in `02-…`.
-2. **Sector-granular truncation** of non-512-aligned images — a staging
-   requirement on the bridge/reference-workload side, stated in the
-   resolution (`05-…`); the 32 KiB synthetic image is aligned.
+2. **Sector-granular truncation** of non-512-aligned images — undetectable
+   in-guest (decision 3); must be validated at staging on the
+   bridge/reference-workload side, stated in the resolution (`05-…`); the
+   32 KiB synthetic image is aligned, and valid ROMs are power-of-two-sized
+   by refwork's own cart contract.
 3. **DMA buffer physical contiguity**: multi-sector DMA needs GPA-contiguous
    memory; the plan reads at most one 4 KiB page (8 sectors) per command into
    a page-aligned, mlocked static — one page is always GPA-contiguous.
@@ -140,9 +159,12 @@ reference-workload side is instructions in the handback, not edits by us.
 4. **`game_source` under the hypervisor's staged m9 image** — untouched by
    design (decision 1); only reference-workload's package-04 boot.toml adopts
    it.
-5. **RAM budget**: game bytes exist twice transiently (file + workload's own
-   copy); cap materialization at `MAX_GAME_BYTES = 64 MiB` (loud fault above)
-   against 128 MiB guest RAM; today's images are 32 KiB.
+5. **RAM budget**: game bytes exist twice at peak — the /run file plus the
+   harness's in-process copy (refwork's loader `fs::read` keeps the Vec as
+   `Cartridge.rom` for the process lifetime, so this is not transient). Cap
+   materialization at `MAX_GAME_BYTES = 32 MiB` (loud fault above; pair
+   peaks at 64 MiB against 128 MiB guest RAM) and unlink the file after the
+   control leg (decision 5); today's images are 32 KiB.
 
 ## Non-goals
 

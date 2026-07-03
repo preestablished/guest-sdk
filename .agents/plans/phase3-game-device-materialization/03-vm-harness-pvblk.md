@@ -39,14 +39,25 @@ A minimal, read-only pv-blk model faithful to dh-devices semantics
   `[0xD000_4000, 0xD000_5000)` to the pv-blk model **only when the test
   attached one**; otherwise preserve today's behavior exactly (read 0 /
   drop) — `boot_probe` and the existing m2/m4 tests must be bit-identical
-  with no device attached (their goldens, e.g. m4's
-  `0x3b0d3ebc93e4ba51`, must not shift).
+  with no device attached (their goldens, e.g. m2's `M3_TESTLOAD_EVENT_HASH
+  = 0x3b0d3ebc93e4ba51` at `m2_acceptance.rs:37`, must not shift).
+- **8-byte accesses**: the existing arms truncate every MMIO access to the
+  low 4 bytes (`data.len().min(4)` + `u32::from_le_bytes`) before pv-pad
+  sees it. The agent writes SECTOR/BUF_GPA as single 8-byte volatile stores,
+  so route the **raw `data` slice** to the pv-blk model *before* that
+  truncation; the model must accept 4- and 8-byte naturally-aligned accesses
+  (a routed-after-truncation implementation would silently zero the high
+  halves and even appear to work in a 128 MiB guest — a latent model bug).
 - Attachment API: keep it in the harness style — e.g. a
   `VmHarness::attach_pv_blk(backing: Vec<u8>)` (or a field on the params
   struct `VmHarness::new` takes, whichever exists — follow `mod.rs:182-269`),
   plus an accessor for test assertions mirroring `pvpad()` (`mod.rs:434`).
 - Guest-memory copy: same access path `attach_channel`/pv-pad use
   (`pio.rs:179` neighborhood) — do not add a second mapping of guest RAM.
+- Snapshots: keep the model's state `Clone` (it rides in `PioState`, which
+  `VmSnapshot` clones), but do **not** build restore fidelity beyond that —
+  all pv-blk traffic in this tier is pre-READY, and `04-…`'s test never
+  snapshots. Don't over-build.
 
 ## Tests (host-side, in tests/vm — no KVM needed for the model itself)
 
@@ -54,9 +65,10 @@ Unit-test the model directly (plain struct + fake/borrowed guest memory if
 the harness structure allows; otherwise fold into `04-…`'s VM test):
 
 - MAGIC/VERSION reads; MAGIC is 4-byte only.
-- Read at last valid sector OK; one past ⇒ BAD_REQUEST; count 0 ⇒
-  BAD_REQUEST (this is what the agent's capacity probe keys on — fidelity
-  here **is** the test of the probe's assumptions).
+- Read at last valid sector OK; one past ⇒ BAD_REQUEST (this out-of-range
+  semantic is what the agent's size discovery keys on — fidelity here **is**
+  the test of its assumptions); count 0 ⇒ BAD_REQUEST too, per `blk.rs`.
+- 8-byte writes to SECTOR/BUF_GPA land whole (high half preserved).
 - Multi-sector read crossing nothing special returns exact backing bytes.
 - Non-512-multiple backing: trailing partial sector not addressable.
 - WRITE ⇒ BAD_REQUEST.
