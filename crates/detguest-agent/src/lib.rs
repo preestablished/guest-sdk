@@ -9,9 +9,10 @@
 //! Unsafe policy (IMPLEMENTATION-PLAN M6, module-scoped): unsafe is permitted
 //! only in the documented modules — [`pio`] (iopl + OUT/IN inline asm),
 //! [`channel`] (hugetlbfs mmap of shared channel memory), the libc
-//! process/epoll plumbing in [`supervise`] and [`runtime`], and the AF_UNIX
-//! SEQPACKET plumbing in [`region_ipc`]. Everything else inherits this
-//! crate-level deny. (`translate` needs no unsafe: pagemap is plain file I/O.)
+//! process/epoll plumbing in [`supervise`] and [`runtime`], the AF_UNIX
+//! SEQPACKET plumbing in [`region_ipc`], and the /dev/mem MMIO mapping +
+//! mlocked DMA page in [`pvblk`]. Everything else inherits this crate-level
+//! deny. (`translate` needs no unsafe: pagemap is plain file I/O.)
 #![deny(unsafe_code)]
 
 pub mod boot;
@@ -19,6 +20,7 @@ pub mod channel;
 pub mod commands;
 pub mod control;
 pub mod pio;
+pub mod pvblk;
 pub(crate) mod region_ipc;
 pub mod runtime;
 pub mod supervise;
