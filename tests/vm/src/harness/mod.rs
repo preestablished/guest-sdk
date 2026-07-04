@@ -39,6 +39,19 @@ const CMDLINE_ADDR: u64 = 0x20000;
 const CMDLINE_MAX: usize = 0x800;
 const HIMEM_START: u64 = 0x10_0000;
 
+/// The deterministic worker's forced timer-disabling flags
+/// (`dh-vmm/src/config.rs:92` `BZIMAGE_FORCED_CMDLINE`): no TSC, no APIC
+/// timer, jiffies as the clocksource. `lpj=4096` is load-bearing, not
+/// cosmetic: when the quick TSC calibration against the PIT counter fails
+/// (it is flaky — see the SPEAKER_DUMMY note in `create_vm_core`),
+/// calibrate_delay falls back to converging on jiffies, and with delivery
+/// suppressed jiffies never advance — a nondeterministic pre-userspace
+/// hang. The preset skips calibration entirely, exactly like the worker.
+/// Appended to the harness default cmdline by the no-timer reproducer
+/// tests (request phase3-boot-scheduling-deadlock).
+pub const TIMERLESS_CMDLINE_FLAGS: &str =
+    "notsc tsc=unstable clocksource=jiffies noapictimer lpj=4096";
+
 /// Harness configuration.
 pub struct VmConfig {
     /// Path to the `image/build.sh`-built bzImage.
@@ -49,6 +62,11 @@ pub struct VmConfig {
     pub cmdline: String,
     /// Guest RAM in bytes (MAP.md canonical demo guest: 128 MiB).
     pub mem_size: usize,
+    /// Deliver timer interrupts (irqchip PIT → IRQ0). Default true. False
+    /// reproduces the deterministic worker's environment: interrupts exist
+    /// as machinery but nothing is armed, so the guest's jiffies never
+    /// advance (request phase3-boot-scheduling-deadlock).
+    pub timer_interrupts: bool,
 }
 
 impl VmConfig {
@@ -65,7 +83,14 @@ impl VmConfig {
             cmdline: "console=ttyS0,115200 panic=-1 reboot=t 8250.nr_uarts=1 hugepages=4"
                 .to_string(),
             mem_size: 128 << 20,
+            timer_interrupts: true,
         }
+    }
+
+    /// The current cmdline plus [`TIMERLESS_CMDLINE_FLAGS`] — the no-timer
+    /// reproducer cmdline (assign it back to `self.cmdline`).
+    pub fn timerless_cmdline(&self) -> String {
+        format!("{} {}", self.cmdline, TIMERLESS_CMDLINE_FLAGS)
     }
 }
 
@@ -125,7 +150,7 @@ struct VmCore {
     mem: MemSlot,
 }
 
-fn create_vm_core(mem_size: usize) -> io::Result<VmCore> {
+fn create_vm_core(mem_size: usize, timer_interrupts: bool) -> io::Result<VmCore> {
     let kvm = Kvm::new().map_err(io::Error::from)?;
     let vm = kvm.create_vm().map_err(io::Error::from)?;
     // Legacy Intel requirement: TSS + identity map out of the way of RAM
@@ -142,6 +167,9 @@ fn create_vm_core(mem_size: usize) -> io::Result<VmCore> {
         ..Default::default()
     };
     vm.create_pit2(pit).map_err(io::Error::from)?;
+    if !timer_interrupts {
+        suppress_timer_gsi_routes(&vm)?;
+    }
 
     let guest_mem: GuestMemoryMmap = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size)])
         .map_err(|e| io::Error::other(format!("guest memory: {e}")))?;
@@ -167,6 +195,61 @@ fn create_vm_core(mem_size: usize) -> io::Result<VmCore> {
     })
 }
 
+/// Suppress timer-interrupt *delivery* while keeping the irqchip + PIT
+/// intact (SPEAKER_DUMMY and the in-kernel 0x61/0x42 emulation stay, so the
+/// kernel's PIT-polled TSC calibration cannot hang — request
+/// phase3-boot-scheduling-deadlock §3 caveat): replace the GSI routing
+/// table with KVM's post-CREATE_IRQCHIP default minus GSIs 0 and 2.
+///
+/// Pin model (kernel `virt/kvm` `irq_comm.c` `default_routing`): GSI n maps
+/// to PIC pin n%8 AND IOAPIC pin n for n in 0..16, IOAPIC-only for 16..24 —
+/// i.e. GSI 0 → IOAPIC *pin 0*; the familiar GSI0→IOAPIC-pin-2 remap is a
+/// QEMU userspace convention, not the kernel default. The in-kernel PIT
+/// injects via `kvm_set_irq(…, gsi 0, …)`, so omitting GSI 0 alone
+/// suppresses delivery; GSI 2 is dropped as well for belt-and-braces. A
+/// missing route fails silently — `pit_do_work` ignores `kvm_set_irq`'s
+/// return and in default reinject mode simply stops re-arming — which is
+/// exactly the behavior we want: no VM error, no delivery. The guest cannot
+/// re-enable it (unmasking its PIC IMR is irrelevant; the host table has no
+/// route).
+fn suppress_timer_gsi_routes(vm: &VmFd) -> io::Result<()> {
+    use kvm_bindings::{
+        kvm_irq_routing_entry, KvmIrqRouting, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER,
+        KVM_IRQCHIP_PIC_SLAVE, KVM_IRQ_ROUTING_IRQCHIP,
+    };
+
+    fn entry(gsi: u32, irqchip: u32, pin: u32) -> kvm_irq_routing_entry {
+        let mut e = kvm_irq_routing_entry {
+            gsi,
+            type_: KVM_IRQ_ROUTING_IRQCHIP,
+            ..Default::default()
+        };
+        e.u.irqchip.irqchip = irqchip;
+        e.u.irqchip.pin = pin;
+        e
+    }
+
+    let mut entries = Vec::new();
+    for gsi in 0u32..24 {
+        if gsi == 0 || gsi == 2 {
+            continue;
+        }
+        entries.push(entry(gsi, KVM_IRQCHIP_IOAPIC, gsi));
+        if gsi < 16 {
+            let pic = if gsi < 8 {
+                KVM_IRQCHIP_PIC_MASTER
+            } else {
+                KVM_IRQCHIP_PIC_SLAVE
+            };
+            entries.push(entry(gsi, pic, gsi % 8));
+        }
+    }
+    let mut routing = KvmIrqRouting::new(entries.len())
+        .map_err(|e| io::Error::other(format!("KvmIrqRouting alloc: {e}")))?;
+    routing.as_mut_slice().copy_from_slice(&entries);
+    vm.set_gsi_routing(&routing).map_err(io::Error::from)
+}
+
 /// Create vCPU 0 with the full supported-CPUID table (identical in the boot
 /// and restore paths — CPUID determines guest-visible feature bits).
 fn create_vcpu_with_cpuid(kvm: &Kvm, vm: &VmFd) -> io::Result<VcpuFd> {
@@ -187,7 +270,7 @@ impl VmHarness {
             vm,
             guest_mem,
             mem,
-        } = create_vm_core(cfg.mem_size)?;
+        } = create_vm_core(cfg.mem_size, cfg.timer_interrupts)?;
 
         // ---- load kernel (bzImage), initramfs, cmdline, boot params ----
         let mut kernel = File::open(&cfg.bzimage)?;

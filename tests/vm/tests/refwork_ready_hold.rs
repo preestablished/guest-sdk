@@ -72,8 +72,16 @@ fn workload_death(events: &[detguest_host::GuestEvent]) -> Option<String> {
     })
 }
 
-#[test]
-fn real_harness_reaches_and_holds_ready() {
+/// The timer-ful acceptance body, parameterized for the no-timer twin
+/// (request phase3-boot-scheduling-deadlock package 01 §4). With
+/// `timer_interrupts = false` the harness suppresses IRQ0 delivery via GSI
+/// routing and appends the worker's timerless cmdline flags — the
+/// deterministic worker's environment — and the phase-2 hold check is
+/// deliberately relaxed to workload-alive only (frame pacing in the refwork
+/// harness may itself be tick-dependent; a frozen frame counter there is
+/// outside this request's scope). Frame advance stays asserted in the
+/// timer-ful arm.
+fn ready_hold_body(timer_interrupts: bool) {
     let Ok(initramfs) = std::env::var("REFWORK_READY_INITRAMFS") else {
         eprintln!("skipping refwork ready-hold: REFWORK_READY_INITRAMFS unset");
         return;
@@ -82,7 +90,11 @@ fn real_harness_reaches_and_holds_ready() {
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../image/build/bzImage").to_string()
     });
 
-    let cfg = VmConfig::new(PathBuf::from(bzimage), PathBuf::from(initramfs));
+    let mut cfg = VmConfig::new(PathBuf::from(bzimage), PathBuf::from(initramfs));
+    if !timer_interrupts {
+        cfg.timer_interrupts = false;
+        cfg.cmdline = cfg.timerless_cmdline();
+    }
     let mut vm = VmHarness::new(&cfg).expect("harness boots");
     vm.attach_pv_blk(nop_rom());
 
@@ -136,10 +148,16 @@ fn real_harness_reaches_and_holds_ready() {
         panic!("workload died after Ready ({stop:?}): {death}");
     }
     let f1 = meta_frame(&vm);
-    assert!(
-        f1 > f0 || f1 > 0,
-        "frame counter must advance past the first boundary (before={f0}, after={f1})"
-    );
+    if timer_interrupts {
+        assert!(
+            f1 > f0 || f1 > 0,
+            "frame counter must advance past the first boundary (before={f0}, after={f1})"
+        );
+    } else if f1 > f0 || f1 > 0 {
+        // Bonus observation for the resolution file: frames advance even
+        // without a tick.
+        eprintln!("no-timer arm: frames advanced anyway (before={f0}, after={f1})");
+    }
 
     // Phase 3: the boot-leg breadcrumbs arrive in order (the step-01
     // wedge-diagnosis contract; agent LogLine stream 3, level 1).
@@ -168,4 +186,20 @@ fn real_harness_reaches_and_holds_ready() {
         ],
         "boot-leg breadcrumb sequence"
     );
+}
+
+#[test]
+fn real_harness_reaches_and_holds_ready() {
+    ready_hold_body(true);
+}
+
+/// No-timer twin (reproducer tier 2, the request's §3 red→green arbiter):
+/// same body, timer-interrupt delivery suppressed + timerless cmdline.
+/// ⚠ The initramfs embeds the agent as PID 1: a green run REQUIRES an
+/// artifact rebuilt against the fixed agent (local uncommitted
+/// `guest-sdk.lock` bump in the reference-workload checkout) — against a
+/// pre-fix artifact this stays red no matter what the local tree holds.
+#[test]
+fn no_timer_real_harness_reaches_and_holds_ready() {
+    ready_hold_body(false);
 }

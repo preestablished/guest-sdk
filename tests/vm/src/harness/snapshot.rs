@@ -283,7 +283,7 @@ impl VmHarness {
             vm,
             guest_mem,
             mem,
-        } = create_vm_core(cfg.mem_size)?;
+        } = create_vm_core(cfg.mem_size, cfg.timer_interrupts)?;
 
         guest_mem
             .write_slice(&snap.memory, GuestAddress(0))

@@ -36,6 +36,13 @@ fn boot_probe_prints_serial() {
     if let Ok(cmdline) = std::env::var("BOOT_PROBE_CMDLINE") {
         cfg.cmdline = cmdline;
     }
+    // BOOT_PROBE_NO_TIMER=1: suppress timer-interrupt delivery (GSI routing;
+    // irqchip+PIT kept so TSC calibration can't hang) — the deterministic
+    // worker's no-tick environment (request phase3-boot-scheduling-deadlock).
+    // Combine with BOOT_PROBE_CMDLINE for the worker's timerless flags.
+    if std::env::var("BOOT_PROBE_NO_TIMER").as_deref() == Ok("1") {
+        cfg.timer_interrupts = false;
+    }
     let mut vm = VmHarness::new(&cfg).expect("harness boots");
     if let Ok(game) = std::env::var("BOOT_PROBE_GAME") {
         vm.attach_pv_blk(std::fs::read(game).expect("read BOOT_PROBE_GAME"));
