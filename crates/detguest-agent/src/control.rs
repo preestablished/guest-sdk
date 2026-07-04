@@ -34,10 +34,23 @@ pub(crate) struct ControlSocket {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ControlReply {
-    HelloAck { proto_version: u16 },
+    HelloAck {
+        proto_version: u16,
+    },
     GameLoaded,
-    Ready { frame: u64 },
-    Fault { detail: String },
+    /// Informational region announcement (refwork-protocol tag 7,
+    /// `RegisterRegion`) sent between GameLoaded and Ready. The agent
+    /// gates Ready on the detchannel manifest, not on these messages, so
+    /// they are skipped wherever a reply is awaited. The staged M9
+    /// fixture's minimal dialect never sent them — the real harness does
+    /// (found on the first real boot, 2026-07-04).
+    Region,
+    Ready {
+        frame: u64,
+    },
+    Fault {
+        detail: String,
+    },
 }
 
 pub(crate) fn socketpair() -> io::Result<(ControlSocket, OwnedFd)> {
@@ -112,29 +125,35 @@ pub(crate) fn drive_refwork_start(
 
     sock.send(&encode_load_game(game_path))
         .map_err(|e| format!("send refwork LoadGame: {e}"))?;
-    match sock
-        .recv(&mut idle)
-        .map_err(|e| format!("recv refwork GameLoaded: {e}"))?
-    {
-        ControlReply::GameLoaded => {}
-        ControlReply::Fault { detail } => {
-            return Err(format!("refwork fault after LoadGame: {detail}"));
+    loop {
+        match sock
+            .recv(&mut idle)
+            .map_err(|e| format!("recv refwork GameLoaded: {e}"))?
+        {
+            ControlReply::GameLoaded => break,
+            ControlReply::Region => continue,
+            ControlReply::Fault { detail } => {
+                return Err(format!("refwork fault after LoadGame: {detail}"));
+            }
+            other => return Err(format!("expected refwork GameLoaded, got {other:?}")),
         }
-        other => return Err(format!("expected refwork GameLoaded, got {other:?}")),
     }
 
-    match sock
-        .recv(&mut idle)
-        .map_err(|e| format!("recv refwork Ready: {e}"))?
-    {
-        ControlReply::Ready { frame: 0 } => {}
-        ControlReply::Ready { frame } => {
-            return Err(format!("refwork Ready frame must be 0, got {frame}"));
+    loop {
+        match sock
+            .recv(&mut idle)
+            .map_err(|e| format!("recv refwork Ready: {e}"))?
+        {
+            ControlReply::Ready { frame: 0 } => break,
+            ControlReply::Region => continue,
+            ControlReply::Ready { frame } => {
+                return Err(format!("refwork Ready frame must be 0, got {frame}"));
+            }
+            ControlReply::Fault { detail } => {
+                return Err(format!("refwork fault before Start: {detail}"));
+            }
+            other => return Err(format!("expected refwork Ready, got {other:?}")),
         }
-        ControlReply::Fault { detail } => {
-            return Err(format!("refwork fault before Start: {detail}"));
-        }
-        other => return Err(format!("expected refwork Ready, got {other:?}")),
     }
 
     sock.send(&[0x02])
@@ -249,6 +268,13 @@ fn decode_reply(bytes: &[u8]) -> Result<ControlReply, String> {
             let _sram_size = cur.varint()?;
             ControlReply::GameLoaded
         }
+        // Payload deliberately not parsed — but consumed, to satisfy the
+        // trailing-bytes check: one message per datagram and the agent
+        // ignores region announcements (see ControlReply::Region).
+        7 => {
+            cur.at = cur.bytes.len();
+            ControlReply::Region
+        }
         8 => ControlReply::Ready {
             frame: cur.varint()?,
         },
@@ -358,6 +384,12 @@ mod tests {
         assert_eq!(
             decode_reply(&[0x08, 0x00]).unwrap(),
             ControlReply::Ready { frame: 0 }
+        );
+        // Tag 7 (RegisterRegion) is informational and skipped: any payload
+        // decodes to Region without being parsed.
+        assert_eq!(
+            decode_reply(&[0x07, 0x04, b'w', b'r', b'a', b'm', 0x00]).unwrap(),
+            ControlReply::Region
         );
     }
 }

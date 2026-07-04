@@ -31,6 +31,9 @@ fn boot_probe_prints_serial() {
 
     let cfg = VmConfig::new(PathBuf::from(bzimage), PathBuf::from(initramfs));
     let mut vm = VmHarness::new(&cfg).expect("harness boots");
+    if let Ok(game) = std::env::var("BOOT_PROBE_GAME") {
+        vm.attach_pv_blk(std::fs::read(game).expect("read BOOT_PROBE_GAME"));
+    }
     let stop = vm
         .run_until(Duration::from_secs(secs), |_| false)
         .expect("run loop");
