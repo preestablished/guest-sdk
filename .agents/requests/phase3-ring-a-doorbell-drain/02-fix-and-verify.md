@@ -1,43 +1,26 @@
 # Fix Options And Verification
 
-## The Routing Decision (yours — you own the channel contract)
+## Step 1: Pin the exact op (before any fix)
 
-The bug is a mismatch between `channel.rs::emit`'s documented contract
-("the doorbell exit makes the host drain + bump the consumer index") and
-the real worker's `NextSdkEvent` run behavior (ring A not drained until
-stop). One of the two must move. Please decide which and record it in
-`03-resolution.md`:
+The worker DOES drain ring A on the doorbell (`detchannel.rs:590`), so
+the naive "make the worker drain" fix is a no-op. Pin the real block
+first with the counter in `01`'s "How To Pin It" — one bridge-run
+real-worker handoff resolves it to one of:
 
-### Option A — Worker drains ring A mid-run (likely primary; determinism-hypervisor)
+- **(a) `emit` doorbell-drain not freeing producer-visible space**
+  (`channel.rs:203-212`): a huge doorbell count. This would be a
+  producer/consumer index-visibility issue between the guest `try_push`
+  and the host `drain` under the real worker's deterministic memory
+  model — investigate whether the consumer bump the host writes is
+  observed by the guest producer before it re-checks (a missing
+  acquire/release or a cache-vs-fresh read in the guest ring producer).
+  A worker-side half may exist; if so the bridge files the
+  determinism-hypervisor request and drives it.
+- **(b) blocking reply `send`** (`region_ipc.rs:189`, `MSG_NOSIGNAL`,
+  no `MSG_DONTWAIT`): a low count. Make it non-blocking/bounded and a
+  failed/would-block send a named boot-fault.
 
-If the doorbell-drain contract is real (the comment says it is, and the
-whole point of `DOORBELL_RING_A` is host wakeup), then the worker's
-`Run{until: NextSdkEvent(...)}` loop must **service `DOORBELL_RING_A` VM
-exits by draining ring A and advancing the consumer index**, not just
-watch for the target event kind. Your plan's H4 already routes this:
-"that half lives in determinism-hypervisor — file a request to that repo
-per the series convention rather than fixing cross-repo yourself."
-
-If you choose A: hand the precise worker-side ask back here (or say the
-word) and **the bridge session will file the determinism-hypervisor
-request and drive it** — we own that repo's request series and the
-real-worker verification. This keeps you from fixing cross-repo.
-
-### Option B — Agent does not depend on mid-run drain (guest-sdk)
-
-If the contract is that the host only drains at stop/capture boundaries
-during a `NextSdkEvent` run, then the agent must guarantee it never
-needs more critical ring-A space than exists before `Ready`:
-
-- Ensure the pre-Ready critical burst (Hello, WorkloadStarted, 3×
-  {NameIntern, RegionRegister}, Ready) fits ring A with margin — i.e.
-  ring A must hold the whole boot handshake, or the burst must be
-  reduced/coalesced.
-- Consider whether `NameIntern`/`RegionRegister` must be *critical*
-  during boot, or whether the host reconstructs them from the manifest
-  at Ready (making them droppable would remove the spin entirely).
-
-### Both options: kill the silent HARD_CAP
+## Step 2: Structural hardening (regardless of a/b)
 
 Regardless of A or B, replace the **unbounded** `emit` critical-full
 `loop` (`channel.rs:203-212`) with a **bounded** doorbell-wait that

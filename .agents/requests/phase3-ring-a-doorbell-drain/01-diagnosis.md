@@ -33,18 +33,26 @@ The device-less probe (`tests/vm/tests/boot_probe.rs` with
 `BOOT_PROBE_GAME`) on the **identical** image reaches
 `Ready { region_count: 3, gen 6 }` and the workload is **alive at the
 30 s deadline** (Timeout, not WorkloadExited). Symptom 2 fully fixed.
-The delta is what your plan already flagged: **"the probe host drains
-ring A continuously while the real worker buffers events until stop —
-consumer index frozen mid-run."** So the probe's doorbell-wait always
-makes progress; the real worker's does not.
+**Corrected causal note:** the worker is NOT failing to drain — it
+services the doorbell (`detchannel.rs:590` → `drain()`, advancing the
+consumer) on the OUT-0xD380 exit, in `NextSdkEvent` mode too. So the
+probe-vs-worker delta is something subtler: under the real worker either
+(a) an `emit` doorbell-drain does not free *producer-visible* ring space
+(a producer/consumer index-visibility interaction under the deterministic
+memory model that the probe's continuous host-side drain masks), or (b) a
+different blocking op in the service path stalls. The observed facts
+(regions complete, no Ready, caps silent) are solid; the exact op is not
+yet pinned — see "How to pin it" below.
 
 ## Why The Caps Didn't Fire (the tell)
 
 Your retuned wedge-to-fault caps (`CONTROL_RECV_POLL_LIMIT` 500 K,
 `READY_REGION_POLL_LIMIT`) bound the *poll loops*. But the boot ran the
 full 10 B without faulting — so the wedge is **not** in a counted poll
-loop. It is in the **unbounded** `channel.rs::emit` critical-full loop
-(`:203-212`), reached via:
+loop; it is a genuine block inside one `service_region_ipc` iteration.
+The leading candidate is the **unbounded** `channel.rs::emit`
+critical-full loop (`:203-212`) not making progress; the other is the
+blocking reply `send` (`region_ipc.rs:189`). Both are reached via:
 
 ```
 drive_refwork_start (control.rs:149, recv-GameLoaded loop)
@@ -62,12 +70,28 @@ matches every observation.
 ## Why The M9 Fixture And The Probe Don't Hit It
 
 - The staged fixture (`m9_refwork_contract.rs`) emits a *minimal* event
-  set and never fills ring A before `Ready`.
-- The probe drains ring A continuously, so `emit`'s doorbell-wait
-  always finds space.
+  set — it may simply never reach whatever ring-pressure or blocking
+  condition the real harness hits.
+- The probe reaches `Ready` on the exact wedging image, so the trigger
+  is specific to the real-worker environment (real device set,
+  deterministic epoch run control, and its ring producer/consumer
+  visibility) — not the image content.
 - The real refwork harness emits the full critical burst (Hello,
-  WorkloadStarted, 3× {NameIntern, RegionRegister}) into a ring the real
-  worker never drains mid-run → overflow → spin.
+  WorkloadStarted, 3× {NameIntern, RegionRegister}) and drives a
+  cross-process fd-3 + agent.sock handshake; the stall is somewhere in
+  the agent's `service_region_ipc` servicing of that burst.
+
+## How To Pin It (one counter, one real-worker run)
+
+Add a diagnostic counter surfaced in the boot-fault detail:
+- doorbell-ring count inside `channel.rs::emit`'s critical-full branch
+  (`:203-212`), and
+- a `service_region_ipc` iteration/elapsed count.
+A never-progressing `emit` will show a huge doorbell count pinned to a
+named event (⇒ candidate (a): drain not freeing producer space); a stall
+with a low count points at the blocking reply `send`
+(`region_ipc.rs:189`, `MSG_NOSIGNAL`, no `MSG_DONTWAIT`) or elsewhere
+(⇒ candidate (b)). The bridge session runs it — see `02`.
 
 ## Anchors
 

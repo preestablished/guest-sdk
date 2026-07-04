@@ -22,15 +22,16 @@ Err(RingFull) if critical => {
 }
 ```
 
-That comment states the contract the agent relies on: **a
-`DOORBELL_RING_A` exit makes the host drain ring A and advance the
-consumer index.** Under the real worker's
-`Run{until: NextSdkEvent(Ready)}`, that does not happen — the worker
-**buffers ring A until the run stops** (your plan's own H4 note:
-"consumer index frozen mid-run"; my instrumentation only drained the
-events *after* the run ended). So once the region-registration burst
-fills ring A, the next critical `emit` spins the doorbell forever, to
-the 10 B hard cap.
+**CORRECTION (2026-07-04, after reading the worker):** the worker DOES
+drain ring A on the doorbell — `PORT_DOORBELL` (0xD380) is in the detcall
+PIO window, and `dh-devices/detchannel.rs:590` calls `drain()` (advancing
+the consumer) on that exit, in every run mode including `NextSdkEvent`.
+So the simple story "the worker never drains mid-run" is **wrong**; do
+not chase it. What is confirmed below is narrower: the agent stalls
+inside `service_region_ipc` during region registration in a way the poll
+caps don't catch — the exact blocking op still needs pinning (a
+doorbell-drain that doesn't free producer-visible space, or the blocking
+reply `send`). `01-diagnosis.md` has the corrected analysis.
 
 `is_critical` (`detguest-wire/src/record.rs:115`) = everything except
 `Pad`/`Beacon`/`LogLine`. So every `NameIntern` + `RegionRegister` in
