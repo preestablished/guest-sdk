@@ -29,7 +29,13 @@ fn boot_probe_prints_serial() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
 
-    let cfg = VmConfig::new(PathBuf::from(bzimage), PathBuf::from(initramfs));
+    let mut cfg = VmConfig::new(PathBuf::from(bzimage), PathBuf::from(initramfs));
+    // BOOT_PROBE_CMDLINE overrides the harness's default (timer-ful) cmdline
+    // — set it to the worker's timerless forced cmdline to reproduce the
+    // real-worker scheduling wedge under the fast probe.
+    if let Ok(cmdline) = std::env::var("BOOT_PROBE_CMDLINE") {
+        cfg.cmdline = cmdline;
+    }
     let mut vm = VmHarness::new(&cfg).expect("harness boots");
     if let Ok(game) = std::env::var("BOOT_PROBE_GAME") {
         vm.attach_pv_blk(std::fs::read(game).expect("read BOOT_PROBE_GAME"));

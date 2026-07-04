@@ -27,11 +27,13 @@ drain ring A on the doorbell — `PORT_DOORBELL` (0xD380) is in the detcall
 PIO window, and `dh-devices/detchannel.rs:590` calls `drain()` (advancing
 the consumer) on that exit, in every run mode including `NextSdkEvent`.
 So the simple story "the worker never drains mid-run" is **wrong**; do
-not chase it. What is confirmed below is narrower: the agent stalls
-inside `service_region_ipc` during region registration in a way the poll
-caps don't catch — the exact blocking op still needs pinning (a
-doorbell-drain that doesn't free producer-visible space, or the blocking
-reply `send`). `01-diagnosis.md` has the corrected analysis.
+not chase it. **ROOT CAUSE now CONFIRMED (see `01`): preemption.** The probe has an
+in-kernel PIT (preemptive scheduling); the deterministic worker delivers
+no interrupts (cooperative only). The agent's boot control-recv
+`sched_yield` spin relies on preemption to let the workload run, so it
+deadlocks under the worker after region registration. Fix: `poll(2)`
+blocking wait on both the fd-3 and region-IPC fds (plan H1). A
+non-preemptive probe variant reproduces it fast, locally.
 
 `is_critical` (`detguest-wire/src/record.rs:115`) = everything except
 `Pad`/`Beacon`/`LogLine`. So every `NameIntern` + `RegionRegister` in

@@ -33,65 +33,54 @@ The device-less probe (`tests/vm/tests/boot_probe.rs` with
 `BOOT_PROBE_GAME`) on the **identical** image reaches
 `Ready { region_count: 3, gen 6 }` and the workload is **alive at the
 30 s deadline** (Timeout, not WorkloadExited). Symptom 2 fully fixed.
-**Corrected causal note:** the worker is NOT failing to drain — it
-services the doorbell (`detchannel.rs:590` → `drain()`, advancing the
-consumer) on the OUT-0xD380 exit, in `NextSdkEvent` mode too. So the
-probe-vs-worker delta is something subtler: under the real worker either
-(a) an `emit` doorbell-drain does not free *producer-visible* ring space
-(a producer/consumer index-visibility interaction under the deterministic
-memory model that the probe's continuous host-side drain masks), or (b) a
-different blocking op in the service path stalls. The observed facts
-(regions complete, no Ready, caps silent) are solid; the exact op is not
-yet pinned — see "How to pin it" below.
+**ROOT CAUSE CONFIRMED (2026-07-04): preemption.** The probe creates an
+in-kernel irqchip + PIT (`tests/vm/src/harness/mod.rs:135`; the run loop
+notes "idle HLT ... wakes on timer", :348), so it delivers periodic
+timer interrupts and the guest gets **preemptive** scheduling. The
+deterministic worker delivers **no** interrupts (determinism forbids
+them), so scheduling is **cooperative only**. The agent's boot
+control-recv wait is a spin — `MSG_DONTWAIT recv → idle()
+(service_region_ipc) → sched_yield()` (`control.rs:214-247`) — that
+relies on preemption to hand the CPU to the workload. Under the worker's
+no-interrupt execution, `sched_yield` doesn't get the workload scheduled,
+so after region registration the handshake deadlocks (the workload never
+sends `GameLoaded`, the agent spins) → the 10 B silent HARD_CAP.
 
-## Why The Caps Didn't Fire (the tell)
+Two experiments nailed it:
+- **Timerless cmdline on the probe still reaches `Ready`.** Adding the
+  worker's `notsc tsc=unstable clocksource=jiffies noapictimer` to the
+  probe cmdline (new `BOOT_PROBE_CMDLINE`) did NOT reproduce the wedge —
+  because disabling the guest's *use* of the TSC/APIC timer doesn't stop
+  the probe's PIT from delivering ticks. So it is not the guest cmdline;
+  it is the **absence of interrupt delivery** under the deterministic
+  worker. This is also exactly why "the probe can't reproduce symptom 1":
+  the PIT masks it.
+- **Fast-then-dead, not slow.** Region registration completes in ~1 M
+  instructions (all at icount ≈ 643 M), then abrupt total silence to
+  10 B. A slow cooperative spin would dribble progress; an abrupt full
+  stop after fast progress is a deadlock at the post-registration
+  `GameLoaded` transition.
 
-Your retuned wedge-to-fault caps (`CONTROL_RECV_POLL_LIMIT` 500 K,
-`READY_REGION_POLL_LIMIT`) bound the *poll loops*. But the boot ran the
-full 10 B without faulting — so the wedge is **not** in a counted poll
-loop; it is a genuine block inside one `service_region_ipc` iteration.
-The leading candidate is the **unbounded** `channel.rs::emit`
-critical-full loop (`:203-212`) not making progress; the other is the
-blocking reply `send` (`region_ipc.rs:189`). Both are reached via:
+## The Fix (plan H1, now with a confirmed why)
 
-```
-drive_refwork_start (control.rs:149, recv-GameLoaded loop)
-  └─ recv() WouldBlock → idle()                  (control.rs:231)
-       └─ Supervisor::service_region_ipc          (runtime.rs:196)
-            └─ RegionIpc::handle (region_ipc.rs:246)
-                 └─ channel.emit_with_doorbell     (region_ipc.rs:296)
-                      └─ channel.emit → LOOP on RingFull (critical)  ← spins here
-```
+Replace the `sched_yield` spin in the agent's boot waits with a
+**`poll(2)` blocking wait on BOTH the fd-3 control socket AND the
+region-IPC fds** (`control.rs::recv` + the `idle`/`service_region_ipc`
+fds; the epoll infra already exists for the supervise loop). `poll(2)`
+deschedules the agent until real I/O readiness, which forces the kernel
+to run the workload — no dependency on preemption. Keep a bounded
+fallback that boot-faults with a named leg if `poll` returns nothing
+serviceable N times, so a future wedge is loud, not a 10 B silent cap.
 
-Because the spin is inside `idle()`, the outer `recv()` `for _ in
-0..CONTROL_RECV_POLL_LIMIT` never advances, so the cap can't fire. That
-matches every observation.
+## Fast Local Reproducer (unblocks your verify loop)
 
-## Why The M9 Fixture And The Probe Don't Hit It
-
-- The staged fixture (`m9_refwork_contract.rs`) emits a *minimal* event
-  set — it may simply never reach whatever ring-pressure or blocking
-  condition the real harness hits.
-- The probe reaches `Ready` on the exact wedging image, so the trigger
-  is specific to the real-worker environment (real device set,
-  deterministic epoch run control, and its ring producer/consumer
-  visibility) — not the image content.
-- The real refwork harness emits the full critical burst (Hello,
-  WorkloadStarted, 3× {NameIntern, RegionRegister}) and drives a
-  cross-process fd-3 + agent.sock handshake; the stall is somewhere in
-  the agent's `service_region_ipc` servicing of that burst.
-
-## How To Pin It (one counter, one real-worker run)
-
-Add a diagnostic counter surfaced in the boot-fault detail:
-- doorbell-ring count inside `channel.rs::emit`'s critical-full branch
-  (`:203-212`), and
-- a `service_region_ipc` iteration/elapsed count.
-A never-progressing `emit` will show a huge doorbell count pinned to a
-named event (⇒ candidate (a): drain not freeing producer space); a stall
-with a low count points at the blocking reply `send`
-(`region_ipc.rs:189`, `MSG_NOSIGNAL`, no `MSG_DONTWAIT`) or elsewhere
-(⇒ candidate (b)). The bridge session runs it — see `02`.
+Because the masker is the PIT, a **non-preemptive probe variant** — same
+`boot_probe` but with interrupt delivery suppressed (no irqchip/PIT tick,
+or a run mode that doesn't inject timer IRQs) — should reproduce the
+deadlock in ~30 s, WITHOUT a real-worker handoff. Build that and you can
+iterate the `poll(2)` fix locally; the bridge session does the final
+real-worker confirmation. (If a faithful non-preemptive probe is hard,
+hand back the commit + lock bump and the bridge runs the real worker.)
 
 ## Anchors
 
