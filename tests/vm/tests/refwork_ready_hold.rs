@@ -66,7 +66,8 @@ fn workload_death(events: &[detguest_host::GuestEvent]) -> Option<String> {
         )),
         OwnedPayload::LogLine { msg, .. } => {
             let text = String::from_utf8_lossy(msg);
-            text.contains("frame loop failed").then(|| text.into_owned())
+            text.contains("frame loop failed")
+                .then(|| text.into_owned())
         }
         _ => None,
     })

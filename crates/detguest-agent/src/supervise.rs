@@ -240,6 +240,25 @@ const TOK_OUT: u64 = 3;
 const TOK_ERR: u64 = 4;
 const TOK_REGION_LISTENER: u64 = 5;
 const TOK_REGION_CONN: u64 = 6;
+/// The workload's fd-3 control socket — registered for the BOOT LEG ONLY
+/// (added before `drive_refwork_start`, removed after it returns on both
+/// paths). Post-Start the agent never touches the control socket, and a
+/// persistent registration would make the supervise loop wake on
+/// workload-side EOF with a token it must then handle (HUP → potential
+/// busy-spin between death and reap); the boot-only lifecycle closes that
+/// analysis off. Revisit when host-driven HashRequest/Shutdown relays land.
+const TOK_CONTROL: u64 = 7;
+
+/// `wait_boot_io`'s epoll timeout. Advisory only: it can fire ONLY in a
+/// tickful environment (host unit tests, the PIT-ful probe, any future
+/// ticked worker) — in the no-tick guest, timer expiry is itself
+/// interrupt-driven, so a dead-block parks the vCPU in HLT and the
+/// authoritative hang bound is the HOST's wall-clock deadline (harness
+/// `run_until`; the worker's wall budget), not this value.
+#[cfg(test)]
+const BOOT_WAIT_TIMEOUT_MS: i32 = 5;
+#[cfg(not(test))]
+const BOOT_WAIT_TIMEOUT_MS: i32 = 100;
 
 impl Supervisor {
     /// Build the loop fds: blocked-SIGCHLD signalfd + 10 ms periodic timerfd
@@ -434,7 +453,11 @@ impl Supervisor {
         }
     }
 
-    /// Reap exited/stopped children (SIGCHLD or shutdown sweep).
+    /// Reap exited/stopped children (SIGCHLD or shutdown sweep). The `-1`
+    /// wait is correct in the single-child PID 1 supervise loop; boot-time
+    /// waits use [`Supervisor::reap_workload`] instead (targeted — the
+    /// multi-threaded cargo test harness runs `wait_boot_io`, and a `-1`
+    /// wait there could steal another test's child).
     fn reap(&mut self) {
         loop {
             let mut status: i32 = 0;
@@ -447,63 +470,202 @@ impl Supervisor {
             if self.workload.as_ref().map(|w| w.pid) != Some(pid) {
                 continue; // unrelated child (none expected in v1)
             }
-            if libc::WIFSTOPPED(status) {
-                // FORCED quiesce landed: acknowledge host-ward (§6).
-                if let Some(w) = self.workload.as_mut() {
-                    w.stopped = true;
-                }
-                let token = self.forced_token;
-                self.channel
-                    .emit_with_doorbell(vnanos(), 0, &EventPayload::QuiesceReady { token });
-                continue;
-            }
-            // Exited or killed: final pipe drain, flush partial lines, emit
-            // WorkloadExited (critical + doorbell).
-            self.drain_pipe(TOK_OUT);
-            self.drain_pipe(TOK_ERR);
-            let w = self.workload.take().expect("checked above");
-            // The dead workload's control socket must not linger across a
-            // future restart of the (single, v1) unit slot.
-            self.workload_control = None;
-            let mut out_lines: Vec<Vec<u8>> = Vec::new();
-            let mut err_lines: Vec<Vec<u8>> = Vec::new();
-            let (mut ob, mut eb) = (w.outbuf, w.errbuf);
-            ob.finish(|l| out_lines.push(l.to_vec()));
-            eb.finish(|l| err_lines.push(l.to_vec()));
-            self.emit_lines(log_stream::STDOUT, STDOUT_LEVEL, &out_lines);
-            self.emit_lines(log_stream::STDERR, STDERR_LEVEL, &err_lines);
-            // SAFETY: deregister + close the pipe fds.
-            unsafe {
-                libc::epoll_ctl(
-                    self.epfd,
-                    libc::EPOLL_CTL_DEL,
-                    w.stdout,
-                    std::ptr::null_mut(),
-                );
-                libc::epoll_ctl(
-                    self.epfd,
-                    libc::EPOLL_CTL_DEL,
-                    w.stderr,
-                    std::ptr::null_mut(),
-                );
-                libc::close(w.stdout);
-                libc::close(w.stderr);
-            }
-            let (exit_code, term_signal) = if libc::WIFEXITED(status) {
-                (libc::WEXITSTATUS(status), 0)
-            } else {
-                (-1, libc::WTERMSIG(status))
-            };
-            self.channel.emit_with_doorbell(
-                vnanos(),
-                0,
-                &EventPayload::WorkloadExited {
-                    guest_pid: pid as u32,
-                    exit_code,
-                    term_signal,
-                },
-            );
+            self.handle_child_status(pid, status);
         }
+    }
+
+    /// Targeted boot-time reap: wait on the supervised workload's pid
+    /// specifically (never `-1`) and run the same exited/stopped handling
+    /// as [`Supervisor::reap`].
+    fn reap_workload(&mut self) {
+        let Some(pid) = self.workload.as_ref().map(|w| w.pid) else {
+            return;
+        };
+        let mut status: i32 = 0;
+        // SAFETY: waitpid on our own child into a local.
+        let got = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+        if got == pid {
+            self.handle_child_status(pid, status);
+        }
+    }
+
+    /// Shared exited/stopped handling for a waitpid result on the
+    /// supervised workload.
+    fn handle_child_status(&mut self, pid: i32, status: i32) {
+        if libc::WIFSTOPPED(status) {
+            // FORCED quiesce landed: acknowledge host-ward (§6).
+            if let Some(w) = self.workload.as_mut() {
+                w.stopped = true;
+            }
+            let token = self.forced_token;
+            self.channel
+                .emit_with_doorbell(vnanos(), 0, &EventPayload::QuiesceReady { token });
+            return;
+        }
+        // Exited or killed: final pipe drain, flush partial lines, emit
+        // WorkloadExited (critical + doorbell).
+        self.drain_pipe(TOK_OUT);
+        self.drain_pipe(TOK_ERR);
+        let w = self.workload.take().expect("checked above");
+        // The dead workload's control socket must not linger across a
+        // future restart of the (single, v1) unit slot.
+        self.workload_control = None;
+        let mut out_lines: Vec<Vec<u8>> = Vec::new();
+        let mut err_lines: Vec<Vec<u8>> = Vec::new();
+        let (mut ob, mut eb) = (w.outbuf, w.errbuf);
+        ob.finish(|l| out_lines.push(l.to_vec()));
+        eb.finish(|l| err_lines.push(l.to_vec()));
+        self.emit_lines(log_stream::STDOUT, STDOUT_LEVEL, &out_lines);
+        self.emit_lines(log_stream::STDERR, STDERR_LEVEL, &err_lines);
+        // SAFETY: deregister + close the pipe fds.
+        unsafe {
+            libc::epoll_ctl(
+                self.epfd,
+                libc::EPOLL_CTL_DEL,
+                w.stdout,
+                std::ptr::null_mut(),
+            );
+            libc::epoll_ctl(
+                self.epfd,
+                libc::EPOLL_CTL_DEL,
+                w.stderr,
+                std::ptr::null_mut(),
+            );
+            libc::close(w.stdout);
+            libc::close(w.stderr);
+        }
+        let (exit_code, term_signal) = if libc::WIFEXITED(status) {
+            (libc::WEXITSTATUS(status), 0)
+        } else {
+            (-1, libc::WTERMSIG(status))
+        };
+        self.channel.emit_with_doorbell(
+            vnanos(),
+            0,
+            &EventPayload::WorkloadExited {
+                guest_pid: pid as u32,
+                exit_code,
+                term_signal,
+            },
+        );
+    }
+
+    /// Drain a readable workload pipe and apply the HUP/ERR-deregister
+    /// discipline (shared by the run loop and `wait_boot_io`): a writer
+    /// that closed without exiting must be deregistered so a permanently-
+    /// HUP fd cannot busy-spin the wait. The fd stays open for the final
+    /// drain at reap.
+    fn service_pipe_event(&mut self, tok: u64, ev_events: u32) {
+        self.drain_pipe(tok);
+        if ev_events & (libc::EPOLLHUP as u32 | libc::EPOLLERR as u32) != 0 {
+            if let Some(w) = &self.workload {
+                let fd = if tok == TOK_OUT { w.stdout } else { w.stderr };
+                // SAFETY: removing our own registration.
+                unsafe {
+                    libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
+                }
+            }
+        }
+    }
+
+    /// Register the workload's fd-3 control socket for the boot leg (see
+    /// [`TOK_CONTROL`] for why the registration is boot-only).
+    pub(crate) fn register_control_fd(&mut self, fd: RawFd) {
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: TOK_CONTROL,
+        };
+        // SAFETY: registering a live fd with our epoll instance.
+        unsafe {
+            libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_ADD, fd, &mut ev);
+        }
+    }
+
+    /// Remove the boot-leg control-fd registration. Required explicitly:
+    /// the socket outlives the boot leg by design (symptom-2 retention), so
+    /// the close-time auto-deregister never applies — mirror the pipe-fd
+    /// discipline in [`Supervisor::handle_child_status`].
+    pub(crate) fn deregister_control_fd(&mut self, fd: RawFd) {
+        // SAFETY: removing our own registration.
+        unsafe {
+            libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
+        }
+    }
+
+    /// Boot-leg blocking wait: park in the supervise epoll until any wake
+    /// source fires, then service it — a mini supervise pass. Used by the
+    /// pre-Ready waits (control-reply recv, expected-regions gate) so the
+    /// boot handshake makes progress in a guest with NO timer interrupts:
+    /// the workload's own send/connect syscalls are the wakeup (request
+    /// phase3-boot-scheduling-deadlock). The timeout only ever fires in a
+    /// tickful environment — see [`BOOT_WAIT_TIMEOUT_MS`].
+    ///
+    /// Wake handling:
+    /// - signalfd → drain AND reap (targeted): a workload dying mid-gate
+    ///   wakes the wait, the reap emits `WorkloadExited`, and the caller's
+    ///   next control recv sees EOF → an immediate named boot fault
+    ///   instead of a wakeup-cap timeout. (Merely draining would leave an
+    ///   unreported zombie after Ready.) NOTE: inside the multi-threaded
+    ///   cargo test process this wake is unreliable — another thread can
+    ///   deliver-and-discard the signal — so tests rely on the control-fd
+    ///   EOF / pipe-HUP wakes instead; in the single-threaded PID 1 guest
+    ///   both paths work.
+    /// - workload pipes → drain + HUP discipline. Load-bearing, not
+    ///   housekeeping: the pipes are registered during boot, epoll is
+    ///   level-triggered, and workloads print during the boot leg — an
+    ///   undrained readable pipe would turn every wait into an instant
+    ///   return, burn the wakeup cap into a false boot fault, and in the
+    ///   no-tick guest reinstate the spin this exists to kill. Side
+    ///   effect: workload LogLines can now be emitted before Ready.
+    /// - timerfd → drain the counter (level-triggered; an undrained tick
+    ///   would quietly turn the block back into a spin in tickful envs).
+    /// - control fd / region IPC → no payload handling here: region IPC is
+    ///   serviced unconditionally below (covers-races posture, same as the
+    ///   run loop), and control-fd readiness is discovered by the caller's
+    ///   next MSG_DONTWAIT recv.
+    pub(crate) fn wait_boot_io(&mut self) -> io::Result<()> {
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
+        let n = loop {
+            // SAFETY: epoll_wait into a local array.
+            let n = unsafe {
+                libc::epoll_wait(
+                    self.epfd,
+                    events.as_mut_ptr(),
+                    events.len() as i32,
+                    BOOT_WAIT_TIMEOUT_MS,
+                )
+            };
+            if n >= 0 {
+                break n;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        };
+        for ev in events.iter().take(n as usize) {
+            match ev.u64 {
+                TOK_SIG => {
+                    let mut info = [0u8; 128]; // >= sizeof(signalfd_siginfo)
+                                               // SAFETY: drain the signalfd.
+                    while unsafe { libc::read(self.sigfd, info.as_mut_ptr().cast(), info.len()) }
+                        > 0
+                    {}
+                    self.reap_workload();
+                }
+                TOK_OUT | TOK_ERR => self.service_pipe_event(ev.u64, ev.events),
+                TOK_TIMER => {
+                    let mut ticks = [0u8; 8];
+                    // SAFETY: drain the timerfd counter.
+                    unsafe { libc::read(self.timerfd, ticks.as_mut_ptr().cast(), 8) };
+                }
+                // TOK_REGION_LISTENER | TOK_REGION_CONN | TOK_CONTROL:
+                // serviced below / by the caller.
+                _ => {}
+            }
+        }
+        self.service_region_ipc()?;
+        Ok(())
     }
 
     /// Run until a shutdown completes (the caller then powers off). Each
@@ -532,30 +694,7 @@ impl Supervisor {
                         // SAFETY: drain the timerfd counter.
                         unsafe { libc::read(self.timerfd, ticks.as_mut_ptr().cast(), 8) };
                     }
-                    TOK_OUT | TOK_ERR => {
-                        self.drain_pipe(ev.u64);
-                        if ev.events & (libc::EPOLLHUP as u32 | libc::EPOLLERR as u32) != 0 {
-                            // Writer closed without exiting: deregister so a
-                            // permanently-HUP fd cannot busy-spin the loop.
-                            // The fd stays open for the final drain at reap.
-                            if let Some(w) = &self.workload {
-                                let fd = if ev.u64 == TOK_OUT {
-                                    w.stdout
-                                } else {
-                                    w.stderr
-                                };
-                                // SAFETY: removing our own registration.
-                                unsafe {
-                                    libc::epoll_ctl(
-                                        self.epfd,
-                                        libc::EPOLL_CTL_DEL,
-                                        fd,
-                                        std::ptr::null_mut(),
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    TOK_OUT | TOK_ERR => self.service_pipe_event(ev.u64, ev.events),
                     TOK_REGION_LISTENER | TOK_REGION_CONN => {
                         self.service_region_ipc()?;
                     }

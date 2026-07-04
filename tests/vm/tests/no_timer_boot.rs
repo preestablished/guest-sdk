@@ -197,5 +197,8 @@ fn no_timer_boot_reaches_and_holds_ready() {
         panic!("workload died after Ready: {death}");
     }
     let faults = p0_agent_faults(&vm);
-    assert!(faults.is_empty(), "no P0 agent fault after Ready: {faults:?}");
+    assert!(
+        faults.is_empty(),
+        "no P0 agent fault after Ready: {faults:?}"
+    );
 }

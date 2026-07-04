@@ -8,29 +8,29 @@
 #![allow(unsafe_code)]
 
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::boot::UnitControl;
 
 const CONTROL_FD: i32 = 3;
 const MAX_DATAGRAM: usize = 4096;
 
-/// Reply-wait spin cap. Each iteration is a non-blocking recv + the idle
-/// callback (region-IPC servicing) + sched_yield — several syscalls,
-/// roughly 3–6 K guest instructions — so the cap must be sized against the
-/// host's run budget, not wall clock: the first real-worker boot wedged in
-/// this loop and burned silently to a 10 B-instruction HARD_CAP because the
-/// old 200 M-iteration cap costs ~600 B instructions (request
-/// phase3-ready-not-emitted-real-worker). 500 K iterations ≈ 1.5–3 B guest
-/// instructions: a wedge boot-faults loudly inside the worker's budget,
-/// while legitimate legs keep ≥1000× margin (the slowest — LoadGame doing
-/// real device I/O on a 32 KiB game — is milliseconds ≈ thousands of
-/// polls). Hitting the cap means the workload is dead or wedged:
-/// boot-fault instead of hanging the boot forever.
+/// Reply-wait *wakeup* cap. Each iteration is a non-blocking recv + the
+/// idle callback, which now BLOCKS in the supervisor's epoll
+/// (`Supervisor::wait_boot_io`) instead of sched_yield-spinning — the
+/// no-tick cooperative-scheduling deadlock fix (request
+/// phase3-boot-scheduling-deadlock). So the cap counts wakeups, not a
+/// guest-instruction proxy: in a tickful environment each wakeup is at
+/// most one `BOOT_WAIT_TIMEOUT_MS` block (non-test: 600 × 100 ms ≈ 60 s of
+/// wall time before a loud boot fault naming this leg). In the no-tick
+/// guest the epoll timeout can never fire (timer expiry is itself
+/// interrupt-driven), so only genuine wakeups count and a total dead-block
+/// parks the vCPU in HLT — bounded by the HOST's wall-clock deadline by
+/// design, not by this cap. Legitimate legs need a handful of wakeups.
 #[cfg(test)]
-const CONTROL_RECV_POLL_LIMIT: usize = 100_000;
+const CONTROL_RECV_WAKE_LIMIT: usize = 200;
 #[cfg(not(test))]
-const CONTROL_RECV_POLL_LIMIT: usize = 500_000;
+const CONTROL_RECV_WAKE_LIMIT: usize = 600;
 
 #[derive(Debug)]
 pub(crate) struct ControlSocket {
@@ -82,10 +82,15 @@ pub(crate) fn child_fd_number() -> i32 {
 
 /// Progress callbacks out of the boot-time control leg.
 ///
-/// `Idle` fires on every empty poll of the control socket — the workload
-/// registers regions over agent.sock *between* control replies (e.g. after
-/// GameLoaded, before Ready), so the caller services region IPC there; a
-/// blocking recv would deadlock the boot (ARCHITECTURE.md §5).
+/// `Idle` fires on every empty poll of the control socket. The caller's
+/// callback blocks in the supervisor's epoll (`wait_boot_io`) until any
+/// wake source is readable and services it — the workload registers
+/// regions over agent.sock *between* control replies (e.g. after
+/// GameLoaded, before Ready), and the region-IPC fds are in that same
+/// epoll set, so a workload blocked on a register reply still wakes and
+/// unblocks this wait (ARCHITECTURE.md §5). A recv blocking on the control
+/// fd ALONE would deadlock the boot; a recv blocking on the whole wake set
+/// is the no-tick scheduling fix (request phase3-boot-scheduling-deadlock).
 ///
 /// `Milestone` fires once per completed leg so the caller can drop a
 /// breadcrumb into the event stream: a wedged boot then names its last
@@ -187,6 +192,12 @@ pub(crate) fn drive_refwork_start(
 }
 
 impl ControlSocket {
+    /// The raw fd, for the supervisor's boot-leg epoll registration only
+    /// (the fd itself stays blocking-agnostic; recv keeps MSG_DONTWAIT).
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
     fn send(&self, bytes: &[u8]) -> io::Result<()> {
         let rc = unsafe {
             libc::send(
@@ -208,12 +219,14 @@ impl ControlSocket {
         Ok(())
     }
 
-    /// Bounded non-blocking reply wait: poll with `MSG_DONTWAIT`, running
-    /// `idle` (region-IPC servicing) + `sched_yield` between polls so a
-    /// workload blocked on a register reply cannot deadlock this wait.
+    /// Bounded reply wait: poll with `MSG_DONTWAIT`; on empty polls the
+    /// `idle` callback BLOCKS in the supervisor's epoll until any wake
+    /// source (control fd, region IPC, pipes, SIGCHLD) is readable, then
+    /// services it. The workload's own send(2) on fd 3 is the wakeup — no
+    /// timer tick required (request phase3-boot-scheduling-deadlock).
     fn recv(&self, idle: &mut impl FnMut() -> Result<(), String>) -> io::Result<ControlReply> {
         let mut buf = [0u8; MAX_DATAGRAM];
-        for _ in 0..CONTROL_RECV_POLL_LIMIT {
+        for _ in 0..CONTROL_RECV_WAKE_LIMIT {
             // SAFETY: non-blocking recv into a local buffer.
             let n = unsafe {
                 libc::recv(
@@ -229,10 +242,6 @@ impl ControlSocket {
                     return Err(err);
                 }
                 idle().map_err(io::Error::other)?;
-                // SAFETY: plain sched_yield between polls.
-                unsafe {
-                    libc::sched_yield();
-                }
                 continue;
             }
             if n == 0 {
@@ -247,7 +256,7 @@ impl ControlSocket {
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
-                "control reply poll limit ({CONTROL_RECV_POLL_LIMIT} polls) \
+                "control reply wakeup limit ({CONTROL_RECV_WAKE_LIMIT} wakeups) \
                  exceeded (workload dead or wedged)"
             ),
         ))

@@ -16,19 +16,22 @@ use crate::control;
 use crate::supervise::{vnanos, Supervisor};
 use crate::{agent_version, pio, translate};
 
-/// Expected-regions gate spin cap. Each iteration services region IPC and
-/// copies + decodes the manifest — tens of syscalls and a multi-KB copy,
-/// order 10–20 K guest instructions — so like `CONTROL_RECV_POLL_LIMIT`
-/// this is sized against the host's run budget: 100 K iterations ≈ 1–2 B
-/// guest instructions, so a wedged gate boot-faults inside a worker's hard
-/// cap instead of burning silently to it (request
-/// phase3-ready-not-emitted-real-worker). Legitimate boots pass the gate in
-/// a handful of polls — the regions register during the control leg that
-/// precedes this wait.
+/// Expected-regions gate *wakeup* cap. Each iteration services region IPC,
+/// checks the manifest, and then BLOCKS in the supervisor's epoll
+/// (`Supervisor::wait_boot_io`) — the no-tick cooperative-scheduling
+/// deadlock fix (request phase3-boot-scheduling-deadlock). Like
+/// `CONTROL_RECV_WAKE_LIMIT` this counts wakeups, each at most one
+/// `BOOT_WAIT_TIMEOUT_MS` block in a tickful environment (non-test:
+/// 600 × 100 ms ≈ 60 s before a loud gate fault); in the no-tick guest
+/// the timeout never fires and a dead-block is bounded by the HOST's
+/// wall-clock deadline by design. Legitimate boots pass the gate on the
+/// FIRST check — all regions register during the control leg that precedes
+/// this wait. The test value keeps the gate test's worst case (~50 × 5 ms
+/// blocks, timerfd-punctuated) well under a second.
 #[cfg(test)]
-const READY_REGION_POLL_LIMIT: usize = 128;
+const READY_REGION_WAKE_LIMIT: usize = 50;
 #[cfg(not(test))]
-const READY_REGION_POLL_LIMIT: usize = 100_000;
+const READY_REGION_WAKE_LIMIT: usize = 600;
 
 /// Boot manifest path inside the initramfs (API.md §7).
 pub const BOOT_TOML_PATH: &str = "/etc/detguest/boot.toml";
@@ -191,15 +194,22 @@ fn drive_and_retain_control(
     unit_control: &crate::boot::UnitControl,
     game_path: &str,
 ) -> Result<(), String> {
-    control::drive_refwork_start(&sock, unit_control, game_path, |p| match p {
-        control::ControlProgress::Idle => sup
-            .service_region_ipc()
-            .map_err(|e| format!("region IPC service: {e}")),
+    // Boot-leg-only epoll registration (see TOK_CONTROL in supervise.rs);
+    // the Idle callback blocks in the supervise epoll until any wake source
+    // fires (wait_boot_io services region IPC internally).
+    sup.register_control_fd(sock.raw_fd());
+    let result = control::drive_refwork_start(&sock, unit_control, game_path, |p| match p {
+        control::ControlProgress::Idle => sup.wait_boot_io().map_err(|e| format!("boot wait: {e}")),
         control::ControlProgress::Milestone(m) => {
             breadcrumb(&mut sup.channel, m);
             Ok(())
         }
-    })?;
+    });
+    // Deregister on BOTH paths before propagating the error — the socket
+    // outlives the boot leg (symptom-2 retention), so there is no
+    // close-time auto-deregister.
+    sup.deregister_control_fd(sock.raw_fd());
+    result?;
     sup.workload_control = Some(sock);
     Ok(())
 }
@@ -386,22 +396,28 @@ fn wait_for_expected_regions(
         });
     }
     let mut last_err = String::new();
-    for _ in 0..READY_REGION_POLL_LIMIT {
+    for _ in 0..READY_REGION_WAKE_LIMIT {
         // Registrations arrive over agent.sock; the supervise epoll loop is
         // not running yet, so this wait IS the IPC service loop.
         sup.service_region_ipc()
             .map_err(|e| format!("region IPC service: {e}"))?;
+        // Check BEFORE blocking — load-bearing ordering, not style: the
+        // gate's condition is manifest state, not fd readiness, and in the
+        // normal boot it is already true on entry (all regions register
+        // during the control leg that precedes this wait). A wait-then-
+        // check loop would block first on an epoll set with nothing
+        // pending, and in the no-tick guest that first block never times
+        // out. No lost-wakeup race the other way: the epoll is level-
+        // triggered, so a registration racing this check leaves its conn
+        // fd readable and the wait below returns immediately.
         match expected_regions_ready(&sup.channel, expected_regions) {
             Ok(snapshot) => return Ok(snapshot),
             Err(err) => last_err = err,
         }
-        // Give the just-forked workload a deterministic chance to publish.
-        unsafe {
-            libc::sched_yield();
-        }
+        sup.wait_boot_io().map_err(|e| format!("boot wait: {e}"))?;
     }
     Err(format!(
-        "expected-regions gate exhausted after {READY_REGION_POLL_LIMIT} polls: {last_err}"
+        "expected-regions gate exhausted after {READY_REGION_WAKE_LIMIT} wakeups: {last_err}"
     ))
 }
 
@@ -596,6 +612,7 @@ mod tests {
             region_count: u32,
             manifest_generation: u64,
         },
+        WorkloadStarted,
         Other(u32),
     }
 
@@ -642,6 +659,7 @@ mod tests {
                     region_count,
                     manifest_generation,
                 },
+                EventPayload::WorkloadStarted { .. } => TestPayload::WorkloadStarted,
                 _ => TestPayload::Other(hdr.kind as u32),
             });
             at += hdr.len as usize;
@@ -672,7 +690,16 @@ mod tests {
         let err = autostart_and_ready(&mut sup).unwrap_err();
 
         assert!(err.contains("expected_regions pending before Ready"));
-        assert!(sup.workload.is_some(), "autostart must happen before gate");
+        // Intent assertion: autostart happened before the gate. NOT
+        // `workload.is_some()` — wait_boot_io reaps on the sigfd wake, so
+        // the exited /bin/true may or may not still be held at fault time
+        // (timing-dependent under the multi-threaded test harness).
+        assert!(
+            ring_a_payloads(&sup.channel)
+                .iter()
+                .any(|p| matches!(p, TestPayload::WorkloadStarted)),
+            "autostart must happen before gate"
+        );
         assert!(!ring_a_has_ready(&sup.channel), "must not emit Ready");
     }
 
@@ -753,9 +780,7 @@ mod tests {
     /// A scripted fd-3 peer speaking the harness's half of the boot leg
     /// (golden bytes from `control.rs` tests), returning its fd afterward
     /// so the test can probe whether the agent kept its own end open.
-    fn fake_harness(
-        child: std::os::fd::OwnedFd,
-    ) -> std::thread::JoinHandle<std::os::fd::OwnedFd> {
+    fn fake_harness(child: std::os::fd::OwnedFd) -> std::thread::JoinHandle<std::os::fd::OwnedFd> {
         std::thread::spawn(move || {
             assert_eq!(recv_dg(&child), [0x00, 0x01], "Hello");
             send_dg(&child, &[0x05, 0x01, 0x03, b'e', b'm', b'u', 0x01, b'1']);
@@ -781,9 +806,11 @@ mod tests {
     fn control_leg_retains_workload_socket_and_names_its_legs() {
         use std::os::fd::AsRawFd;
 
-        let mut sup =
-            Supervisor::new(crate::channel::test_channel(test_doorbell), manifest(None, vec![]))
-                .unwrap();
+        let mut sup = Supervisor::new(
+            crate::channel::test_channel(test_doorbell),
+            manifest(None, vec![]),
+        )
+        .unwrap();
         let (sock, child) = control::socketpair().unwrap();
         let harness = fake_harness(child);
         let unit_control = UnitControl {
@@ -854,6 +881,137 @@ mod tests {
         assert_eq!(n, 0, "supervisor teardown closes the retained socket");
     }
 
+    /// The boot leg must complete by BLOCKING between replies (each idle
+    /// pass parks in the supervise epoll), not by spinning through a poll
+    /// cap: a peer that delays every reply past many test-mode timeout
+    /// windows still completes the leg with the breadcrumbs in order,
+    /// well inside the wakeup cap (request phase3-boot-scheduling-deadlock).
+    #[test]
+    fn control_leg_completes_while_blocking_on_a_slow_peer() {
+        let mut sup = Supervisor::new(
+            crate::channel::test_channel(test_doorbell),
+            manifest(None, vec![]),
+        )
+        .unwrap();
+        let (sock, child) = control::socketpair().unwrap();
+        let harness = std::thread::spawn(move || {
+            let delay = std::time::Duration::from_millis(50);
+            assert_eq!(recv_dg(&child), [0x00, 0x01], "Hello");
+            std::thread::sleep(delay);
+            send_dg(&child, &[0x05, 0x01, 0x03, b'e', b'm', b'u', 0x01, b'1']);
+            assert_eq!(recv_dg(&child)[0], 0x01, "LoadGame");
+            std::thread::sleep(delay);
+            let mut game_loaded = vec![0x06];
+            game_loaded.extend_from_slice(&[0u8; 32]);
+            game_loaded.extend_from_slice(&[0x04, b'm', b'm', b'c', b'3', 0x00]);
+            send_dg(&child, &game_loaded);
+            std::thread::sleep(delay);
+            send_dg(&child, &[0x08, 0x00]); // Ready { frame: 0 }
+            assert_eq!(recv_dg(&child), [0x02], "Start");
+            child
+        });
+        let unit_control = UnitControl {
+            protocol: "refwork-ctl".to_string(),
+            proto_version: 1,
+            game_dev: Some("/dev/vdb".to_string()),
+            game_source: None,
+        };
+
+        let t0 = std::time::Instant::now();
+        drive_and_retain_control(&mut sup, sock, &unit_control, "/dev/vdb").unwrap();
+        let _child = harness.join().unwrap();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "delayed boot leg must finish well under the test budget, took {:?}",
+            t0.elapsed()
+        );
+
+        let breadcrumbs: Vec<Vec<u8>> = ring_a_payloads(&sup.channel)
+            .into_iter()
+            .filter_map(|p| match p {
+                TestPayload::LogLine { stream, msg }
+                    if stream == detguest_wire::events::log_stream::AGENT =>
+                {
+                    Some(msg)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            breadcrumbs,
+            vec![
+                b"boot: helloack".to_vec(),
+                b"boot: gameloaded".to_vec(),
+                b"boot: rw-ready".to_vec(),
+                b"boot: start-sent".to_vec(),
+            ]
+        );
+        assert!(sup.workload_control.is_some(), "socket retained");
+    }
+
+    /// A workload that dies while the expected-regions gate is waiting must
+    /// produce the gate-exhausted boot fault promptly (pipe-HUP wakes + the
+    /// test-mode timeout budget), never a hang. No assertion on
+    /// WorkloadExited/reap here: the sigfd wake is unreliable inside the
+    /// multi-threaded test process (see wait_boot_io); the reap contract
+    /// gets its real coverage in the VM tier, where the agent is
+    /// single-threaded PID 1.
+    #[test]
+    fn workload_death_during_gate_faults_promptly() {
+        let mut sup = Supervisor::new(
+            crate::channel::test_channel(test_doorbell),
+            manifest(
+                None,
+                vec![ExpectedRegion {
+                    name: "wram".to_string(),
+                    layout_version: 1,
+                }],
+            ),
+        )
+        .unwrap();
+        sup.start_unit(0).unwrap(); // /bin/true: exits immediately
+        let pid = sup.workload.as_ref().unwrap().pid;
+        // Wait for the child to actually exit (zombie state Z in
+        // /proc/<pid>/stat) WITHOUT waitpid-ing it — reaping is the
+        // agent's job.
+        let t0 = std::time::Instant::now();
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            // The state field follows the parenthesized comm; an empty
+            // read means the pid vanished (already reaped) — also done.
+            let exited = stat.is_empty()
+                || stat
+                    .rsplit(") ")
+                    .next()
+                    .map(|rest| rest.starts_with('Z'))
+                    .unwrap_or(false);
+            if exited {
+                break;
+            }
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "/bin/true did not exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let expected = [ExpectedRegion {
+            name: "wram".to_string(),
+            layout_version: 1,
+        }];
+        let t0 = std::time::Instant::now();
+        let err = wait_for_expected_regions(&mut sup, &expected).unwrap_err();
+        assert!(
+            err.contains("expected-regions gate exhausted"),
+            "gate must fault with the named leg: {err}"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "gate fault must be prompt, took {:?}",
+            t0.elapsed()
+        );
+    }
+
     #[test]
     fn unit_control_faults_before_ready_when_workload_does_not_reply() {
         let mut sup = Supervisor::new(
@@ -873,8 +1031,15 @@ mod tests {
         let err = autostart_and_ready(&mut sup).unwrap_err();
 
         assert!(err.contains("recv refwork HelloAck"), "{err}");
+        // Intent assertion: the control fault happens after autostart. NOT
+        // `workload.is_some()` — see expected_regions_pending test; the
+        // fast exit path here is the control-fd EOF wake (/bin/true exits,
+        // its fd-3 end closes, the next MSG_DONTWAIT recv sees EOF), and
+        // the sigfd wake may or may not have reaped by then.
         assert!(
-            sup.workload.is_some(),
+            ring_a_payloads(&sup.channel)
+                .iter()
+                .any(|p| matches!(p, TestPayload::WorkloadStarted)),
             "control fault happens after autostart"
         );
         assert!(!ring_a_has_ready(&sup.channel), "must not emit Ready");
