@@ -1,3 +1,9 @@
+> **SUPERSEDED (2026-07-04)** by `../phase3-boot-scheduling-deadlock/`.
+> This thread records the investigation journey with two wrong turns
+> (ring-drain, guest-timer) before the root cause — a cooperative-
+> scheduling deadlock under the no-interrupt worker — was pinned. Read
+> the superseding request for the authoritative diagnosis and fix.
+
 # Request: Ring-A Critical-Emit Spins When The Real Worker Doesn't Drain Mid-Run
 
 Filed 2026-07-04 by the rom-operator-bridge session. This continues the
