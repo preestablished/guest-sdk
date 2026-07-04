@@ -200,6 +200,13 @@ fn real_harness_reaches_and_holds_ready() {
 /// artifact rebuilt against the fixed agent (local uncommitted
 /// `guest-sdk.lock` bump in the reference-workload checkout) — against a
 /// pre-fix artifact this stays red no matter what the local tree holds.
+///
+/// Guard-reversion checked 2026-07-04: with the agent's epoll-blocking
+/// boot waits reverted to the sched_yield spins (old poll caps restored,
+/// image rebuilt from the reverted agent via `xtask image build
+/// --agent-bin`), this test goes red again — wedged post-registration at
+/// generation 6 with no Ready, timing out at the 120 s wall deadline —
+/// and returns green with the fix restored (guest-sdk `70851a2`).
 #[test]
 fn no_timer_real_harness_reaches_and_holds_ready() {
     ready_hold_body(false);

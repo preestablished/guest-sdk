@@ -12,9 +12,15 @@
 //! TSC calibration cannot hang) plus the worker's timerless cmdline flags,
 //! and requires the boot to reach and HOLD `Ready`.
 //!
-//! Red against the sched_yield-spinning agent, green with the
-//! epoll-blocking boot waits (Fix A) — see package 03's guard-reversion
-//! record in this header once verified.
+//! Observed 2026-07-04 (recorded for honesty about what this test can
+//! catch): this tier did NOT wedge against the pre-fix sched_yield-spinning
+//! agent — `game-load-check`'s boot dialogue happens not to hit the
+//! cooperative-scheduling starvation that the REAL refwork harness hits
+//! (tier 2, `refwork_ready_hold.rs::no_timer_real_harness_reaches_and_
+//! holds_ready`, which is the red→green arbiter and carries the
+//! guard-reversion record). This test stays as a permanent cheap guard:
+//! it exercises the full production boot shape under the worker's no-tick
+//! environment with no external artifact needed.
 //!
 //! Gated on `DETGUEST_VM_TESTS=1` like the other VM suites.
 
