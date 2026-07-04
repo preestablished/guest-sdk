@@ -16,16 +16,21 @@ const CONTROL_FD: i32 = 3;
 const MAX_DATAGRAM: usize = 4096;
 
 /// Reply-wait spin cap. Each iteration is a non-blocking recv + the idle
-/// callback (region-IPC servicing) + sched_yield — roughly a microsecond —
-/// so the prod cap represents minutes, sized against the slowest legitimate
-/// leg (a reference workload's LoadGame doing real device I/O), not against
-/// region publication. Hitting it means the workload is dead or wedged:
-/// boot-fault instead of hanging the boot forever (this is a deliberate
-/// semantic change from the old indefinitely-blocking recv).
+/// callback (region-IPC servicing) + sched_yield — several syscalls,
+/// roughly 3–6 K guest instructions — so the cap must be sized against the
+/// host's run budget, not wall clock: the first real-worker boot wedged in
+/// this loop and burned silently to a 10 B-instruction HARD_CAP because the
+/// old 200 M-iteration cap costs ~600 B instructions (request
+/// phase3-ready-not-emitted-real-worker). 500 K iterations ≈ 1.5–3 B guest
+/// instructions: a wedge boot-faults loudly inside the worker's budget,
+/// while legitimate legs keep ≥1000× margin (the slowest — LoadGame doing
+/// real device I/O on a 32 KiB game — is milliseconds ≈ thousands of
+/// polls). Hitting the cap means the workload is dead or wedged:
+/// boot-fault instead of hanging the boot forever.
 #[cfg(test)]
-const CONTROL_RECV_POLL_LIMIT: usize = 512;
+const CONTROL_RECV_POLL_LIMIT: usize = 100_000;
 #[cfg(not(test))]
-const CONTROL_RECV_POLL_LIMIT: usize = 200_000_000;
+const CONTROL_RECV_POLL_LIMIT: usize = 500_000;
 
 #[derive(Debug)]
 pub(crate) struct ControlSocket {
@@ -75,18 +80,33 @@ pub(crate) fn child_fd_number() -> i32 {
     CONTROL_FD
 }
 
+/// Progress callbacks out of the boot-time control leg.
+///
+/// `Idle` fires on every empty poll of the control socket — the workload
+/// registers regions over agent.sock *between* control replies (e.g. after
+/// GameLoaded, before Ready), so the caller services region IPC there; a
+/// blocking recv would deadlock the boot (ARCHITECTURE.md §5).
+///
+/// `Milestone` fires once per completed leg so the caller can drop a
+/// breadcrumb into the event stream: a wedged boot then names its last
+/// completed leg in the host's buffered-event dump instead of dying as a
+/// silent hard-cap (request phase3-ready-not-emitted-real-worker). One
+/// enum, one closure — the caller's supervisor state can't be mutably
+/// borrowed by two callbacks at once.
+pub(crate) enum ControlProgress {
+    Idle,
+    Milestone(&'static str),
+}
+
 /// Drive the boot-time control leg. `game_path` is the LoadGame.dev_path to
 /// send — resolved by the caller (verbatim `game_dev`, or the materialized
-/// image path under `game_source = "pv-blk"`; API.md §7.1). `idle` runs on
-/// every empty poll of the control socket — the workload registers regions
-/// over agent.sock *between* these replies (e.g. after GameLoaded, before
-/// Ready), so the caller passes a region-IPC servicing closure here; a
-/// blocking recv would deadlock the boot (ARCHITECTURE.md §5).
+/// image path under `game_source = "pv-blk"`; API.md §7.1). See
+/// [`ControlProgress`] for the `progress` contract.
 pub(crate) fn drive_refwork_start(
     sock: &ControlSocket,
     control: &UnitControl,
     game_path: &str,
-    mut idle: impl FnMut() -> Result<(), String>,
+    mut progress: impl FnMut(ControlProgress) -> Result<(), String>,
 ) -> Result<(), String> {
     if control.protocol != "refwork-ctl" {
         return Err(format!(
@@ -104,12 +124,14 @@ pub(crate) fn drive_refwork_start(
     sock.send(&encode_hello(proto_version))
         .map_err(|e| format!("send refwork Hello: {e}"))?;
     match sock
-        .recv(&mut idle)
+        .recv(&mut || progress(ControlProgress::Idle))
         .map_err(|e| format!("recv refwork HelloAck: {e}"))?
     {
         ControlReply::HelloAck {
             proto_version: reply_version,
-        } if reply_version == proto_version => {}
+        } if reply_version == proto_version => {
+            progress(ControlProgress::Milestone("boot: helloack"))?;
+        }
         ControlReply::HelloAck {
             proto_version: reply_version,
         } => {
@@ -127,7 +149,7 @@ pub(crate) fn drive_refwork_start(
         .map_err(|e| format!("send refwork LoadGame: {e}"))?;
     loop {
         match sock
-            .recv(&mut idle)
+            .recv(&mut || progress(ControlProgress::Idle))
             .map_err(|e| format!("recv refwork GameLoaded: {e}"))?
         {
             ControlReply::GameLoaded => break,
@@ -138,10 +160,11 @@ pub(crate) fn drive_refwork_start(
             other => return Err(format!("expected refwork GameLoaded, got {other:?}")),
         }
     }
+    progress(ControlProgress::Milestone("boot: gameloaded"))?;
 
     loop {
         match sock
-            .recv(&mut idle)
+            .recv(&mut || progress(ControlProgress::Idle))
             .map_err(|e| format!("recv refwork Ready: {e}"))?
         {
             ControlReply::Ready { frame: 0 } => break,
@@ -155,9 +178,11 @@ pub(crate) fn drive_refwork_start(
             other => return Err(format!("expected refwork Ready, got {other:?}")),
         }
     }
+    progress(ControlProgress::Milestone("boot: rw-ready"))?;
 
     sock.send(&[0x02])
         .map_err(|e| format!("send refwork Start: {e}"))?;
+    progress(ControlProgress::Milestone("boot: start-sent"))?;
     Ok(())
 }
 
@@ -221,7 +246,10 @@ impl ControlSocket {
         }
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            "control reply poll limit exceeded (workload dead or wedged)",
+            format!(
+                "control reply poll limit ({CONTROL_RECV_POLL_LIMIT} polls) \
+                 exceeded (workload dead or wedged)"
+            ),
         ))
     }
 }

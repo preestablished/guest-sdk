@@ -16,10 +16,19 @@ use crate::control;
 use crate::supervise::{vnanos, Supervisor};
 use crate::{agent_version, pio, translate};
 
+/// Expected-regions gate spin cap. Each iteration services region IPC and
+/// copies + decodes the manifest — tens of syscalls and a multi-KB copy,
+/// order 10–20 K guest instructions — so like `CONTROL_RECV_POLL_LIMIT`
+/// this is sized against the host's run budget: 100 K iterations ≈ 1–2 B
+/// guest instructions, so a wedged gate boot-faults inside a worker's hard
+/// cap instead of burning silently to it (request
+/// phase3-ready-not-emitted-real-worker). Legitimate boots pass the gate in
+/// a handful of polls — the regions register during the control leg that
+/// precedes this wait.
 #[cfg(test)]
 const READY_REGION_POLL_LIMIT: usize = 128;
 #[cfg(not(test))]
-const READY_REGION_POLL_LIMIT: usize = 50_000_000;
+const READY_REGION_POLL_LIMIT: usize = 100_000;
 
 /// Boot manifest path inside the initramfs (API.md §7).
 pub const BOOT_TOML_PATH: &str = "/etc/detguest/boot.toml";
@@ -153,6 +162,48 @@ pub fn bring_up_channel() -> io::Result<AgentChannel> {
     Ok(channel)
 }
 
+/// Boot-leg breadcrumb: a tiny agent LogLine so a wedged boot names its
+/// last completed leg in the host's buffered-event dump (request
+/// phase3-ready-not-emitted-real-worker — the first real boot wedged
+/// somewhere after region registration and died as a silent hard-cap).
+/// Droppable emit: a full ring must not turn diagnostics into a new wedge.
+fn breadcrumb(channel: &mut AgentChannel, msg: &str) {
+    channel.emit(
+        vnanos(),
+        0,
+        &EventPayload::LogLine {
+            stream: detguest_wire::events::log_stream::AGENT,
+            level: 1,
+            msg: msg.as_bytes(),
+        },
+    );
+}
+
+/// Drive the boot-time control leg over `sock` and, on success, retain the
+/// agent's end for the workload's lifetime. Dropping it closes the
+/// workload's inherited fd 3, which its frame loop polls at every frame
+/// boundary and treats EOF on as agent death — an early close is a
+/// protocol violation (it killed the first real boot right after Ready:
+/// request phase3-ready-not-emitted-real-worker, symptom 2).
+fn drive_and_retain_control(
+    sup: &mut Supervisor,
+    sock: control::ControlSocket,
+    unit_control: &crate::boot::UnitControl,
+    game_path: &str,
+) -> Result<(), String> {
+    control::drive_refwork_start(&sock, unit_control, game_path, |p| match p {
+        control::ControlProgress::Idle => sup
+            .service_region_ipc()
+            .map_err(|e| format!("region IPC service: {e}")),
+        control::ControlProgress::Milestone(m) => {
+            breadcrumb(&mut sup.channel, m);
+            Ok(())
+        }
+    })?;
+    sup.workload_control = Some(sock);
+    Ok(())
+}
+
 /// Step 7: autostart + the READY gate (ARCHITECTURE.md §4.1).
 ///
 /// With no autostart unit: `Ready` fires immediately after Hello with
@@ -196,18 +247,13 @@ pub fn autostart_and_ready(sup: &mut Supervisor) -> Result<(), String> {
         sup.start_unit_with_control(unit, child_fd.as_raw_fd())
             .map_err(|e| format!("autostart unit {unit}: {e}"))?;
         drop(child_fd);
-        // The workload registers regions over agent.sock between control
-        // replies (e.g. GameLoaded → Ready): service region IPC while
-        // waiting or the boot deadlocks (ARCHITECTURE.md §5).
-        control::drive_refwork_start(&sock, control, game_path, || {
-            sup.service_region_ipc()
-                .map_err(|e| format!("region IPC service: {e}"))
-        })?;
+        drive_and_retain_control(sup, sock, control, game_path)?;
         // The harness holds its own copy by GameLoaded; drop the RAM-backed
         // file so the game exists once at steady state.
         if control.game_source.is_some() {
             std::fs::remove_file(crate::pvblk::GAME_IMG_PATH)
                 .map_err(|e| format!("unlink {}: {e}", crate::pvblk::GAME_IMG_PATH))?;
+            breadcrumb(&mut sup.channel, "boot: game-unlinked");
         }
     } else {
         sup.start_unit(unit)
@@ -215,7 +261,9 @@ pub fn autostart_and_ready(sup: &mut Supervisor) -> Result<(), String> {
     }
     let expected_regions = sup.manifest.expected_regions.clone();
     let snapshot = wait_for_expected_regions(sup, &expected_regions)?;
+    breadcrumb(&mut sup.channel, "boot: regions-gated");
     emit_expected_region_evidence(sup, &expected_regions, snapshot)?;
+    breadcrumb(&mut sup.channel, "boot: evidence-done");
     emit_ready(sup, unit, snapshot);
     Ok(())
 }
@@ -352,7 +400,9 @@ fn wait_for_expected_regions(
             libc::sched_yield();
         }
     }
-    Err(last_err)
+    Err(format!(
+        "expected-regions gate exhausted after {READY_REGION_POLL_LIMIT} polls: {last_err}"
+    ))
 }
 
 fn emit_expected_region_evidence(
@@ -527,6 +577,10 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     enum TestPayload {
+        LogLine {
+            stream: u8,
+            msg: Vec<u8>,
+        },
         NameIntern {
             name_id: u32,
             name: Vec<u8>,
@@ -565,6 +619,10 @@ mod tests {
         while at < bytes.len() {
             let (hdr, payload) = detguest_wire::events::decode_event(&bytes[at..]).unwrap();
             out.push(match payload {
+                EventPayload::LogLine { stream, msg, .. } => TestPayload::LogLine {
+                    stream,
+                    msg: msg.to_vec(),
+                },
                 EventPayload::NameIntern { name_id, name } => TestPayload::NameIntern {
                     name_id,
                     name: name.to_vec(),
@@ -667,6 +725,133 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn send_dg(fd: &std::os::fd::OwnedFd, bytes: &[u8]) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `bytes` is readable for its full length and `fd` is live.
+        let n = unsafe {
+            libc::send(
+                fd.as_raw_fd(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        assert_eq!(n, bytes.len() as isize, "{}", io::Error::last_os_error());
+    }
+
+    fn recv_dg(fd: &std::os::fd::OwnedFd) -> Vec<u8> {
+        use std::os::fd::AsRawFd;
+        let mut buf = [0u8; 4096];
+        // SAFETY: blocking recv into a local buffer; `fd` is live.
+        let n = unsafe { libc::recv(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        assert!(n > 0, "recv: {}", io::Error::last_os_error());
+        buf[..n as usize].to_vec()
+    }
+
+    /// A scripted fd-3 peer speaking the harness's half of the boot leg
+    /// (golden bytes from `control.rs` tests), returning its fd afterward
+    /// so the test can probe whether the agent kept its own end open.
+    fn fake_harness(
+        child: std::os::fd::OwnedFd,
+    ) -> std::thread::JoinHandle<std::os::fd::OwnedFd> {
+        std::thread::spawn(move || {
+            assert_eq!(recv_dg(&child), [0x00, 0x01], "Hello");
+            send_dg(&child, &[0x05, 0x01, 0x03, b'e', b'm', b'u', 0x01, b'1']);
+            assert_eq!(recv_dg(&child)[0], 0x01, "LoadGame");
+            let mut game_loaded = vec![0x06];
+            game_loaded.extend_from_slice(&[0u8; 32]);
+            game_loaded.extend_from_slice(&[0x04, b'm', b'm', b'c', b'3', 0x00]);
+            send_dg(&child, &game_loaded);
+            send_dg(&child, &[0x08, 0x00]); // Ready { frame: 0 }
+            assert_eq!(recv_dg(&child), [0x02], "Start");
+            child
+        })
+    }
+
+    /// Symptom-2 guard (request phase3-ready-not-emitted-real-worker): the
+    /// agent must hold its end of the fd-3 socketpair for the workload's
+    /// lifetime — the workload's frame loop treats EOF as agent death, and
+    /// dropping the socket at the end of the boot leg killed the first real
+    /// boot immediately after Ready. (Shown to fail when
+    /// `drive_and_retain_control` is reverted to drop the socket instead of
+    /// storing it — guard-reversion checked 2026-07-04.)
+    #[test]
+    fn control_leg_retains_workload_socket_and_names_its_legs() {
+        use std::os::fd::AsRawFd;
+
+        let mut sup =
+            Supervisor::new(crate::channel::test_channel(test_doorbell), manifest(None, vec![]))
+                .unwrap();
+        let (sock, child) = control::socketpair().unwrap();
+        let harness = fake_harness(child);
+        let unit_control = UnitControl {
+            protocol: "refwork-ctl".to_string(),
+            proto_version: 1,
+            game_dev: Some("/dev/vdb".to_string()),
+            game_source: None,
+        };
+
+        drive_and_retain_control(&mut sup, sock, &unit_control, "/dev/vdb").unwrap();
+        let child = harness.join().unwrap();
+
+        assert!(
+            sup.workload_control.is_some(),
+            "boot-leg socket must be retained for the workload's lifetime"
+        );
+        // The workload-facing end must still be open with nothing queued:
+        // EAGAIN, not the EOF (n == 0) that a dropped agent end produces.
+        let mut buf = [0u8; 16];
+        // SAFETY: non-blocking recv into a local buffer; `child` is live.
+        let n = unsafe {
+            libc::recv(
+                child.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        let err = io::Error::last_os_error();
+        assert_eq!(n, -1, "expected no data on an open socket, got n={n}");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+
+        // The boot leg names each completed leg (wedge diagnosis
+        // breadcrumbs — see the plan's step 01 decision table).
+        let breadcrumbs: Vec<Vec<u8>> = ring_a_payloads(&sup.channel)
+            .into_iter()
+            .filter_map(|p| match p {
+                TestPayload::LogLine { stream, msg }
+                    if stream == detguest_wire::events::log_stream::AGENT =>
+                {
+                    Some(msg)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            breadcrumbs,
+            vec![
+                b"boot: helloack".to_vec(),
+                b"boot: gameloaded".to_vec(),
+                b"boot: rw-ready".to_vec(),
+                b"boot: start-sent".to_vec(),
+            ]
+        );
+
+        // Reap/teardown is the sanctioned close: only then may the
+        // workload-facing end see EOF.
+        drop(sup);
+        // SAFETY: non-blocking recv into a local buffer; `child` is live.
+        let n = unsafe {
+            libc::recv(
+                child.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        assert_eq!(n, 0, "supervisor teardown closes the retained socket");
     }
 
     #[test]

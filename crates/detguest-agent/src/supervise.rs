@@ -219,6 +219,14 @@ pub struct Supervisor {
     /// Region-registration IPC server + ledger (bound by `runtime::run`;
     /// `None` only in tests that don't exercise regions).
     pub(crate) region_ipc: Option<crate::region_ipc::RegionIpc>,
+    /// The agent's end of the workload's fd-3 control socketpair, held for
+    /// the workload's lifetime. The workload's frame loop polls its end at
+    /// every frame boundary and treats EOF as agent death, so dropping this
+    /// while the workload runs is a protocol violation (it killed the first
+    /// real boot right after Ready). The agent sends nothing on it
+    /// post-Start today; host-driven HashRequest/Shutdown relays are future
+    /// work.
+    pub(crate) workload_control: Option<crate::control::ControlSocket>,
     /// Outstanding FORCED-quiesce token (v1: at most one).
     forced_token: u64,
     epfd: RawFd,
@@ -285,6 +293,7 @@ impl Supervisor {
                 log_mask: 0x1F,
                 shutdown: None,
                 region_ipc: None,
+                workload_control: None,
                 forced_token: 0,
                 epfd,
                 sigfd,
@@ -453,6 +462,9 @@ impl Supervisor {
             self.drain_pipe(TOK_OUT);
             self.drain_pipe(TOK_ERR);
             let w = self.workload.take().expect("checked above");
+            // The dead workload's control socket must not linger across a
+            // future restart of the (single, v1) unit slot.
+            self.workload_control = None;
             let mut out_lines: Vec<Vec<u8>> = Vec::new();
             let mut err_lines: Vec<Vec<u8>> = Vec::new();
             let (mut ob, mut eb) = (w.outbuf, w.errbuf);
@@ -594,6 +606,7 @@ impl Supervisor {
 
     /// Immediate shutdown: SIGKILL + synchronous reap + WorkloadExited.
     pub fn immediate_shutdown(&mut self) {
+        self.workload_control = None;
         if let Some(w) = self.workload.take() {
             // SAFETY: SIGKILL + blocking waitpid on our child.
             unsafe {
