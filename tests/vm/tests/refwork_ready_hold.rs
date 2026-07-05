@@ -149,16 +149,11 @@ fn ready_hold_body(timer_interrupts: bool) {
         panic!("workload died after Ready ({stop:?}): {death}");
     }
     let f1 = meta_frame(&vm);
-    if timer_interrupts {
-        assert!(
-            f1 > f0 || f1 > 0,
-            "frame counter must advance past the first boundary (before={f0}, after={f1})"
-        );
-    } else if f1 > f0 || f1 > 0 {
-        // Bonus observation for the resolution file: frames advance even
-        // without a tick.
-        eprintln!("no-timer arm: frames advanced anyway (before={f0}, after={f1})");
-    }
+    assert!(
+        f1 > f0,
+        "frame counter must advance after Ready (timer_interrupts={timer_interrupts}, \
+         before={f0}, after={f1})"
+    );
 
     // Phase 3: the boot-leg breadcrumbs arrive in order (the step-01
     // wedge-diagnosis contract; agent LogLine stream 3, level 1).
