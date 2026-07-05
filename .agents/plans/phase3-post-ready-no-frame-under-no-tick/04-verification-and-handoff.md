@@ -21,6 +21,10 @@ DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest --test no_timer_boot -- --noca
 DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest --test <new-no-timer-post-ready-test> -- --nocapture
 ```
 
+If the new post-ready VM test is marked `#[ignore]` like the heavier snapshot
+suites, run it with `-- --ignored --nocapture` instead. Do not accept a
+false-green run that compiled the test binary but filtered out the test.
+
 If the real reference-workload artifact is available:
 
 ```bash
@@ -45,7 +49,7 @@ Also run the relevant existing VM suites because frame-boundary changes touch
 shared behavior:
 
 ```bash
-DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest --test m4_snapshot -- --nocapture
+DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest --test m4_snapshot -- --ignored --nocapture
 DETGUEST_VM_TESTS=1 DETGUEST_M4_CHILDREN=4 \
   cargo test -p detguest-vmtest --test m4_acceptance -- --ignored --nocapture
 ```
@@ -74,8 +78,10 @@ directory is missing at planning time, use this precedence:
 1. If `.agents/requests/phase3-post-ready-no-frame-under-no-tick/` exists by
    then, write the resolution there.
 2. If it still does not exist, create that directory with a concise
-   `00-resolution.md` or attach the same content to the implementation Beads
-   issue and mention that the source request was absent.
+   `00-resolution.md` at completion, or attach the same content to the
+   implementation Beads issue and mention that the source request was absent.
+   Do not create the missing request directory at package-01 start just to hold
+   preliminary evidence.
 
 Include:
 
@@ -86,5 +92,14 @@ Include:
 - any wall-clock budget risk that remains under no tick.
 
 Before ending the implementation session, follow the repository close protocol:
-close finished Beads issues, `bd dolt push`, commit, `git push`, and verify
-`git status` is up to date with origin.
+
+```bash
+bd close <ids> --reason="..."
+git status
+git add <files>
+git commit -m "..."
+git pull --rebase
+bd dolt push
+git push
+git status -sb  # must report up to date with origin
+```

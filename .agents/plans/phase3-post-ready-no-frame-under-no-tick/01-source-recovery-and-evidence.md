@@ -3,12 +3,30 @@
 The named request directory is missing locally. This package prevents the next
 agent from implementing against a guessed symptom.
 
+## Step 0: Beads Setup
+
+Run the tracker setup before editing anything:
+
+```bash
+bd prime
+bd dolt pull
+bd create --title="..." --description="..." --type=task --priority=2
+bd dep add <package-02-id> <package-01-id>
+bd dep add <package-03-id> <package-02-id>
+bd dep add <package-04-id> <package-03-id>
+bd update <package-01-id> --claim
+```
+
+Use one issue per package. Run these commands serially; the embedded backend
+uses an exclusive lock and concurrent `bd` commands can fail.
+
 ## Step 1: Re-check the Request Source
 
 Start with:
 
 ```bash
 git pull --rebase
+bd dolt pull
 find .agents/requests -maxdepth 2 -type d -name 'phase3-post-ready-no-frame-under-no-tick' -print
 find /home/infra-admin/git/preestablished -path '*phase3-post-ready-no-frame-under-no-tick*' -print
 bd search "post ready no frame"
@@ -70,6 +88,9 @@ runtime bug unless the request explicitly changes the SDK wakeup contract.
 ## Deliverable
 
 Add a short evidence note before code work begins. If the original request
-directory remains absent, create a local resolution/evidence file under the
-request path or reference the Beads issue used for the implementation. Include
-the classification above and the raw command lines used to reproduce it.
+directory remains absent after `git pull --rebase` and `bd dolt pull`, do not
+create `.agents/requests/phase3-post-ready-no-frame-under-no-tick/` at the
+start of implementation. Record package-01 evidence in the implementation
+Beads issue instead. Create a request-path `00-resolution.md` only at
+completion, unless the original request arrives first. Include the
+classification above and the raw command lines used to reproduce it.

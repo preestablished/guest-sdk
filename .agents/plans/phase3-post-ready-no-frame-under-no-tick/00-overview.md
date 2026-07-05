@@ -67,7 +67,9 @@ contract:
 
 ## Tracking
 
-Use Beads for implementation tracking. Create one issue per package before
-editing code, wire dependencies in package order, claim issues as work starts,
-and close them with the exact verification evidence. Do not use markdown task
-lists as the implementation tracker.
+Use Beads for implementation tracking. Before editing plan/request/code, run
+`bd prime` and `bd dolt pull`, then create one issue per package, wire
+dependencies in package order, claim issues as work starts, and close them with
+the exact verification evidence. Run Beads commands serially; the embedded
+backend takes an exclusive writer lock. Do not use markdown task lists as the
+implementation tracker.

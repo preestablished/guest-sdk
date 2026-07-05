@@ -73,7 +73,9 @@ Focus on snapshot fidelity:
 - `VmHarness::from_snapshot()` must be called with `timer_interrupts = false`;
 - `VmSnapshot` carries `PioState`, including pv-pad frame counter and input
   schedule;
-- channel host state must carry ring C/I producer seqs;
+- channel host state must carry ring C/I producer seqs internally; verify this
+  through public behavior such as successful post-restore `push_command`
+  continuity, not by requiring private field access;
 - pending ring W records at the READY boundary must be drainable after restore;
 - if first post-restore frame uses `inject_point`, pending-inject host state
   may matter. Track this against `guest-sdk-4bc` if the current accessors are
