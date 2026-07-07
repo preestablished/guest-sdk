@@ -301,22 +301,6 @@ fn m3_testload_event_lines(events: &[GuestEvent]) -> Vec<String> {
         .collect()
 }
 
-fn fnv1a64_lines(lines: &[String]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for line in lines {
-        for byte in line
-            .as_bytes()
-            .iter()
-            .copied()
-            .chain(std::iter::once(b'\n'))
-        {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-    hash
-}
-
 #[test]
 #[ignore = "KVM tier: Intel runner only (DETGUEST_VM_TESTS=1)"]
 fn boots_to_hello_and_ready_within_one_guest_second() {
@@ -524,7 +508,7 @@ fn testload_m3_event_stream_hash_matches_golden() {
     start_unit_and_wait_exit(&mut vm, 2, Duration::from_secs(60));
 
     let lines = m3_testload_event_lines(&vm.observed.events);
-    let hash = fnv1a64_lines(&lines);
+    let hash = detguest_vmtest::replay::fnv1a64_lines(&lines);
     assert_eq!(
         hash,
         M3_TESTLOAD_EVENT_HASH,

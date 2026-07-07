@@ -228,7 +228,7 @@ if command -v "$REPLAY_TOOL" >/dev/null; then
 elif [[ -n "${DETGUEST_REPLAY_TOOL:-}" ]]; then
   fail "DETGUEST_REPLAY_TOOL=${DETGUEST_REPLAY_TOOL} is not on PATH or not executable"
 else
-  note "determinism_replay not on PATH — M5 replay gate remains blocked by guest-sdk-ext-hyp-determinism-replay-linux"
+  note "no determinism_replay binary expected: determinism-hypervisor ships none (its replay surface is dh-worker VerifyReplay gRPC + DHILOG fixtures; a CLI wrapper is available on request via their .agents/requests/). The guest-sdk Ms5 gate drives fixtures/harness directly — tests/vm/tests/determinism_replay.rs. ext-hyp replay beads are closed (handback dh 0831f92)."
 fi
 note "local harness provides KVM snapshot/fork/restore (tests/vm/src/harness/snapshot.rs — M4 acceptance tier); production snapshots remain determinism-hypervisor's"
 

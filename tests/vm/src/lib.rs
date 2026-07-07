@@ -17,6 +17,7 @@
 //! measurement) land here behind these gates.
 
 pub mod harness;
+pub mod replay;
 
 /// True when the environment opts into running KVM-requiring tests.
 pub fn vm_tests_enabled() -> bool {
