@@ -215,11 +215,13 @@ pub(crate) mod mock {
         DoorbellW,
     }
 
+    type Observer = Box<dyn FnMut(PioOp)>;
+
     thread_local! {
         static LOG: RefCell<Vec<PioOp>> = const { RefCell::new(Vec::new()) };
         static IN_ANSWERS: RefCell<VecDeque<u32>> = const { RefCell::new(VecDeque::new()) };
         static DOORBELL_FAILURES: RefCell<u32> = const { RefCell::new(0) };
-        static OBSERVER: RefCell<Option<Box<dyn FnMut(PioOp)>>> = const { RefCell::new(None) };
+        static OBSERVER: RefCell<Option<Observer>> = const { RefCell::new(None) };
     }
 
     /// Clear the log, the IN answer queue, forced doorbell failures, and any
