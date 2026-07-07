@@ -132,6 +132,25 @@ pub struct ProducerSeqs {
     pub ring_i: u32,
 }
 
+/// One intern-map entry, exported for checkpointing (the carrier for
+/// [`Channel::interns`] / [`Channel::restore_interns`], mirroring
+/// [`ProducerSeqs`] for the reconstructible half of the host state).
+///
+/// `name` is the host-side cached form: a **lossy** UTF-8 conversion of the
+/// guest's `NameIntern` bytes (see [`Channel::intern_name`]). A checkpointer
+/// holding raw name bytes must apply the same lossy rule before re-seeding,
+/// so a re-seeded child resolves exactly what a root that drained the events
+/// would hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternSnapshotEntry {
+    /// The guest-assigned name_id.
+    pub name_id: u32,
+    /// The interned name (lossy-UTF-8 host form).
+    pub name: String,
+    /// REACHABLE_DECL flag.
+    pub reachable_decl: bool,
+}
+
 impl<M: GuestMem> std::fmt::Debug for Channel<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Channel")
@@ -214,6 +233,68 @@ impl<M: GuestMem> Channel<M> {
     pub fn restore_producer_seqs(&mut self, seqs: ProducerSeqs) {
         self.next_seq_c = seqs.ring_c;
         self.next_seq_i = seqs.ring_i;
+    }
+
+    /// Export the intern map for checkpointing (entries in name_id order).
+    /// The reconstructible-from-drain caveat in the [`Channel`] docs is why
+    /// this exists: capturing from the channel is cheaper and simpler than
+    /// re-folding a root's drained event history.
+    pub fn interns(&self) -> Vec<InternSnapshotEntry> {
+        self.interns
+            .iter()
+            .map(|(id, e)| InternSnapshotEntry {
+                name_id: *id,
+                name: e.name.clone(),
+                reachable_decl: e.reachable_decl,
+            })
+            .collect()
+    }
+
+    /// Re-seed the intern map after re-attaching on a snapshot restore, so a
+    /// child resolves [`Channel::intern_name`] without any drain having
+    /// occurred. Replaces the map wholesale.
+    ///
+    /// Intended for a freshly-attached channel whose map is empty; like
+    /// [`Channel::restore_producer_seqs`], a late call is not an error — the
+    /// restored state simply wins — but the `debug_assert` flags the misuse
+    /// in test builds.
+    pub fn restore_interns(&mut self, entries: impl IntoIterator<Item = InternSnapshotEntry>) {
+        debug_assert!(
+            self.interns.is_empty(),
+            "restore_interns on a channel that already folded interns"
+        );
+        self.interns = entries
+            .into_iter()
+            .map(|e| {
+                (
+                    e.name_id,
+                    InternEntry {
+                        name: e.name,
+                        reachable_decl: e.reachable_decl,
+                    },
+                )
+            })
+            .collect();
+    }
+
+    /// Export the pending-inject table (iseq → name_id of drained-but-not-
+    /// yet-answered `InjectQuery` events) for checkpointing, in iseq order.
+    pub fn pending_injects(&self) -> Vec<(u32, u32)> {
+        self.pending_injects
+            .iter()
+            .map(|(iseq, name_id)| (*iseq, *name_id))
+            .collect()
+    }
+
+    /// Re-seed the pending-inject table after re-attaching on a snapshot
+    /// restore. Replaces the table wholesale; same late-call semantics as
+    /// [`Channel::restore_interns`].
+    pub fn restore_pending_injects(&mut self, entries: impl IntoIterator<Item = (u32, u32)>) {
+        debug_assert!(
+            self.pending_injects.is_empty(),
+            "restore_pending_injects on a channel with drained inject queries"
+        );
+        self.pending_injects = entries.into_iter().collect();
     }
 
     /// The validated channel header.
@@ -366,5 +447,43 @@ mod tests {
             AttachError::AlreadyAttached.init_status(),
             InitStatus::AlreadyAttached
         );
+    }
+
+    #[test]
+    fn reseeded_channel_resolves_interns_without_drain() {
+        let mut ch = Channel::attach(fresh_channel_mem(), BASE).unwrap();
+        assert_eq!(ch.intern_name(7), None);
+        ch.restore_interns([
+            InternSnapshotEntry {
+                name_id: 7,
+                name: "boot.milestone".into(),
+                reachable_decl: false,
+            },
+            InternSnapshotEntry {
+                name_id: 9,
+                name: "level.secret".into(),
+                reachable_decl: true,
+            },
+        ]);
+        assert_eq!(ch.intern_name(7), Some("boot.milestone"));
+        assert_eq!(ch.intern_name(9), Some("level.secret"));
+        assert_eq!(ch.declared_reachables().collect::<Vec<_>>(), vec![9]);
+        // Round trip: export matches what was seeded, in name_id order.
+        let exported = ch.interns();
+        assert_eq!(exported.len(), 2);
+        assert_eq!(exported[0].name_id, 7);
+        assert_eq!(exported[1].name_id, 9);
+        assert!(exported[1].reachable_decl);
+    }
+
+    #[test]
+    fn reseeded_channel_answers_pending_injects_without_drain() {
+        let mut ch = Channel::attach(fresh_channel_mem(), BASE).unwrap();
+        assert_eq!(ch.take_pending_inject(3), None);
+        ch.restore_pending_injects([(3, 42), (5, 43)]);
+        assert_eq!(ch.pending_injects(), vec![(3, 42), (5, 43)]);
+        assert_eq!(ch.take_pending_inject(3), Some(42));
+        assert_eq!(ch.take_pending_inject(3), None);
+        assert_eq!(ch.take_pending_inject(5), Some(43));
     }
 }

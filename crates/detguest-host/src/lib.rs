@@ -19,7 +19,7 @@ pub mod guestmem;
 pub mod inject;
 pub mod manifest;
 
-pub use channel::{AttachError, Channel, DropCounters, ProducerSeqs};
+pub use channel::{AttachError, Channel, DropCounters, InternSnapshotEntry, ProducerSeqs};
 pub use drain::{GuestEvent, OwnedPayload};
 pub use guestmem::{GuestMem, MemError, MockGuestMem};
 pub use inject::{FaultPlan, InjectResponder, LogFaultPlan, TableFaultPlan};

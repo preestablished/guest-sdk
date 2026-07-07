@@ -204,11 +204,28 @@ fn snapshot_restore_guest_still_runs() {
     }
     let mut root = boot_to_warmup();
     let root_last = *root.observed.frame_counter_writes.last().unwrap();
+    // The root folded NameIntern events while draining; remember one so the
+    // child's re-seeded intern map can be checked below.
+    let root_interns = root.channel.as_ref().unwrap().interns();
+    assert!(
+        !root_interns.is_empty(),
+        "m4 fixture must have interned at least one name before warm-up"
+    );
     let snap = root.snapshot().expect("snapshot");
     drop(root);
 
     let cfg = m4_config();
     let mut child = VmHarness::from_snapshot(&cfg, &snap).expect("child build");
+    // The child never drained an event: intern_name resolving here proves
+    // from_snapshot re-seeded the channel's intern map directly (guest-sdk-4bc),
+    // not via manifest name bytes.
+    let probe = &root_interns[0];
+    assert_eq!(
+        child.channel.as_ref().unwrap().intern_name(probe.name_id),
+        Some(probe.name.as_str()),
+        "child channel must resolve intern {} without any drain",
+        probe.name_id
+    );
     run_child_frames(&mut child, CHILD_FRAMES);
 
     // The frame counter continues from the snapshot point (no reboot, no

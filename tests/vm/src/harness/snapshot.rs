@@ -26,7 +26,7 @@ use kvm_ioctls::{Cap, Kvm, VcpuFd, VmFd};
 use vm_memory::{Bytes, GuestAddress};
 
 use detguest_host::{
-    Channel, InjectResponder, OwnedPayload, ProducerSeqs, RecordingSink, TableFaultPlan,
+    Channel, InjectResponder, InternSnapshotEntry, ProducerSeqs, RecordingSink, TableFaultPlan,
 };
 
 use super::icount::GuestIcount;
@@ -71,14 +71,16 @@ struct VcpuState {
     mp_state: kvm_mp_state,
 }
 
-/// One host-interned name captured from the drained event stream, kept in
-/// the snapshot so a child can re-seed name resolution once `detguest-host`
-/// grows a `Channel::restore_interns` (see [`HostChannelState::interns`]).
+/// One host-interned name captured from the root channel's intern map
+/// (`Channel::interns()`), kept in the snapshot so `from_snapshot` can
+/// re-seed the child's name resolution via `Channel::restore_interns`.
 #[derive(Clone)]
 pub struct InternRecord {
     /// The guest-assigned name_id.
     pub name_id: u32,
-    /// Raw name bytes.
+    /// Raw name bytes. The host caches names as lossy UTF-8 `String`s, so
+    /// these are the lossy form's bytes; converting back with
+    /// `String::from_utf8_lossy` at restore is exact (already valid UTF-8).
     pub name: Vec<u8>,
     /// REACHABLE_DECL flag.
     pub reachable_decl: bool,
@@ -93,15 +95,17 @@ pub struct HostChannelState {
     gpa: u64,
     /// `Channel::producer_seqs()` at snapshot time (rings C/I).
     producer_seqs: ProducerSeqs,
-    /// Intern map at snapshot time, reconstructed from the root's drained
-    /// `NameIntern` events (the host folds ring A+W interns into one map).
-    /// NOTE: `Channel` currently exposes no way to re-seed its intern map
-    /// (`interns` is `pub(crate)`, no getter/setter), so children resolve
-    /// names via manifest name bytes only; the data is carried here so the
-    /// restore can be completed without re-snapshotting once the accessor
-    /// exists. Same for `pending_injects` (also `pub(crate)`, no getter) —
-    /// snapshot only at a boundary with no outstanding inject queries.
+    /// Intern map at snapshot time, captured from `Channel::interns()` (the
+    /// host folds ring A+W interns into one map) and re-seeded into the
+    /// child via `Channel::restore_interns` — children resolve names
+    /// directly, without falling back to manifest name bytes.
     pub interns: Vec<InternRecord>,
+    /// Pending-inject table (iseq → name_id of drained-but-unanswered
+    /// `InjectQuery` events) at snapshot time, re-seeded via
+    /// `Channel::restore_pending_injects`. Preserves in-flight inject
+    /// queries across a restore; snapshots taken at a quiet boundary simply
+    /// carry an empty table.
+    pub pending_injects: Vec<(u32, u32)>,
 }
 
 /// A full VM snapshot. Immutable by construction: `from_snapshot` only reads
@@ -232,26 +236,22 @@ impl VmHarness {
         let ioapic = get_irqchip(&self.vm, KVM_IRQCHIP_IOAPIC)?;
 
         // Host-side channel state (REQUIRED for push_command in children).
+        // Interns/pending injects come straight off the channel's own maps —
+        // the authoritative folded state — not from re-scanning the root's
+        // drained event history.
         let host_channel = self.channel.as_ref().map(|ch| HostChannelState {
             gpa: ch.base_gpa(),
             producer_seqs: ch.producer_seqs(),
-            interns: self
-                .observed
-                .events
-                .iter()
-                .filter_map(|e| match &e.payload {
-                    OwnedPayload::NameIntern {
-                        name_id,
-                        name,
-                        reachable_decl,
-                    } => Some(InternRecord {
-                        name_id: *name_id,
-                        name: name.clone(),
-                        reachable_decl: *reachable_decl,
-                    }),
-                    _ => None,
+            interns: ch
+                .interns()
+                .into_iter()
+                .map(|e| InternRecord {
+                    name_id: e.name_id,
+                    name: e.name.into_bytes(),
+                    reachable_decl: e.reachable_decl,
                 })
                 .collect(),
+            pending_injects: ch.pending_injects(),
         });
 
         Ok(VmSnapshot {
@@ -330,14 +330,21 @@ impl VmHarness {
         vm.set_irqchip(&snap.pic_slave).map_err(io::Error::from)?;
         vm.set_irqchip(&snap.ioapic).map_err(io::Error::from)?;
 
-        // Host channel: re-attach over the child's memslot and restore the
-        // non-reconstructible producer seqs. The intern map cannot be
-        // re-seeded yet (no Channel accessor — see HostChannelState docs).
+        // Host channel: re-attach over the child's memslot, restore the
+        // non-reconstructible producer seqs, and re-seed the intern map and
+        // pending-inject table so the child resolves names / answers injects
+        // without any drain having occurred.
         let channel = match &snap.host_channel {
             Some(hc) => {
                 let mut ch = Channel::attach(mem, hc.gpa)
                     .map_err(|e| io::Error::other(format!("child channel attach: {e:?}")))?;
                 ch.restore_producer_seqs(hc.producer_seqs);
+                ch.restore_interns(hc.interns.iter().map(|r| InternSnapshotEntry {
+                    name_id: r.name_id,
+                    name: String::from_utf8_lossy(&r.name).into_owned(),
+                    reachable_decl: r.reachable_decl,
+                }));
+                ch.restore_pending_injects(hc.pending_injects.iter().copied());
                 Some(ch)
             }
             None => None,
