@@ -18,11 +18,14 @@ pub mod drain;
 pub mod guestmem;
 pub mod inject;
 pub mod manifest;
+pub mod replay;
 
 pub use channel::{AttachError, Channel, DropCounters, InternSnapshotEntry, ProducerSeqs};
 pub use drain::{GuestEvent, OwnedPayload};
 pub use guestmem::{GuestMem, MemError, MockGuestMem};
-pub use inject::{FaultPlan, InjectResponder, LogFaultPlan, TableFaultPlan};
+pub use inject::{
+    FaultPlan, InjectResponder, LogDivergence, LogFaultPlan, LoggedDecision, TableFaultPlan,
+};
 pub use manifest::{RegionManifest, ResolvedRegion};
 
 use detguest_wire::RingId;

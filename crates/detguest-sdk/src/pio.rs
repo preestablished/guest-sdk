@@ -74,7 +74,8 @@ pub(crate) fn frame_mark() {}
 
 #[cfg(test)]
 pub(crate) fn doorbell_w() -> Result<(), InitError> {
-    Ok(())
+    mock::record(mock::PioOp::DoorbellW);
+    mock::next_doorbell_result()
 }
 
 #[cfg(not(test))]
@@ -125,7 +126,7 @@ fn map_pv_pad() -> Result<MappedMmio, InitError> {
 }
 
 #[cfg(all(not(test), target_arch = "x86_64"))]
-fn detcall_out(port: u16, value: u32) -> Result<(), InitError> {
+pub(crate) fn detcall_out(port: u16, value: u32) -> Result<(), InitError> {
     unsafe {
         core::arch::asm!(
             "out dx, eax",
@@ -138,7 +139,7 @@ fn detcall_out(port: u16, value: u32) -> Result<(), InitError> {
 }
 
 #[cfg(all(not(test), target_arch = "x86"))]
-fn detcall_out(port: u16, value: u32) -> Result<(), InitError> {
+pub(crate) fn detcall_out(port: u16, value: u32) -> Result<(), InitError> {
     unsafe {
         core::arch::asm!(
             "out dx, eax",
@@ -151,8 +152,138 @@ fn detcall_out(port: u16, value: u32) -> Result<(), InitError> {
 }
 
 #[cfg(all(not(test), not(any(target_arch = "x86", target_arch = "x86_64"))))]
-fn detcall_out(_port: u16, _value: u32) -> Result<(), InitError> {
+pub(crate) fn detcall_out(_port: u16, _value: u32) -> Result<(), InitError> {
     Err(InitError::PioPermissionDenied)
+}
+
+#[cfg(all(not(test), target_arch = "x86_64"))]
+pub(crate) fn detcall_in(port: u16) -> Result<u32, InitError> {
+    let value: u32;
+    unsafe {
+        core::arch::asm!(
+            "in eax, dx",
+            in("dx") port,
+            out("eax") value,
+            options(nostack, preserves_flags)
+        );
+    }
+    Ok(value)
+}
+
+#[cfg(all(not(test), target_arch = "x86"))]
+pub(crate) fn detcall_in(port: u16) -> Result<u32, InitError> {
+    let value: u32;
+    unsafe {
+        core::arch::asm!(
+            "in eax, dx",
+            in("dx") port,
+            out("eax") value,
+            options(nostack, preserves_flags)
+        );
+    }
+    Ok(value)
+}
+
+#[cfg(all(not(test), not(any(target_arch = "x86", target_arch = "x86_64"))))]
+pub(crate) fn detcall_in(_port: u16) -> Result<u32, InitError> {
+    Err(InitError::PioPermissionDenied)
+}
+
+#[cfg(test)]
+pub(crate) use mock::{detcall_in, detcall_out};
+
+/// Thread-local scriptable PIO mock for unit tests: records every OUT / IN /
+/// ring-W doorbell in program order, answers IN from a scripted queue, and
+/// can force doorbell failures (the only way the Critical-emit retry
+/// discipline exhausts in-process). Thread-local because the test harness
+/// runs each test on its own thread.
+#[cfg(test)]
+pub(crate) mod mock {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    use crate::InitError;
+
+    /// One recorded PIO-visible operation.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum PioOp {
+        /// `detcall_out(port, value)`.
+        Out { port: u16, value: u32 },
+        /// `detcall_in(port)`.
+        In { port: u16 },
+        /// `doorbell_w()`.
+        DoorbellW,
+    }
+
+    thread_local! {
+        static LOG: RefCell<Vec<PioOp>> = const { RefCell::new(Vec::new()) };
+        static IN_ANSWERS: RefCell<VecDeque<u32>> = const { RefCell::new(VecDeque::new()) };
+        static DOORBELL_FAILURES: RefCell<u32> = const { RefCell::new(0) };
+        static OBSERVER: RefCell<Option<Box<dyn FnMut(PioOp)>>> = const { RefCell::new(None) };
+    }
+
+    /// Clear the log, the IN answer queue, forced doorbell failures, and any
+    /// installed observer. Call at the top of every test that uses the mock.
+    pub(crate) fn reset() {
+        LOG.with(|l| l.borrow_mut().clear());
+        IN_ANSWERS.with(|q| q.borrow_mut().clear());
+        DOORBELL_FAILURES.with(|n| *n.borrow_mut() = 0);
+        OBSERVER.with(|o| *o.borrow_mut() = None);
+    }
+
+    /// Install a callback invoked synchronously on every recorded op —
+    /// lets a test observe external state (e.g. the ring-W producer index)
+    /// at the exact moment an OUT happens.
+    pub(crate) fn set_observer(f: impl FnMut(PioOp) + 'static) {
+        OBSERVER.with(|o| *o.borrow_mut() = Some(Box::new(f)));
+    }
+
+    /// Queue the next `detcall_in` answers, front first. An empty queue
+    /// answers 0 (packed `Proceed`).
+    pub(crate) fn push_in_answer(value: u32) {
+        IN_ANSWERS.with(|q| q.borrow_mut().push_back(value));
+    }
+
+    /// Force the next `n` `doorbell_w` calls to fail.
+    pub(crate) fn fail_doorbells(n: u32) {
+        DOORBELL_FAILURES.with(|c| *c.borrow_mut() = n);
+    }
+
+    /// The ops recorded since the last [`reset`], in program order.
+    pub(crate) fn log() -> Vec<PioOp> {
+        LOG.with(|l| l.borrow().clone())
+    }
+
+    pub(crate) fn record(op: PioOp) {
+        LOG.with(|l| l.borrow_mut().push(op));
+        OBSERVER.with(|o| {
+            if let Some(f) = o.borrow_mut().as_mut() {
+                f(op);
+            }
+        });
+    }
+
+    pub(crate) fn next_doorbell_result() -> Result<(), InitError> {
+        DOORBELL_FAILURES.with(|c| {
+            let mut c = c.borrow_mut();
+            if *c > 0 {
+                *c -= 1;
+                Err(InitError::PioPermissionDenied)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    pub(crate) fn detcall_out(port: u16, value: u32) -> Result<(), InitError> {
+        record(PioOp::Out { port, value });
+        Ok(())
+    }
+
+    pub(crate) fn detcall_in(port: u16) -> Result<u32, InitError> {
+        record(PioOp::In { port });
+        Ok(IN_ANSWERS.with(|q| q.borrow_mut().pop_front()).unwrap_or(0))
+    }
 }
 
 #[derive(Debug)]

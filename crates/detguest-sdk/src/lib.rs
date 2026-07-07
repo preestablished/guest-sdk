@@ -45,6 +45,8 @@ struct SdkState {
     beacons: beacons::BeaconCounters,
     stats: StatsState,
     frame_index: u32,
+    /// Next `inject_point` query sequence number (see `inject::FIRST_ISEQ`).
+    next_iseq: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -153,6 +155,7 @@ fn init_from_channel_fd<'a>(
             beacons: beacons::BeaconCounters::default(),
             stats: StatsState::default(),
             frame_index: 0,
+            next_iseq: inject::FIRST_ISEQ,
         }),
     };
     match cell.set(sdk) {
@@ -205,11 +208,15 @@ pub fn coverage_beacon(id: u32) {
 }
 
 /// Ask the host whether to inject a fault here.
+///
+/// Standalone mode (no channel mapped) returns [`FaultDecision::Proceed`]
+/// without touching any port.
 pub fn inject_point(name: &'static str) -> FaultDecision {
-    let _ = with_sdk_state(|state| {
+    with_sdk_state(|state| {
         state.stats.inject_queries_total = state.stats.inject_queries_total.saturating_add(1);
-    });
-    inject::inject_point(name)
+        state.inject_point(name)
+    })
+    .unwrap_or(FaultDecision::Proceed)
 }
 
 /// Per-frame controller read from the pv-pad latch.
@@ -576,6 +583,7 @@ mod tests {
             beacons: beacons::BeaconCounters::default(),
             stats: StatsState::default(),
             frame_index: 0,
+            next_iseq: inject::FIRST_ISEQ,
         }
     }
 
@@ -1092,5 +1100,148 @@ mod tests {
         assert_eq!(payload, ev);
         let frame = unsafe { words_ptr.add(pio::PVPAD_FRAME_COUNTER_WORD).read() };
         assert_eq!(frame, 1);
+    }
+
+    // ---- inject_point (guest-sdk-m5-sdk-inject-point) ----
+
+    use detguest_wire::ports::PORT_INJECT;
+    use pio::mock::{self, PioOp};
+
+    fn inject_out_values(log: &[PioOp]) -> Vec<u32> {
+        log.iter()
+            .filter_map(|op| match op {
+                PioOp::Out { port, value } if *port == PORT_INJECT => Some(*value),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inject_point_publishes_query_before_detcall_out() {
+        let file = test_channel_file(ChannelHeader::canonical());
+        let mut state = test_state(&file);
+        mock::reset();
+        mock::push_in_answer(FaultDecision::Proceed.pack());
+
+        // Observe the ring-W producer index at the exact moment of the OUT:
+        // the InjectQuery must already be published (acceptance ordering).
+        let probe = file.try_clone().unwrap();
+        let prod_at_out = std::rc::Rc::new(std::cell::Cell::new(None));
+        let prod_at_out2 = prod_at_out.clone();
+        mock::set_observer(move |op| {
+            if let PioOp::Out { port, .. } = op {
+                if port == PORT_INJECT {
+                    let mut b = [0u8; 4];
+                    probe.read_exact_at(&mut b, OFF_RING_W_PROD as u64).unwrap();
+                    prod_at_out2.set(Some(u32::from_le_bytes(b)));
+                }
+            }
+        });
+        let decision = state.inject_point("fault.site");
+        mock::set_observer(|_| {});
+        assert_eq!(decision, FaultDecision::Proceed);
+
+        let prod_at_out = prod_at_out.get().expect("OUT on PORT_INJECT observed");
+        assert_eq!(
+            prod_at_out,
+            read_u32_at(&file, OFF_RING_W_PROD),
+            "InjectQuery publication must precede the OUT"
+        );
+        let mut queries = Vec::new();
+        for_each_ring_w_event(&file, |_, _, payload| {
+            if let EventPayload::InjectQuery { iseq, name_id } = payload {
+                queries.push((iseq, name_id));
+            }
+        });
+        assert_eq!(queries, vec![(inject::FIRST_ISEQ, 1)]);
+
+        // Op order: the query's doorbell, then OUT, then IN — all on the log.
+        let log = mock::log();
+        let bell = log
+            .iter()
+            .position(|o| matches!(o, PioOp::DoorbellW))
+            .expect("doorbell recorded");
+        let out = log
+            .iter()
+            .position(|o| matches!(o, PioOp::Out { port, .. } if *port == PORT_INJECT))
+            .expect("OUT recorded");
+        let inn = log
+            .iter()
+            .position(|o| matches!(o, PioOp::In { port } if *port == PORT_INJECT))
+            .expect("IN recorded");
+        assert!(
+            bell < out && out < inn,
+            "expected doorbell < OUT < IN: {log:?}"
+        );
+    }
+
+    #[test]
+    fn inject_point_decodes_packed_decisions_and_increments_iseq() {
+        let file = test_channel_file(ChannelHeader::canonical());
+        let mut state = test_state(&file);
+        mock::reset();
+        let platform = FaultDecision::Platform { kind: 2, arg: 512 };
+        let workload = FaultDecision::Workload { kind: 64, arg: 7 };
+        mock::push_in_answer(platform.pack());
+        mock::push_in_answer(workload.pack());
+        mock::push_in_answer(FaultDecision::Proceed.pack());
+
+        assert_eq!(state.inject_point("fault.a"), platform);
+        assert_eq!(state.inject_point("fault.b"), workload);
+        assert_eq!(state.inject_point("fault.a"), FaultDecision::Proceed);
+
+        // iseq increments per call, starting at FIRST_ISEQ, and the OUT'd
+        // value is the same iseq carried by the ring-W event (one counter).
+        assert_eq!(inject_out_values(&mock::log()), vec![1, 2, 3]);
+        let mut event_iseqs = Vec::new();
+        for_each_ring_w_event(&file, |_, _, payload| {
+            if let EventPayload::InjectQuery { iseq, .. } = payload {
+                event_iseqs.push(iseq);
+            }
+        });
+        assert_eq!(event_iseqs, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn standalone_inject_point_returns_proceed_without_touching_the_port() {
+        mock::reset();
+        assert_eq!(inject_point("fault.site"), FaultDecision::Proceed);
+        assert!(mock::log().is_empty(), "no PIO traffic in standalone mode");
+    }
+
+    #[test]
+    fn inject_point_invalid_name_returns_proceed_without_query_or_port() {
+        let file = test_channel_file(ChannelHeader::canonical());
+        let mut state = test_state(&file);
+        mock::reset();
+        // Longer than the intern-table name limit ⇒ intern fails ⇒ Proceed.
+        let long: &'static str = Box::leak("x".repeat(4096).into_boxed_str());
+        assert_eq!(state.inject_point(long), FaultDecision::Proceed);
+        assert!(mock::log().is_empty(), "no PIO traffic on intern failure");
+        assert_eq!(read_u32_at(&file, OFF_RING_W_PROD), 0, "no ring-W event");
+        // The failed call consumed no iseq.
+        assert_eq!(state.next_iseq, inject::FIRST_ISEQ);
+    }
+
+    #[test]
+    fn inject_point_exhausted_publication_returns_proceed_without_out() {
+        let file = test_channel_file(ChannelHeader::canonical());
+        let mut state = test_state(&file);
+        mock::reset();
+        force_ring_w_full(&file);
+        // The Critical retry loop doorbells on every failed push; forcing the
+        // doorbell to fail is the only way it exhausts. Budget covers the
+        // NameIntern emit's retries plus the InjectQuery's.
+        mock::fail_doorbells(8);
+
+        assert_eq!(state.inject_point("fault.full"), FaultDecision::Proceed);
+        assert!(
+            inject_out_values(&mock::log()).is_empty(),
+            "no OUT after failed publication"
+        );
+        assert!(
+            !mock::log().iter().any(|o| matches!(o, PioOp::In { .. })),
+            "no IN after failed publication"
+        );
     }
 }

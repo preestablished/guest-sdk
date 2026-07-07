@@ -123,19 +123,115 @@ impl FaultPlan for TableFaultPlan {
     }
 }
 
-/// Replay-mode plan skeleton: reads decisions back from the input log so the
-/// same call site gets the same answer bit-for-bit with the synthesizer
-/// absent. Final wiring lands in determinism-hypervisor (it owns the DHILOG
-/// format); until then this skeleton answers Proceed.
+/// One recorded replay decision — the input to [`LogFaultPlan`].
+///
+/// This is the "supplied replay decisions" seam: DHILOG serialization stays
+/// hypervisor-owned, so the caller feeds *decoded* decisions (in round 2,
+/// parsed from real DHILOG `pio_answer` records by determinism-hypervisor
+/// code; in tests, synthetic fixtures or a record leg's
+/// [`TableFaultPlan::decisions`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoggedDecision {
+    /// The inject sequence number the decision was recorded at.
+    pub iseq: u32,
+    /// The interned point name the query carried.
+    pub name_id: u32,
+    /// The decision to replay verbatim.
+    pub decision: FaultDecision,
+}
+
+/// One replay divergence a [`LogFaultPlan`] detected (the replay-divergence
+/// surface — a nonzero count fails the gate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogDivergence {
+    /// The query's iseq did not match the log entry at the cursor.
+    IseqMismatch {
+        /// iseq the log expected at this position.
+        expected: u32,
+        /// iseq the replay run actually asked.
+        got: u32,
+    },
+    /// The iseq matched but the query carried a different name_id.
+    NameIdMismatch {
+        /// The (matching) iseq.
+        iseq: u32,
+        /// name_id the log recorded.
+        expected: u32,
+        /// name_id the replay run actually asked.
+        got: u32,
+    },
+    /// A query arrived after the log was exhausted.
+    PastEnd {
+        /// iseq of the unanswerable query.
+        got: u32,
+    },
+}
+
+/// Replay-mode plan: a cursor over recorded decisions, returned verbatim so
+/// the same call site gets the same answer bit-for-bit with the synthesizer
+/// absent.
+///
+/// "Fail loudly" semantics: `decide` runs inside the PIO exit path and must
+/// not panic, and the [`FaultPlan`] trait cannot fail — so every divergence
+/// (iseq mismatch, name_id mismatch, past-end query) answers `Proceed`,
+/// consumes the cursor slot (keeping queries and log entries 1:1 and every
+/// later divergence attributable), and is recorded for the harness/gate to
+/// assert on via [`LogFaultPlan::divergences`]. A `Default`-constructed plan
+/// has an empty log: every query is a `PastEnd` divergence answered
+/// `Proceed`.
 #[derive(Debug, Default)]
 pub struct LogFaultPlan {
-    // TODO(determinism-hypervisor): hold the replay cursor over the input
-    // log's (iseq, decision) records and return them verbatim.
+    log: Vec<LoggedDecision>,
+    cursor: usize,
+    divergences: Vec<LogDivergence>,
+}
+
+impl LogFaultPlan {
+    /// Build over supplied replay decisions, in recorded order.
+    pub fn new(decisions: Vec<LoggedDecision>) -> LogFaultPlan {
+        LogFaultPlan {
+            log: decisions,
+            cursor: 0,
+            divergences: Vec::new(),
+        }
+    }
+
+    /// Every divergence detected so far, in query order. The replay gate
+    /// fails on a nonzero count.
+    pub fn divergences(&self) -> &[LogDivergence] {
+        &self.divergences
+    }
+
+    /// Log entries not yet consumed by queries (a nonzero count at end of
+    /// run means the replay asked fewer questions than the record leg).
+    pub fn remaining(&self) -> usize {
+        self.log.len().saturating_sub(self.cursor)
+    }
 }
 
 impl FaultPlan for LogFaultPlan {
-    fn decide(&mut self, _iseq: u32, _name_id: u32, _name: Option<&str>) -> FaultDecision {
-        FaultDecision::Proceed
+    fn decide(&mut self, iseq: u32, name_id: u32, _name: Option<&str>) -> FaultDecision {
+        let Some(entry) = self.log.get(self.cursor) else {
+            self.divergences.push(LogDivergence::PastEnd { got: iseq });
+            return FaultDecision::Proceed;
+        };
+        self.cursor += 1;
+        if entry.iseq != iseq {
+            self.divergences.push(LogDivergence::IseqMismatch {
+                expected: entry.iseq,
+                got: iseq,
+            });
+            return FaultDecision::Proceed;
+        }
+        if entry.name_id != name_id {
+            self.divergences.push(LogDivergence::NameIdMismatch {
+                iseq,
+                expected: entry.name_id,
+                got: name_id,
+            });
+            return FaultDecision::Proceed;
+        }
+        entry.decision
     }
 }
 
@@ -274,14 +370,163 @@ mod tests {
         );
     }
 
+    /// The record/replay fixture: three inject points with distinct names.
+    /// Returns a freshly-attached channel with the queries drained.
+    fn drained_inject_fixture(sink: &mut RecordingSink) -> Channel<MockGuestMem> {
+        let mut ch = channel_with_w_records(&[
+            EventPayload::NameIntern {
+                name_id: 1,
+                name: b"io_read",
+            },
+            EventPayload::NameIntern {
+                name_id: 2,
+                name: b"io_write",
+            },
+            EventPayload::NameIntern {
+                name_id: 3,
+                name: b"net_send",
+            },
+            EventPayload::InjectQuery {
+                iseq: 1,
+                name_id: 1,
+            },
+            EventPayload::InjectQuery {
+                iseq: 2,
+                name_id: 2,
+            },
+            EventPayload::InjectQuery {
+                iseq: 3,
+                name_id: 3,
+            },
+        ]);
+        ch.drain_events(sink).unwrap();
+        ch
+    }
+
+    fn pio_answers(sink: &RecordingSink) -> Vec<u32> {
+        sink.ops
+            .iter()
+            .filter_map(|op| match op {
+                SinkOp::PioAnswer { value, .. } => Some(*value),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The fixture round trip: record leg with `TableFaultPlan` (varied
+    /// Platform/Workload/Proceed decisions), replay leg with `LogFaultPlan`
+    /// seeded from the record leg's decisions — identical `pio_answer`
+    /// values over a real channel, zero divergences, synthesizer absent.
     #[test]
-    fn log_fault_plan_skeleton_always_proceeds_for_now() {
-        let mut p = LogFaultPlan::default();
-        assert_eq!(p.decide(0, 1, None), FaultDecision::Proceed);
-        assert_eq!(p.decide(7, 42, Some("disk_read")), FaultDecision::Proceed);
+    fn log_fault_plan_replays_recorded_decisions_verbatim() {
+        // Record leg.
+        let mut record_sink = RecordingSink::default();
+        let mut ch = drained_inject_fixture(&mut record_sink);
+        let plan = TableFaultPlan::new(vec![
+            FaultRule {
+                name_glob: "io_read".into(),
+                occurrence: None,
+                decision: FaultDecision::Platform { kind: 2, arg: 512 },
+            },
+            FaultRule {
+                name_glob: "net_*".into(),
+                occurrence: None,
+                decision: FaultDecision::Workload { kind: 64, arg: 7 },
+            },
+            // io_write matches nothing ⇒ Proceed (the varied third answer).
+        ]);
+        let mut responder = InjectResponder::new(plan);
+        for iseq in [1, 2, 3] {
+            responder.answer(&mut ch, iseq, &mut record_sink);
+        }
+        let recorded = pio_answers(&record_sink);
         assert_eq!(
-            p.decide(u32::MAX, u32::MAX, Some("anything")),
-            FaultDecision::Proceed
+            recorded,
+            vec![
+                FaultDecision::Platform { kind: 2, arg: 512 }.pack(),
+                0,
+                FaultDecision::Workload { kind: 64, arg: 7 }.pack(),
+            ]
         );
+
+        // Seed the replay plan from the record leg's public decision trace
+        // (the fixture knows its name_ids; DHILOG decoding is round-2 and
+        // hypervisor-owned).
+        let name_ids = [1u32, 2, 3];
+        let decisions = responder
+            .plan_mut()
+            .decisions
+            .iter()
+            .zip(name_ids)
+            .map(|(&(iseq, decision), name_id)| LoggedDecision {
+                iseq,
+                name_id,
+                decision,
+            })
+            .collect();
+
+        // Replay leg: same drained queries on a fresh channel, no table plan
+        // anywhere (synthesizer absent).
+        let mut replay_sink = RecordingSink::default();
+        let mut ch2 = drained_inject_fixture(&mut replay_sink);
+        let mut replayer = InjectResponder::new(LogFaultPlan::new(decisions));
+        for iseq in [1, 2, 3] {
+            replayer.answer(&mut ch2, iseq, &mut replay_sink);
+        }
+        assert_eq!(pio_answers(&replay_sink), recorded);
+        assert_eq!(replayer.plan_mut().divergences(), &[]);
+        assert_eq!(replayer.plan_mut().remaining(), 0);
+        assert_eq!(ch2.unmatched_injects, 0);
+    }
+
+    #[test]
+    fn log_fault_plan_classifies_each_divergence_and_proceeds() {
+        let log = vec![
+            LoggedDecision {
+                iseq: 1,
+                name_id: 1,
+                decision: FaultDecision::Platform { kind: 1, arg: 5 },
+            },
+            LoggedDecision {
+                iseq: 2,
+                name_id: 2,
+                decision: FaultDecision::Workload { kind: 200, arg: 9 },
+            },
+        ];
+        let mut p = LogFaultPlan::new(log);
+
+        // (a) iseq mismatch at cursor: Proceed, slot consumed.
+        assert_eq!(p.decide(9, 1, None), FaultDecision::Proceed);
+        // (b) name_id mismatch for the matching iseq.
+        assert_eq!(p.decide(2, 5, Some("io_write")), FaultDecision::Proceed);
+        // (c) query past end of log.
+        assert_eq!(p.decide(3, 3, None), FaultDecision::Proceed);
+
+        assert_eq!(
+            p.divergences(),
+            &[
+                LogDivergence::IseqMismatch {
+                    expected: 1,
+                    got: 9
+                },
+                LogDivergence::NameIdMismatch {
+                    iseq: 2,
+                    expected: 2,
+                    got: 5
+                },
+                LogDivergence::PastEnd { got: 3 },
+            ]
+        );
+        assert_eq!(p.remaining(), 0);
+    }
+
+    #[test]
+    fn default_log_fault_plan_is_an_empty_log() {
+        // Kept deliberately: an empty log answers every query Proceed while
+        // classifying it PastEnd — a loud zero-fixture state, unlike the
+        // silently-green old skeleton.
+        let mut p = LogFaultPlan::default();
+        assert_eq!(p.decide(1, 1, None), FaultDecision::Proceed);
+        assert_eq!(p.divergences(), &[LogDivergence::PastEnd { got: 1 }]);
     }
 }
