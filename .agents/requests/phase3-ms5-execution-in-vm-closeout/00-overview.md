@@ -1,5 +1,9 @@
 # Request: Execute Ms5 + Ms3 In-VM Acceptance — The Phase 3 Tail, Closed Together (Gated)
 
+> **CURRENT STATUS (2026-07-10):** External handoffs named at filing have
+> landed, but the guest-sdk ledger was not reconciled and the lab acceptances
+> remain unrun. Read `04-current-status-2026-07-10.md`.
+
 ## Who Is Asking
 
 The phases track, round 2 (2026-07-07). This is the successor that
