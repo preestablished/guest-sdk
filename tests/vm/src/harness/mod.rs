@@ -26,7 +26,10 @@ use linux_loader::loader::bootparam::boot_params;
 use linux_loader::loader::{bzimage::BzImage, KernelLoader};
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
-use detguest_host::{Channel, GuestEvent, InjectResponder, RecordingSink, TableFaultPlan};
+use detguest_host::{
+    Channel, FaultPlan, GuestEvent, InjectResponder, LogFaultPlan, RecordingSink, TableFaultPlan,
+};
+use detguest_wire::FaultDecision;
 
 use self::icount::GuestIcount;
 use self::memslot::MemSlot;
@@ -107,6 +110,45 @@ pub struct Observed {
     pub quiesce_acks: Vec<u32>,
 }
 
+/// Fault-decision source installed in the VM PIO handler.
+///
+/// Record legs use [`TableFaultPlan`]; replay legs use [`LogFaultPlan`] and
+/// therefore have no synthesizer available. Keeping the mode explicit avoids
+/// a replay test silently falling back to a generated decision.
+pub enum HarnessFaultPlan {
+    /// Name/occurrence rule table used by a live record leg.
+    Table(TableFaultPlan),
+    /// Cursor over decoded decisions used by a replay leg.
+    Log(LogFaultPlan),
+}
+
+impl HarnessFaultPlan {
+    /// Return the table plan when this is a record leg.
+    pub fn table_mut(&mut self) -> Option<&mut TableFaultPlan> {
+        match self {
+            Self::Table(plan) => Some(plan),
+            Self::Log(_) => None,
+        }
+    }
+
+    /// Return the log plan when this is a replay leg.
+    pub fn log_mut(&mut self) -> Option<&mut LogFaultPlan> {
+        match self {
+            Self::Log(plan) => Some(plan),
+            Self::Table(_) => None,
+        }
+    }
+}
+
+impl FaultPlan for HarnessFaultPlan {
+    fn decide(&mut self, iseq: u32, name_id: u32, name: Option<&str>) -> FaultDecision {
+        match self {
+            Self::Table(plan) => plan.decide(iseq, name_id, name),
+            Self::Log(plan) => plan.decide(iseq, name_id, name),
+        }
+    }
+}
+
 /// Why `run_until` returned.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum StopReason {
@@ -131,7 +173,7 @@ pub struct VmHarness {
     /// Attached after the guest's CHANNEL_INIT (INIT_GO).
     pub channel: Option<Channel<MemSlot>>,
     /// Answers inject queries (drain-matched).
-    pub responder: InjectResponder<TableFaultPlan>,
+    pub responder: InjectResponder<HarnessFaultPlan>,
     /// The input-log trace of every host channel mutation.
     pub sink: RecordingSink,
     /// Everything observed so far.
@@ -346,7 +388,9 @@ impl VmHarness {
             mem,
             pio: PioState::new(),
             channel: None,
-            responder: InjectResponder::new(TableFaultPlan::new(Vec::new())),
+            responder: InjectResponder::new(HarnessFaultPlan::Table(TableFaultPlan::new(
+                Vec::new(),
+            ))),
             sink: RecordingSink::default(),
             observed: Observed::default(),
             icount,

@@ -43,7 +43,7 @@ use detguest_host::{
     MockGuestMem, RecordingSink, SinkOp, TableFaultPlan,
 };
 use detguest_vmtest::harness::snapshot::VmSnapshot;
-use detguest_vmtest::harness::{Observed, StopReason, VmConfig, VmHarness};
+use detguest_vmtest::harness::{HarnessFaultPlan, Observed, StopReason, VmConfig, VmHarness};
 use detguest_vmtest::replay::{assert_digests_equal, digest_from_trace, RunDigest};
 use detguest_wire::events::{encode_event, encoded_event_len, Command, EventPayload};
 use detguest_wire::header::{ChannelHeader, CHANNEL_SIZE, OFF_RESERVED};
@@ -541,7 +541,7 @@ fn seed_fault_plan(seed: u32) -> TableFaultPlan {
 /// m4 pv-pad scheduling pattern), run frames, fold the digest.
 fn vm_leg_digest(cfg: &VmConfig, snap: &VmSnapshot, seed: u32) -> RunDigest {
     let mut child = VmHarness::from_snapshot(cfg, snap).expect("child build");
-    child.responder = InjectResponder::new(seed_fault_plan(seed));
+    child.responder = InjectResponder::new(HarnessFaultPlan::Table(seed_fault_plan(seed)));
     let mut rng = Rng::new(seed);
     let base = child.pvpad().frame_counter;
     for i in 0..CHILD_FRAMES as u32 {

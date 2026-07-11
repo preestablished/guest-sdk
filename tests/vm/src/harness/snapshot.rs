@@ -378,7 +378,9 @@ impl VmHarness {
             mem,
             pio: snap.pio.clone(),
             channel,
-            responder: InjectResponder::new(TableFaultPlan::new(Vec::new())),
+            responder: InjectResponder::new(super::HarnessFaultPlan::Table(TableFaultPlan::new(
+                Vec::new(),
+            ))),
             sink: RecordingSink::default(),
             // Fresh baselines: children count deltas, never root totals.
             observed: Observed::default(),
