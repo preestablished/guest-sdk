@@ -16,9 +16,53 @@ fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("--spam-logs") => spam_logs(),
         Some("--spam-asserts") => spam_asserts(),
+        Some("--inject-roundtrip") => inject_roundtrip(),
         _ => exercise_once(),
     }
     std::process::exit(EXIT_CODE);
+}
+
+/// Canonical Ms5 live-inject fixture. The point order and log schema are
+/// versioned so the host can correlate `(iseq, name_id)` query order with
+/// the workload-observed return without exposing iseq through the SDK API.
+fn inject_roundtrip() {
+    let _ = sdk::init();
+    const POINTS: [&str; 6] = [
+        "ms5.frame.begin",
+        "ms5.io.read",
+        "ms5.frame.end",
+        "ms5.frame.begin",
+        "ms5.io.write",
+        "ms5.frame.end",
+    ];
+
+    for (occurrence, point) in POINTS.into_iter().enumerate() {
+        let decision = sdk::inject_point(point);
+        let (class, kind, arg) = match decision {
+            sdk::FaultDecision::Proceed => ("proceed", 0, 0),
+            sdk::FaultDecision::Platform { kind, arg } => ("platform", kind, arg),
+            sdk::FaultDecision::Workload { kind, arg } => ("workload", kind, arg),
+        };
+        sdk::log_line(
+            LogLevel::Info,
+            &format!(
+                "ms5.inject.v1 occurrence={occurrence} point={point} class={class} kind={kind} arg={arg}"
+            ),
+        );
+
+        // Keep the pv-pad path live in the same trajectory. Frame boundaries
+        // follow the two stable frame.end points.
+        if point == "ms5.io.read" || point == "ms5.io.write" {
+            let pad0 = sdk::poll_input(0);
+            sdk::log_line(
+                LogLevel::Info,
+                &format!("ms5.input.v1 occurrence={occurrence} port=0 value={pad0}"),
+            );
+        }
+        if point == "ms5.frame.end" {
+            sdk::frame_mark();
+        }
+    }
 }
 
 fn exercise_once() {
