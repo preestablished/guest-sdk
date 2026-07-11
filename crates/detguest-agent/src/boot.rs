@@ -93,7 +93,7 @@ fn fault(msg: impl Into<String>) -> BootFault {
 
 /// Parse and §7.2-validate boot.toml contents.
 ///
-/// Parsing uses the in-crate deterministic TOML-subset parser ([`tiny`]),
+/// Parsing uses the in-crate deterministic TOML-subset parser (`tiny`),
 /// not the `toml` crate: that crate's parser seeds a hash table via
 /// `getrandom(2)` at parse time, which in-guest is entropy consumption — a
 /// P0 violation of ARCHITECTURE.md §7 rule 2. The subset covers exactly the

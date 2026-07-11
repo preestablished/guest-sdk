@@ -7,11 +7,11 @@
 //! (pipes → LogLine, SIGCHLD → WorkloadExited, ring C commands).
 //!
 //! Unsafe policy (IMPLEMENTATION-PLAN M6, module-scoped): unsafe is permitted
-//! only in the documented modules — [`pio`] (iopl + OUT/IN inline asm),
-//! [`channel`] (hugetlbfs mmap of shared channel memory), the libc
-//! process/epoll plumbing in [`supervise`] and [`runtime`], the AF_UNIX
-//! SEQPACKET plumbing in [`region_ipc`], and the /dev/mem MMIO mapping +
-//! mlocked DMA page in [`pvblk`]. Everything else inherits this crate-level
+//! only in the documented modules — `pio` (iopl + OUT/IN inline asm),
+//! `channel` (hugetlbfs mmap of shared channel memory), the libc
+//! process/epoll plumbing in `supervise` and `runtime`, the AF_UNIX
+//! SEQPACKET plumbing in `region_ipc`, and the /dev/mem MMIO mapping +
+//! mlocked DMA page in `pvblk`. Everything else inherits this crate-level
 //! deny. (`translate` needs no unsafe: pagemap is plain file I/O.)
 #![deny(unsafe_code)]
 
