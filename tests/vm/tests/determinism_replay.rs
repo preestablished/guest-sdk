@@ -465,7 +465,14 @@ fn run(cwd: &Path, prog: &str, args: &[&str]) {
 
 fn m5_config() -> VmConfig {
     let a = artifacts();
-    VmConfig::new(a.bzimage.clone(), a.initramfs.clone())
+    let mut cfg = VmConfig::new(a.bzimage.clone(), a.initramfs.clone());
+    // The quick TSC calibration is host-timing-sensitive. When it fails,
+    // this tiny kernel has no HPET/PM timer reference and can stall before
+    // userspace while calibrating delay loops. Pinning lpj skips that boot
+    // calibration only; PIT delivery remains enabled for post-Ready
+    // scheduling (the inject workload needs it).
+    cfg.cmdline.push_str(" lpj=4096");
+    cfg
 }
 
 fn boot_to_ready() -> VmHarness {
