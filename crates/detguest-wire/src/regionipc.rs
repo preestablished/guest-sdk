@@ -531,7 +531,7 @@ mod tests {
     fn arbitrary_bytes_never_panic() {
         // Cheap in-test sweep alongside the crate fuzz target.
         for len in 0..REGIONIPC_MAX_DATAGRAM {
-            let bytes: alloc::vec::Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            let bytes: std::vec::Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
             let _ = decode_request(&bytes);
             let _ = decode_reply(&bytes);
         }
