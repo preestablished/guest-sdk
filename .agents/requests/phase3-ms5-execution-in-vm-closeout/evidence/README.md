@@ -25,6 +25,9 @@ Integrity:
 
 - manifest BLAKE3:
   `32ebed7b54c99d66415e010274332d95e58d6c686bbdbb2fe4f8228e9e73202d`
+  (raw atomic file, no trailing newline); committed JSON copy BLAKE3:
+  `bdd76cac67465802c3b53ecc1eed72509bf8d91e91355f9bc662246dac6d76a7`
+  (same JSON content with a repository newline)
 - ordered stream of per-record BLAKE3 lines:
   `be5a44c1f9f0c6f8215d44c4b42f940ebc034d8cd60e409daf99f60df9430b3c`
 - ordered campaign summary:

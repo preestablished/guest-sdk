@@ -109,6 +109,12 @@ pub struct Observed {
     pub serial: Vec<u8>,
     /// FRAME_COUNTER MMIO writes, in order (pv-pad latch stub).
     pub frame_counter_writes: Vec<u32>,
+    /// `(frame, drained_event_count)` captured after draining inside each
+    /// FRAME_COUNTER exit, proving the matching FrameMark was visible first.
+    pub frame_boundary_event_counts: Vec<(u32, usize)>,
+    /// Every workload PAD0..PAD3 MMIO read: `(frame counter, port, value)`.
+    /// This makes the SDK's once-per-frame poll contract observable.
+    pub pvpad_reads: Vec<(u32, u8, u32)>,
     /// QUIESCE_ACK detcall payloads, in order.
     pub quiesce_acks: Vec<u32>,
 }

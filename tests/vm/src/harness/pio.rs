@@ -36,6 +36,26 @@ const PVPAD_FRAME_COUNTER_OFF: u64 = 0x1C;
 /// One past the last register we decode.
 const PVPAD_END_OFF: u64 = 0x20;
 
+/// Neutral decoded form of a hypervisor-owned DHILOG `PAD_SET` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedPadSet {
+    /// Workload frame whose work period observes this value.
+    pub at_frame: u32,
+    /// pv-pad port, 0 through 3.
+    pub port: u8,
+    /// Held button latch value.
+    pub buttons: u32,
+}
+
+/// Why a decoded PAD_SET cannot enter the harness latch schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PadSetError {
+    /// Port is not one of PAD0..PAD3.
+    InvalidPort(u8),
+    /// Record targets a frame that has already opened.
+    PastFrame { current: u32, requested: u32 },
+}
+
 impl PvPad {
     /// Schedule a pad value (the "PAD_SET landing" stand-in for M3 tests).
     pub fn set_pad(&mut self, port: usize, value: u32) {
@@ -55,6 +75,21 @@ impl PvPad {
     /// schedulable (no FRAME_COUNTER write precedes it); use `set_pad`.
     pub fn schedule(&mut self, frame: u32, port: u8, value: u32) {
         self.schedule.entry(frame).or_default().push((port, value));
+    }
+
+    /// Validate and schedule a PAD_SET decoded by the upstream DHILOG reader.
+    pub fn apply_decoded(&mut self, record: DecodedPadSet) -> Result<(), PadSetError> {
+        if record.port >= self.pads.len() as u8 {
+            return Err(PadSetError::InvalidPort(record.port));
+        }
+        if record.at_frame <= self.frame_counter {
+            return Err(PadSetError::PastFrame {
+                current: self.frame_counter,
+                requested: record.at_frame,
+            });
+        }
+        self.schedule(record.at_frame, record.port, record.buttons);
+        Ok(())
     }
 
     /// Apply every schedule entry due at (or before) FRAME_COUNTER value
@@ -204,12 +239,17 @@ pub fn pvpad_read(h: &mut VmHarness, addr: u64) -> u32 {
     let Some(off) = addr.checked_sub(PVPAD_BASE) else {
         return 0;
     };
-    let pv = &h.pio_state().pvpad;
     match off {
         o if (PVPAD_PAD0_OFF..PVPAD_PAD0_OFF + 16).contains(&o) && o % 4 == 0 => {
-            pv.pads[((o - PVPAD_PAD0_OFF) / 4) as usize]
+            let port = ((o - PVPAD_PAD0_OFF) / 4) as u8;
+            let (frame, value) = {
+                let pv = &h.pio_state().pvpad;
+                (pv.frame_counter, pv.pads[port as usize])
+            };
+            h.observed.pvpad_reads.push((frame, port, value));
+            value
         }
-        PVPAD_FRAME_COUNTER_OFF => pv.frame_counter,
+        PVPAD_FRAME_COUNTER_OFF => h.pio_state().pvpad.frame_counter,
         _ => 0,
     }
 }
@@ -222,6 +262,9 @@ pub fn pvpad_write(h: &mut VmHarness, addr: u64, value: u32) {
         // Drain inside the frame-boundary exit: the FrameMark record
         // preceding this write is guaranteed visible (ARCHITECTURE.md §2).
         h.drain();
+        h.observed
+            .frame_boundary_event_counts
+            .push((frame, h.observed.events.len()));
     }
 }
 
@@ -328,5 +371,38 @@ mod tests {
         pv.schedule(1, 7, 0xDEAD);
         write_frame_counter(&mut pv, 1);
         assert_eq!(pv.pads, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn decoded_pad_set_validates_port_and_frame_before_scheduling() {
+        let mut pv = fresh_pvpad();
+        pv.frame_counter = 4;
+        assert_eq!(
+            pv.apply_decoded(DecodedPadSet {
+                at_frame: 5,
+                port: 4,
+                buttons: 1,
+            }),
+            Err(PadSetError::InvalidPort(4))
+        );
+        assert_eq!(
+            pv.apply_decoded(DecodedPadSet {
+                at_frame: 4,
+                port: 0,
+                buttons: 1,
+            }),
+            Err(PadSetError::PastFrame {
+                current: 4,
+                requested: 4
+            })
+        );
+        pv.apply_decoded(DecodedPadSet {
+            at_frame: 5,
+            port: 3,
+            buttons: 0x55,
+        })
+        .unwrap();
+        write_frame_counter(&mut pv, 5);
+        assert_eq!(pv.pads[3], 0x55);
     }
 }

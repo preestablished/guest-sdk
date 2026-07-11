@@ -13,7 +13,8 @@ use std::process::Command as Proc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use detguest_host::SinkOp;
+use detguest_host::{OwnedPayload, SinkOp};
+use detguest_vmtest::harness::pio::{DecodedPadSet, PadSetError};
 use detguest_vmtest::harness::snapshot::VmSnapshot;
 use detguest_vmtest::harness::{Observed, StopReason, VmConfig, VmHarness};
 use detguest_wire::events::{decode_command, decode_workload_ctrl};
@@ -389,6 +390,150 @@ fn snapshot_restore_is_deterministic() {
     assert_ne!(
         regions_a[0], regions_c[0],
         "different input schedules must steer wram differently"
+    );
+}
+
+/// Ms3 decoded PAD_SET → latch → workload poll acceptance. The workload
+/// polls all four ports once per frame and emits `m3.input.v1`; the harness
+/// records the matching MMIO reads and frame-boundary drain prefix.
+#[test]
+#[ignore = "KVM tier: Intel runner only (DETGUEST_VM_TESTS=1)"]
+fn decoded_pad_sets_land_at_frame_and_match_once_per_frame_polls() {
+    if !gated() {
+        return;
+    }
+    let mut root = boot_to_warmup();
+    let snap = root.snapshot().expect("input acceptance snapshot");
+    drop(root);
+
+    let cfg = m4_config();
+    let schedule = |child: &mut VmHarness, shift: u32| {
+        let base = child.pvpad().frame_counter;
+        let records = [
+            DecodedPadSet {
+                at_frame: base + 1 + shift,
+                port: 0,
+                buttons: 0x11,
+            },
+            DecodedPadSet {
+                at_frame: base + 2 + shift,
+                port: 0,
+                buttons: 0x22,
+            },
+            // Same frame/port: decoded order is canonical, latest wins.
+            DecodedPadSet {
+                at_frame: base + 2 + shift,
+                port: 0,
+                buttons: 0x23,
+            },
+            DecodedPadSet {
+                at_frame: base + 3 + shift,
+                port: 1,
+                buttons: 0x101,
+            },
+            DecodedPadSet {
+                at_frame: base + 5 + shift,
+                port: 2,
+                buttons: 0x202,
+            },
+            DecodedPadSet {
+                at_frame: base + 5 + shift,
+                port: 3,
+                buttons: 0x303,
+            },
+        ];
+        for record in records {
+            child.pvpad().apply_decoded(record).unwrap();
+        }
+        base
+    };
+
+    let run = |shift| {
+        let mut child = VmHarness::from_snapshot(&cfg, &snap).expect("input child");
+        let base = schedule(&mut child, shift);
+        run_child_frames(&mut child, 6 + shift as usize);
+        (base, child)
+    };
+    let (base, child) = run(0);
+
+    let reads: Vec<_> = child
+        .observed
+        .pvpad_reads
+        .iter()
+        .copied()
+        .filter(|(frame, _, _)| (*frame > base) && (*frame <= base + 5))
+        .collect();
+    assert_eq!(reads.len(), 5 * 4, "exactly one read per port/frame");
+    for frame in base + 1..=base + 5 {
+        for port in 0..4 {
+            assert_eq!(
+                reads
+                    .iter()
+                    .filter(|&&(f, p, _)| f == frame && p == port)
+                    .count(),
+                1,
+                "frame {frame} port {port} poll count"
+            );
+        }
+    }
+    let value = |frame, port| {
+        reads
+            .iter()
+            .find_map(|&(f, p, value)| (f == frame && p == port).then_some(value))
+            .unwrap()
+    };
+    assert_eq!(value(base + 1, 0), 0x11);
+    assert_eq!(value(base + 2, 0), 0x23);
+    assert_eq!(value(base + 4, 0), 0x23, "held through sparse frame");
+    assert_eq!(value(base + 3, 1), 0x101);
+    assert_eq!(value(base + 5, 2), 0x202);
+    assert_eq!(value(base + 5, 3), 0x303);
+
+    for &(frame, port, value) in &reads {
+        let expected = format!("m3.input.v1 frame={frame} port={port} value={value}");
+        assert!(
+            child.observed.events.iter().any(|event| {
+                matches!(
+                    &event.payload,
+                    OwnedPayload::LogLine { msg, .. } if msg == expected.as_bytes()
+                )
+            }),
+            "missing workload poll log {expected}"
+        );
+    }
+    assert!(
+        child.sink.ops.iter().all(|op| !matches!(
+            op,
+            SinkOp::RingPush {
+                ring: RingId::I,
+                ..
+            }
+        )),
+        "PAD_SET/input data must never enter control ring I"
+    );
+    for &(frame, event_count) in &child.observed.frame_boundary_event_counts {
+        assert!(child.observed.events[..event_count].iter().any(|event| {
+            matches!(event.payload, OwnedPayload::FrameMark { frame_index } if frame_index == frame)
+        }), "FrameMark({frame}) must drain before FRAME_COUNTER({frame})");
+    }
+
+    let (_, repeat) = run(0);
+    assert_eq!(repeat.observed.pvpad_reads, child.observed.pvpad_reads);
+    let (_, shifted) = run(1);
+    assert_ne!(
+        shifted.observed.pvpad_reads, child.observed.pvpad_reads,
+        "shifted at_frame negative must change the observation trace"
+    );
+
+    let mut invalid = VmHarness::from_snapshot(&cfg, &snap).expect("invalid child");
+    let invalid_frame = invalid.pvpad().frame_counter + 1;
+    assert_eq!(
+        invalid.pvpad().apply_decoded(DecodedPadSet {
+            at_frame: invalid_frame,
+            port: 7,
+            buttons: 1,
+        }),
+        Err(PadSetError::InvalidPort(7))
     );
 }
 

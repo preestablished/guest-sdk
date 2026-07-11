@@ -88,7 +88,15 @@ fn run_frame_loop() -> ! {
         // One pad poll per frame; every consumed input feeds both the
         // accumulator and the input-history hash (hosts recompute the hash
         // from the schedule, warm-up zeros included).
-        let input = sdk::poll_input(0);
+        let mut inputs = [0u32; 4];
+        for (port, value) in inputs.iter_mut().enumerate() {
+            *value = sdk::poll_input(port as u8);
+            sdk::log_line(
+                LogLevel::Info,
+                &format!("m3.input.v1 frame={frame} port={port} value={value}"),
+            );
+        }
+        let input = inputs[0];
         log_inject(frame, "ms5.io.read", sdk::inject_point("ms5.io.read"));
         for byte in input.to_le_bytes() {
             input_hash = (input_hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
