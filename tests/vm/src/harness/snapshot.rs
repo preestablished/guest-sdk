@@ -127,6 +127,22 @@ pub struct VmSnapshot {
     host_channel: Option<HostChannelState>,
 }
 
+impl VmSnapshot {
+    /// Deliberately offset the saved ring-C producer sequence.
+    ///
+    /// This negative-test seam changes only the host-side checkpoint, never
+    /// captured guest RAM. The snapshot acceptance uses it to prove that a
+    /// corrupt non-reconstructible sequence is reported as a named mismatch.
+    #[doc(hidden)]
+    pub fn corrupt_ring_c_producer_seq_for_test(&mut self, delta: u32) {
+        let state = self
+            .host_channel
+            .as_mut()
+            .expect("snapshot has no attached channel");
+        state.producer_seqs.ring_c = state.producer_seqs.ring_c.wrapping_add(delta);
+    }
+}
+
 /// Assert that plain `kvm_xsave` get/set is sound on this vCPU: with dynamic
 /// XSTATE features (e.g. AMX) enabled, the kernel's xsave area outgrows the
 /// fixed 4096-byte struct and `set_xsave` would write out of bounds.

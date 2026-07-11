@@ -13,8 +13,11 @@ use std::process::Command as Proc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use detguest_host::SinkOp;
 use detguest_vmtest::harness::snapshot::VmSnapshot;
 use detguest_vmtest::harness::{Observed, StopReason, VmConfig, VmHarness};
+use detguest_wire::events::{decode_command, decode_workload_ctrl};
+use detguest_wire::{Command, RingId, WorkloadCtrl};
 
 /// Warm-up boundary: the root runs to this FRAME_COUNTER value before the
 /// snapshot is taken.
@@ -242,6 +245,110 @@ fn snapshot_restore_guest_still_runs() {
             "guest {bad} after restore; serial:\n{serial}"
         );
     }
+}
+
+/// Host-produced C/I sequences live outside guest RAM. Restored branches
+/// must continue both streams without a reset, duplicate, or gap, and must
+/// emit byte-identical mutation traces from the same root checkpoint.
+#[test]
+#[ignore = "KVM tier: Intel runner only (DETGUEST_VM_TESTS=1)"]
+fn restored_branches_continue_channel_sequences_without_duplicates() {
+    if !gated() {
+        return;
+    }
+
+    let mut root = boot_to_warmup();
+    let command = Command::SetLogMask { mask: 0x5a5a_1234 };
+    let control = WorkloadCtrl::QuiesceReq { token: 0x1020_3040 };
+    root.channel
+        .as_mut()
+        .unwrap()
+        .push_command(&command, &mut root.sink)
+        .expect("root ring-C push");
+    root.channel
+        .as_mut()
+        .unwrap()
+        .push_workload_ctrl(&control, &mut root.sink)
+        .expect("root ring-I push");
+    let checkpoint = root.channel.as_ref().unwrap().producer_seqs();
+    assert!(checkpoint.ring_c > 0 && checkpoint.ring_i > 0);
+    let mut snap = root.snapshot().expect("channel checkpoint snapshot");
+    drop(root);
+
+    let push_after_restore = |snapshot: &VmSnapshot| {
+        let mut child = VmHarness::from_snapshot(&m4_config(), snapshot).expect("child restore");
+        child
+            .channel
+            .as_mut()
+            .unwrap()
+            .push_command(&command, &mut child.sink)
+            .expect("child ring-C push");
+        child
+            .channel
+            .as_mut()
+            .unwrap()
+            .push_workload_ctrl(&control, &mut child.sink)
+            .expect("child ring-I push");
+        child.sink.ops
+    };
+
+    let trace_a = push_after_restore(&snap);
+    let trace_b = push_after_restore(&snap);
+    assert_eq!(trace_a, trace_b, "restored child mutation traces differ");
+    assert_eq!(
+        trace_a.len(),
+        2,
+        "later records must be emitted exactly once"
+    );
+
+    let c_bytes = match &trace_a[0] {
+        SinkOp::RingPush {
+            ring: RingId::C,
+            bytes,
+            ..
+        } => bytes,
+        other => panic!("expected ring-C push first, got {other:?}"),
+    };
+    let (c_header, decoded) = decode_command(c_bytes).expect("decode restored command");
+    assert_eq!(decoded, command);
+    assert_eq!(
+        c_header.seq, checkpoint.ring_c,
+        "ring-C restored sequence mismatch"
+    );
+
+    let i_bytes = match &trace_a[1] {
+        SinkOp::RingPush {
+            ring: RingId::I,
+            bytes,
+            ..
+        } => bytes,
+        other => panic!("expected ring-I push second, got {other:?}"),
+    };
+    let (i_header, decoded) = decode_workload_ctrl(i_bytes).expect("decode restored control");
+    assert_eq!(decoded, control);
+    assert_eq!(
+        i_header.seq, checkpoint.ring_i,
+        "ring-I restored sequence mismatch"
+    );
+
+    snap.corrupt_ring_c_producer_seq_for_test(1);
+    let corrupt_trace = push_after_restore(&snap);
+    let corrupt_bytes = match &corrupt_trace[0] {
+        SinkOp::RingPush {
+            ring: RingId::C,
+            bytes,
+            ..
+        } => bytes,
+        other => panic!("expected corrupt ring-C push first, got {other:?}"),
+    };
+    let corrupt_seq = decode_command(corrupt_bytes)
+        .expect("decode corrupt command")
+        .0
+        .seq;
+    let mismatch = (corrupt_seq != checkpoint.ring_c)
+        .then_some("ring-C restored sequence mismatch")
+        .expect("corrupt checkpoint must be detected");
+    assert_eq!(mismatch, "ring-C restored sequence mismatch");
 }
 
 /// Plan 05 validation test 2: two children from one root with identical
