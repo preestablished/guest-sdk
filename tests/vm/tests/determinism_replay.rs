@@ -504,7 +504,7 @@ fn seed_fault_plan(seed: u32) -> TableFaultPlan {
     let mut rng = Rng::new(seed);
     TableFaultPlan::new(vec![
         FaultRule {
-            name_glob: "ms5.frame.*".into(),
+            name_glob: "ms5.frame.begin".into(),
             occurrence: None,
             decision: FaultDecision::Proceed,
         },
@@ -517,7 +517,7 @@ fn seed_fault_plan(seed: u32) -> TableFaultPlan {
             },
         },
         FaultRule {
-            name_glob: "ms5.io.write".into(),
+            name_glob: "ms5.frame.end".into(),
             occurrence: None,
             decision: FaultDecision::Workload {
                 kind: 64 + (rng.next() % 192) as u8,
