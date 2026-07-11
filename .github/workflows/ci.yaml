@@ -152,6 +152,11 @@ jobs:
           repository: preestablished/reference-workload
           ref: 7b0c7b2434e71d8b3241bf78597be457b281292d
           path: reference-workload
+      - uses: actions/checkout@v4
+        with:
+          repository: preestablished/determinism-hypervisor
+          ref: 6e348e5961b8ba81d91b7bdd4f79af102b809649
+          path: determinism-hypervisor
       # The runner service env does not source the user profile; rustup's
       # bin dir must be added explicitly or the preflight cargo gate fails.
       - name: Configure runner paths
@@ -180,6 +185,13 @@ jobs:
             595466463a37efac6822ffccf3e61d0a2230e7d223a94c0bce5eb78b2f43bee9
           zstd -d -f "$dist/initramfs.cpio.zst" \
             -o "$DETGUEST_EVIDENCE_DIR/refwork-initramfs.cpio"
+          test "$(git -C ../determinism-hypervisor rev-parse HEAD)" = \
+            6e348e5961b8ba81d91b7bdd4f79af102b809649
+          dhilog=../determinism-hypervisor/crates/dh-worker/tests/fixtures/record_replay_corpus/pad_echo_6s/recording.dhilog
+          test "$(b3sum "$dhilog" | cut -d' ' -f1)" = \
+            f6301f544ff1a0bc232688e232332e1d06a1e9d6cf3eac9d52b026bc1269718a
+          cargo run --quiet --manifest-path tools/dh-padset-export/Cargo.toml -- "$dhilog" \
+            > "$DETGUEST_EVIDENCE_DIR/dh-padset-decoded.txt"
           kernel_cache=/home/infra-admin/git/preestablished/guest-sdk/image/build
           test "$(b3sum "$kernel_cache/bzImage" | cut -d' ' -f1)" = \
             595466463a37efac6822ffccf3e61d0a2230e7d223a94c0bce5eb78b2f43bee9
@@ -213,6 +225,8 @@ jobs:
             -- --ignored --exact --nocapture --test-threads=1 \
             2>&1 | tee "$DETGUEST_EVIDENCE_DIR/m3-golden-events.log"
       - name: Ms3 decoded PAD_SET path
+        env:
+          DETGUEST_DECODED_PADSET_FILE: ${{ runner.temp }}/guest-sdk-evidence/${{ github.run_id }}-${{ github.run_attempt }}/dh-padset-decoded.txt
         run: |
           set -o pipefail
           timeout 5m env DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest \

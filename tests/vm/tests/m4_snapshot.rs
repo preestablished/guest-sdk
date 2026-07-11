@@ -537,6 +537,71 @@ fn decoded_pad_sets_land_at_frame_and_match_once_per_frame_polls() {
     );
 }
 
+#[test]
+#[ignore = "KVM + upstream dh-inputlog artifact (DETGUEST_VM_TESTS=1)"]
+fn upstream_dhilog_pad_sets_drive_exact_guest_polls() {
+    if !gated() {
+        return;
+    }
+    let path = std::env::var("DETGUEST_DECODED_PADSET_FILE")
+        .expect("CI must provide dh-inputlog-decoded PAD_SET artifact");
+    let decoded = std::fs::read_to_string(&path).expect("read decoded PAD_SET artifact");
+    let records: Vec<DecodedPadSet> = decoded
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .map(|line| {
+            let mut fields = line.split(',');
+            let at_frame = fields.next().unwrap().parse().unwrap();
+            let port = fields.next().unwrap().parse().unwrap();
+            let buttons = fields.next().unwrap().parse().unwrap();
+            assert!(fields.next().is_none(), "exactly three decoded fields");
+            DecodedPadSet {
+                at_frame,
+                port,
+                buttons,
+            }
+        })
+        .collect();
+    assert_eq!(records.len(), 5, "pinned corpus PAD_SET count");
+    assert_eq!(records.first().unwrap().at_frame, 1);
+    assert_eq!(records.last().unwrap().at_frame, 5);
+
+    let cfg = m4_config();
+    let mut vm = VmHarness::new(&cfg).expect("upstream input VM");
+    for &record in &records {
+        vm.pvpad().apply_decoded(record).unwrap();
+    }
+    run_child_frames(&mut vm, 6);
+    for record in records {
+        assert_eq!(
+            vm.observed
+                .pvpad_reads
+                .iter()
+                .filter(|&&(frame, port, value)| {
+                    frame == record.at_frame && port == record.port && value == record.buttons
+                })
+                .count(),
+            1,
+            "decoded PAD_SET must match exactly one guest poll: {record:?}"
+        );
+        let expected = format!(
+            "m3.input.v1 frame={} port={} value={}",
+            record.at_frame, record.port, record.buttons
+        );
+        assert!(vm.observed.events.iter().any(|event| matches!(
+            &event.payload,
+            OwnedPayload::LogLine { msg, .. } if msg == expected.as_bytes()
+        )));
+    }
+    assert!(vm.sink.ops.iter().all(|op| !matches!(
+        op,
+        SinkOp::RingPush {
+            ring: RingId::I,
+            ..
+        }
+    )));
+}
+
 /// Plan 05 validation test 3: running a child never mutates the root
 /// snapshot — a later child still starts from identical region bytes.
 #[test]

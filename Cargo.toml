@@ -19,7 +19,7 @@ members = [
 # The fuzz crate is excluded: it needs nightly + libfuzzer and must not enter
 # the default hosted `cargo test --workspace` lanes. It is its own workspace
 # root; build it with `cargo +nightly fuzz run decode_record` from fuzz/.
-exclude = ["fuzz"]
+exclude = ["fuzz", "tools/dh-padset-export"]
 
 [workspace.package]
 version = "0.1.0"
