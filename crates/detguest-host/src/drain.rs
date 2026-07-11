@@ -23,6 +23,11 @@ pub struct GuestEvent {
     pub vnanos: u64,
     /// Header TRUNCATED flag (details/msg clipped at its cap).
     pub truncated: bool,
+    /// Complete canonical record bytes as drained from guest memory.
+    ///
+    /// This preserves the byte-for-byte event-stream acceptance surface;
+    /// decoded payloads alone can hide framing or reserved-byte drift.
+    pub raw_record: Vec<u8>,
     /// The decoded payload (owned).
     pub payload: OwnedPayload,
 }
@@ -299,6 +304,7 @@ impl<M: GuestMem> Channel<M> {
                             seq: hdr.seq,
                             vnanos: hdr.vnanos,
                             truncated: hdr.flags & FLAG_TRUNCATED != 0,
+                            raw_record: rec[..len as usize].to_vec(),
                             payload: owned,
                         });
                     }

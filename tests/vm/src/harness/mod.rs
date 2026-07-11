@@ -402,6 +402,28 @@ impl VmHarness {
         &self.guest_mem
     }
 
+    /// FNV-1a-64 over all configured guest RAM, in ascending GPA order.
+    ///
+    /// The acceptance includes the entire `VmConfig::mem_size` range; there
+    /// are no excluded pages or decoded/canonicalized structures.
+    pub fn guest_ram_hash(&self) -> io::Result<u64> {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut offset = 0u64;
+        let mut chunk = vec![0u8; 1 << 20];
+        while offset < self.mem.len() as u64 {
+            let len = chunk.len().min(self.mem.len() - offset as usize);
+            self.guest_mem
+                .read_slice(&mut chunk[..len], GuestAddress(offset))
+                .map_err(|e| io::Error::other(format!("guest RAM hash read: {e}")))?;
+            for &byte in &chunk[..len] {
+                hash ^= byte as u64;
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            offset += len as u64;
+        }
+        Ok(hash)
+    }
+
     /// Drain channel events into `observed` (pause-boundary or doorbell).
     pub fn drain(&mut self) {
         if let Some(ch) = self.channel.as_mut() {

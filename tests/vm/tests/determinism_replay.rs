@@ -1,11 +1,8 @@
-//! Ms5 `determinism_replay` gate scaffold
-//! (`guest-sdk-m5-determinism-replay-ci-gate`, staged by the
-//! phase3-ms5-groundwork-while-blocked round).
+//! Ms5 live `determinism_replay` gate.
 //!
-//! Surface ownership (see `detguest_vmtest::replay` module doc): the
-//! hypervisor's `VerifyReplay` proves RAM/framebuffer bit-identity
-//! (DRL-4/DRL-5); this gate owns S1–S4 (ring C/I pushes, ring A/W consumer
-//! bumps, pio answers, SDK event/drop-counter equivalence).
+//! The authoritative equality surfaces are final guest RAM, complete drained
+//! event bytes, drop counters, and workload-echoed inject decisions. S1–S4
+//! mutation digests remain diagnostics.
 //!
 //! Two tiers:
 //!
@@ -20,70 +17,28 @@
 //!   `DETGUEST_VM_TESTS=1`), lane invocation
 //!   `DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest --test
 //!   determinism_replay -- --ignored --test-threads=1`. Seeded, chunked,
-//!   resumable via env knobs: `DETGUEST_REPLAY_ITERS` (default 2 — lane
-//!   smoke; round 2's acceptance raises it to 1000),
-//!   `DETGUEST_REPLAY_SEED_BASE` (default 0), `DETGUEST_REPLAY_RESUME_AT`
-//!   (default 0).
-//!
-//! **Stub marker: `MS5-STUB`** — grep for it to enumerate exactly what
-//! round 2 (`phase3-ms5-execution-in-vm-closeout`) fills. Each stub panics
-//! with its awaited round-2 item + grounding checklist ID, so a stub
-//! reached is loud, never silently green. No stub sits on the ungated
-//! self-test path. `DETGUEST_REPLAY_EXERCISE_STUBS=<inject|ingest|crosscheck>`
-//! reaches the named stub from the gated leg (proving loudness); the
-//! default lane run does not reach them.
+//!   resumable via explicit `DETGUEST_REPLAY_START_ITER` plus
+//!   `DETGUEST_REPLAY_ITER_COUNT`; durable runs also use the evidence
+//!   manifest as the only continuation cursor.
 
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use detguest_host::{
     Channel, DropCounters, FaultRule, GuestEvent, InjectResponder, LogFaultPlan, LoggedDecision,
     MockGuestMem, RecordingSink, SinkOp, TableFaultPlan,
 };
 use detguest_vmtest::harness::snapshot::VmSnapshot;
-use detguest_vmtest::harness::{HarnessFaultPlan, Observed, StopReason, VmConfig, VmHarness};
-use detguest_vmtest::replay::{assert_digests_equal, digest_from_trace, RunDigest};
+use detguest_vmtest::harness::{HarnessFaultPlan, StopReason, VmConfig, VmHarness};
+use detguest_vmtest::replay::{
+    assert_digests_equal, digest_from_trace, drop_counter_hash, inject_log_hash,
+    raw_event_stream_hash, RunDigest,
+};
 use detguest_wire::events::{encode_event, encoded_event_len, Command, EventPayload};
 use detguest_wire::header::{ChannelHeader, CHANNEL_SIZE, OFF_RESERVED};
 use detguest_wire::{FaultDecision, RingId};
-
-// ---------------------------------------------------------------------------
-// Round-2 stubs (MS5-STUB). Fill these in phase3-ms5-execution-in-vm-closeout;
-// their call sites in the gated leg are marked.
-// ---------------------------------------------------------------------------
-
-/// Workload-side `inject_point` call sites in a VM workload bin: today the
-/// m4 fixture workload makes zero inject queries, so the in-VM legs compare
-/// an empty S3 surface. Round 2 extends testload and re-points the fixture.
-fn stub_workload_inject_call_sites() -> ! {
-    panic!(
-        "MS5-STUB: workload-side inject_point call sites in a VM workload bin — \
-         awaits m5-vm-inject-roundtrip (round-2 item 1); grounded by ILDE-6"
-    );
-}
-
-/// Real-recorded decision ingestion: DHILOG-decoded decisions into
-/// `LogFaultPlan` (decoding stays hypervisor-owned; this repo consumes
-/// decoded `LoggedDecision`s).
-fn stub_ingest_recorded_decisions() -> ! {
-    panic!(
-        "MS5-STUB: real-recorded decision ingestion (DHILOG-decoded decisions into \
-         LogFaultPlan) — awaits round-2 item 1's DHILOG-backed completion; \
-         grounded by ILDE-1..6"
-    );
-}
-
-/// Cross-check the guest-sdk S1–S4 digests against the hypervisor's
-/// `VerifyReplay` end-state hashes for the same run.
-fn stub_cross_check_verify_replay() -> ! {
-    panic!(
-        "MS5-STUB: cross-check against hypervisor VerifyReplay end-state hashes — \
-         awaits round-2 item 2 (the 1000-iteration gate execution); grounded by \
-         DRL-4/DRL-5"
-    );
-}
 
 // ---------------------------------------------------------------------------
 // Ungated self-test fixture: a host-only channel driven through a scripted,
@@ -390,9 +345,6 @@ fn same_seed_record_legs_are_bit_identical() {
 // the file header). Boot machinery follows m4_snapshot.rs.
 // ---------------------------------------------------------------------------
 
-const WARMUP_FRAME: u32 = 8;
-const CHILD_FRAMES: usize = 10;
-
 fn gated() -> bool {
     if !detguest_vmtest::vm_tests_enabled() {
         eprintln!("skipping: DETGUEST_VM_TESTS != 1");
@@ -421,13 +373,13 @@ fn repo_root() -> PathBuf {
 
 struct Artifacts {
     bzimage: PathBuf,
-    initramfs_m4: PathBuf,
+    initramfs: PathBuf,
 }
 
 static ARTIFACTS: OnceLock<Artifacts> = OnceLock::new();
 
-/// Same recipe as `m4_snapshot.rs::artifacts` (the m4-regions fixture is the
-/// boot-or-restore substrate until round 2 lands an inject-calling workload).
+/// No-autostart image containing the canonical inject-calling workload. The
+/// root snapshot is taken at Ready; each child launches unit 0 independently.
 fn artifacts() -> &'static Artifacts {
     ARTIFACTS.get_or_init(|| {
         let root = repo_root();
@@ -449,16 +401,16 @@ fn artifacts() -> &'static Artifacts {
 
         let musl = root.join("target/x86_64-unknown-linux-musl/release");
         let build = root.join("image/build");
-        let dir = build.join("m5-stage-replay");
+        let dir = build.join("m5-stage-replay-live");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sbin")).unwrap();
         std::fs::create_dir_all(dir.join("opt")).unwrap();
         std::fs::create_dir_all(dir.join("etc/detguest")).unwrap();
         std::fs::copy(musl.join("detguest-agent"), dir.join("sbin/detguest-agent")).unwrap();
-        std::fs::copy(musl.join("m4-regions"), dir.join("opt/m4-regions")).unwrap();
-        std::fs::copy(
-            root.join("image/boot.toml.m4-regions"),
+        std::fs::copy(musl.join("testload"), dir.join("opt/testload")).unwrap();
+        std::fs::write(
             dir.join("etc/detguest/boot.toml"),
+            "boot_toml_version = 1\n\n[[unit]]\nid = 0\nexec = \"/opt/testload\"\nargs = [\"--inject-roundtrip\"]\n",
         )
         .unwrap();
         run(
@@ -470,7 +422,7 @@ fn artifacts() -> &'static Artifacts {
         std::fs::rename(build.join("initramfs.cpio"), &out_path).unwrap();
         Artifacts {
             bzimage: build.join("bzImage"),
-            initramfs_m4: out_path,
+            initramfs: out_path,
         }
     })
 }
@@ -486,127 +438,248 @@ fn run(cwd: &Path, prog: &str, args: &[&str]) {
 
 fn m5_config() -> VmConfig {
     let a = artifacts();
-    VmConfig::new(a.bzimage.clone(), a.initramfs_m4.clone())
+    VmConfig::new(a.bzimage.clone(), a.initramfs.clone())
 }
 
-fn boot_to_warmup() -> VmHarness {
+fn boot_to_ready() -> VmHarness {
     let cfg = m5_config();
     let mut vm = VmHarness::new(&cfg).expect("harness build");
     let reason = vm
         .run_until(Duration::from_secs(120), |o| {
-            o.frame_counter_writes
-                .last()
-                .is_some_and(|&v| v >= WARMUP_FRAME)
+            o.events.iter().any(|event| {
+                matches!(
+                    event.payload,
+                    detguest_host::OwnedPayload::Ready { unit: u32::MAX, .. }
+                )
+            })
         })
         .expect("run to warm-up");
     assert_eq!(
         reason,
         StopReason::Predicate,
-        "expected frame {WARMUP_FRAME} before stop/timeout; serial:\n{}",
+        "expected no-autostart Ready before stop/timeout; serial:\n{}",
         vm.serial_text()
     );
     assert!(vm.channel.is_some(), "channel attached");
     vm
 }
 
-/// Seed-derived fault plan for a child leg. Installed on every child; zero
-/// decisions fire until round 2 lands workload-side inject_point call sites
-/// (see `stub_workload_inject_call_sites`).
+/// Seed-derived plan with structural coverage of all decision classes.
 fn seed_fault_plan(seed: u32) -> TableFaultPlan {
     let mut rng = Rng::new(seed);
-    TableFaultPlan::new(
-        POINT_NAMES
-            .iter()
-            .map(|name| FaultRule {
-                name_glob: format!("{name}*"),
-                occurrence: None,
-                decision: match rng.next() % 3 {
-                    0 => FaultDecision::Proceed,
-                    1 => FaultDecision::Platform {
-                        kind: 1 + (rng.next() % 63) as u8,
-                        arg: rng.next() & 0x00ff_ffff,
-                    },
-                    _ => FaultDecision::Workload {
-                        kind: 64 + (rng.next() % 192) as u8,
-                        arg: rng.next() & 0x00ff_ffff,
-                    },
-                },
-            })
-            .collect(),
-    )
+    TableFaultPlan::new(vec![
+        FaultRule {
+            name_glob: "ms5.frame.*".into(),
+            occurrence: None,
+            decision: FaultDecision::Proceed,
+        },
+        FaultRule {
+            name_glob: "ms5.io.read".into(),
+            occurrence: None,
+            decision: FaultDecision::Platform {
+                kind: 1 + (rng.next() % 63) as u8,
+                arg: rng.next() & 0x00ff_ffff,
+            },
+        },
+        FaultRule {
+            name_glob: "ms5.io.write".into(),
+            occurrence: None,
+            decision: FaultDecision::Workload {
+                kind: 64 + (rng.next() % 192) as u8,
+                arg: rng.next() & 0x00ff_ffff,
+            },
+        },
+    ])
 }
 
-/// One in-VM leg: restore a child from the root snapshot, install the
-/// seed-derived fault plan, drive a seed-derived input-burst schedule (the
-/// m4 pv-pad scheduling pattern), run frames, fold the digest.
-fn vm_leg_digest(cfg: &VmConfig, snap: &VmSnapshot, seed: u32) -> RunDigest {
-    let mut child = VmHarness::from_snapshot(cfg, snap).expect("child build");
-    child.responder = InjectResponder::new(HarnessFaultPlan::Table(seed_fault_plan(seed)));
-    let mut rng = Rng::new(seed);
-    let base = child.pvpad().frame_counter;
-    for i in 0..CHILD_FRAMES as u32 {
-        let value = rng.next();
-        child.pvpad().schedule(base + 1 + i, 0, value);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthoritativeSurfaces {
+    final_guest_ram: u64,
+    drained_events: u64,
+    drop_counters: u64,
+    inject_decisions: u64,
+}
+
+struct VmLeg {
+    diagnostics: RunDigest,
+    surfaces: AuthoritativeSurfaces,
+    queries: Vec<(u32, u32)>,
+    decisions: Vec<LoggedDecision>,
+    divergences: usize,
+    fault_class_counts: [u32; 3],
+}
+
+fn assert_surfaces_equal(
+    record: AuthoritativeSurfaces,
+    replay: AuthoritativeSurfaces,
+) -> Result<(), &'static str> {
+    for (name, a, b) in [
+        (
+            "final guest RAM",
+            record.final_guest_ram,
+            replay.final_guest_ram,
+        ),
+        (
+            "complete drained event stream",
+            record.drained_events,
+            replay.drained_events,
+        ),
+        ("drop counters", record.drop_counters, replay.drop_counters),
+        (
+            "inject decision LogLines",
+            record.inject_decisions,
+            replay.inject_decisions,
+        ),
+    ] {
+        if a != b {
+            return Err(name);
+        }
     }
+    Ok(())
+}
+
+/// Restore and execute one record or decoded-log replay child.
+fn vm_leg(
+    cfg: &VmConfig,
+    snap: &VmSnapshot,
+    seed: u32,
+    replay_log: Option<Vec<LoggedDecision>>,
+) -> VmLeg {
+    let mut child = VmHarness::from_snapshot(cfg, snap).expect("child build");
+    let mut rng = Rng::new(seed);
+    child.pvpad().set_pad(0, rng.next());
+    child.pvpad().schedule(1, 0, rng.next());
+    child.responder = match replay_log {
+        Some(log) => InjectResponder::new(HarnessFaultPlan::Log(LogFaultPlan::new(log))),
+        None => InjectResponder::new(HarnessFaultPlan::Table(seed_fault_plan(seed))),
+    };
+    child.push_command(&Command::StartWorkload {
+        unit: 0,
+        log_mask: 0x1f,
+    });
     let reason = child
-        .run_until(Duration::from_secs(60), |o: &Observed| {
-            o.frame_counter_writes.len() >= CHILD_FRAMES
+        .run_until(Duration::from_secs(60), |o| {
+            o.events.iter().any(|event| {
+                matches!(
+                    event.payload,
+                    detguest_host::OwnedPayload::WorkloadExited {
+                        exit_code: 0,
+                        term_signal: 0,
+                        ..
+                    }
+                )
+            })
         })
         .expect("child run");
     assert_eq!(
         reason,
         StopReason::Predicate,
-        "child must advance {CHILD_FRAMES} frames; serial:\n{}",
+        "child workload must exit; serial:\n{}",
         child.serial_text()
     );
-    let drops = child
-        .channel
-        .as_ref()
-        .expect("channel attached")
-        .drop_counters()
-        .expect("drop counters readable");
-    digest_from_trace(&child.sink.ops, &child.observed.events, &drops)
+    let drops = child.channel.as_ref().unwrap().drop_counters().unwrap();
+    let queries: Vec<_> = child
+        .observed
+        .events
+        .iter()
+        .filter_map(|event| match event.payload {
+            detguest_host::OwnedPayload::InjectQuery { iseq, name_id } => Some((iseq, name_id)),
+            _ => None,
+        })
+        .collect();
+    let diagnostics = digest_from_trace(&child.sink.ops, &child.observed.events, &drops);
+    let surfaces = AuthoritativeSurfaces {
+        final_guest_ram: child.guest_ram_hash().expect("hash all guest RAM"),
+        drained_events: raw_event_stream_hash(&child.observed.events),
+        drop_counters: drop_counter_hash(&drops),
+        inject_decisions: inject_log_hash(&child.observed.events),
+    };
+    let (decisions, divergences) = match child.responder.plan_mut() {
+        HarnessFaultPlan::Table(table) => {
+            let decisions = table
+                .decisions
+                .iter()
+                .zip(&queries)
+                .map(|(&(iseq, decision), &(query_iseq, name_id))| {
+                    assert_eq!(iseq, query_iseq);
+                    LoggedDecision {
+                        iseq,
+                        name_id,
+                        decision,
+                    }
+                })
+                .collect();
+            (decisions, 0)
+        }
+        HarnessFaultPlan::Log(log) => (Vec::new(), log.divergences().len() + log.remaining()),
+    };
+    assert_eq!(queries.len(), 6, "canonical fixture query count");
+    let mut fault_class_counts = [0; 3];
+    for op in &child.sink.ops {
+        if let SinkOp::PioAnswer { value, .. } = op {
+            let class = match FaultDecision::unpack(*value) {
+                FaultDecision::Proceed => 0,
+                FaultDecision::Platform { .. } => 1,
+                FaultDecision::Workload { .. } => 2,
+            };
+            fault_class_counts[class] += 1;
+        }
+    }
+    VmLeg {
+        diagnostics,
+        surfaces,
+        queries,
+        decisions,
+        divergences,
+        fault_class_counts,
+    }
 }
 
-/// The gate's iteration skeleton: per seed, two independently-restored
-/// children with identical seed-derived inputs and fault plans must fold
-/// bit-identical S1–S4 digests. Round 2 raises `DETGUEST_REPLAY_ITERS` to
-/// 1000 and fills the MS5-STUB call sites below (record leg with live
-/// inject decisions → replay leg from the recorded log → VerifyReplay
-/// cross-check).
 #[test]
 #[ignore = "KVM tier: Intel runner only (DETGUEST_VM_TESTS=1)"]
 fn determinism_replay_seeded_iterations_are_bit_identical() {
     if !gated() {
         return;
     }
-    let iters = env_u32("DETGUEST_REPLAY_ITERS", 2);
+    let start = env_u32("DETGUEST_REPLAY_START_ITER", 0);
+    let count = env_u32("DETGUEST_REPLAY_ITER_COUNT", 2);
     let seed_base = env_u32("DETGUEST_REPLAY_SEED_BASE", 0);
-    let resume_at = env_u32("DETGUEST_REPLAY_RESUME_AT", 0);
+    let end = start.checked_add(count).expect("iteration range overflow");
 
     let cfg = m5_config();
-    let mut root = boot_to_warmup();
+    let mut root = boot_to_ready();
     let snap = root.snapshot().expect("snapshot");
     drop(root);
 
-    for i in resume_at..iters {
+    let campaign_start = Instant::now();
+    for i in start..end {
+        let iteration_start = Instant::now();
         let seed = seed_base.wrapping_add(i);
-        let a = vm_leg_digest(&cfg, &snap, seed);
-        let b = vm_leg_digest(&cfg, &snap, seed);
-        if let Err(m) = assert_digests_equal(&a, &b) {
-            panic!("iteration {i} (seed {seed}, resume with DETGUEST_REPLAY_RESUME_AT={i}): {m}");
-        }
-        eprintln!("determinism_replay: iteration {i} (seed {seed}) bit-identical");
-
-        // MS5-STUB call sites — round 2 wires these unconditionally:
-        //   1. record leg with workload inject decisions,
-        //   2. replay leg seeded from the recorded log,
-        //   3. VerifyReplay end-state cross-check.
-        match std::env::var("DETGUEST_REPLAY_EXERCISE_STUBS").as_deref() {
-            Ok("inject") => stub_workload_inject_call_sites(),
-            Ok("ingest") => stub_ingest_recorded_decisions(),
-            Ok("crosscheck") => stub_cross_check_verify_replay(),
-            _ => {}
-        }
+        let record = vm_leg(&cfg, &snap, seed, None);
+        assert!(!record.decisions.is_empty());
+        assert!(record.fault_class_counts.iter().all(|&count| count > 0));
+        let replay = vm_leg(&cfg, &snap, seed, Some(record.decisions.clone()));
+        assert_eq!(replay.divergences, 0, "iteration {i}: log replay diverged");
+        assert_eq!(
+            replay.queries, record.queries,
+            "iteration {i}: query sequence"
+        );
+        assert_surfaces_equal(record.surfaces, replay.surfaces).unwrap_or_else(|surface| {
+            panic!(
+                "iteration {i} seed {seed}: {surface} diverged; resume with \
+                 DETGUEST_REPLAY_START_ITER={i} DETGUEST_REPLAY_ITER_COUNT=1"
+            )
+        });
+        assert_digests_equal(&record.diagnostics, &replay.diagnostics)
+            .unwrap_or_else(|m| panic!("iteration {i} diagnostic: {m}"));
+        eprintln!(
+            "determinism_replay: iteration {i} seed {seed} bit-identical in {:?}: {:?}",
+            iteration_start.elapsed(),
+            record.surfaces
+        );
     }
+    eprintln!(
+        "determinism_replay: range [{start},{end}) completed in {:?}",
+        campaign_start.elapsed()
+    );
 }

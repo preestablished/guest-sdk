@@ -241,6 +241,8 @@ fn expected_event(
     extra_flags: u8,
     ev: &EventPayload<'_>,
 ) -> GuestEvent {
+    let mut encoded = [0u8; 4096];
+    let encoded_len = encode_event(&mut encoded, seq, vnanos, extra_flags, ev).unwrap();
     let payload = match *ev {
         EventPayload::Hello {
             proto_version,
@@ -304,6 +306,7 @@ fn expected_event(
         seq,
         vnanos,
         truncated: extra_flags & FLAG_TRUNCATED != 0,
+        raw_record: encoded[..encoded_len].to_vec(),
         payload,
     }
 }

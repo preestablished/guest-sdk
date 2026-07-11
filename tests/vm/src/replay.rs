@@ -28,6 +28,45 @@ pub fn fnv1a64_lines(lines: &[String]) -> u64 {
     hash.finish()
 }
 
+/// Hash the complete drained event stream byte-for-byte, including the ring
+/// identity and canonical record framing for every event.
+pub fn raw_event_stream_hash(events: &[GuestEvent]) -> u64 {
+    let mut hash = Fnv::new();
+    for event in events {
+        hash.update(&[event.ring as u8]);
+        hash.update_u32(event.raw_record.len() as u32);
+        hash.update(&event.raw_record);
+    }
+    hash.finish()
+}
+
+/// Hash the complete canonical drop-counter structure.
+pub fn drop_counter_hash(drops: &DropCounters) -> u64 {
+    let mut hash = Fnv::new();
+    hash.update_u64(drops.ring_a_records);
+    hash.update_u64(drops.ring_a_bytes);
+    hash.update_u64(drops.ring_w_records);
+    hash.update_u64(drops.ring_w_bytes);
+    for value in drops.ring_w_by_kind {
+        hash.update_u64(value);
+    }
+    hash.finish()
+}
+
+/// Hash only the canonical workload decision-echo LogLines.
+pub fn inject_log_hash(events: &[GuestEvent]) -> u64 {
+    let mut hash = Fnv::new();
+    for event in events {
+        if let detguest_host::OwnedPayload::LogLine { msg, .. } = &event.payload {
+            if msg.starts_with(b"ms5.inject.v1 ") {
+                hash.update_u32(msg.len() as u32);
+                hash.update(msg);
+            }
+        }
+    }
+    hash.finish()
+}
+
 /// Incremental FNV-1a-64 (same constants as [`fnv1a64_lines`], usable over
 /// raw byte spans).
 struct Fnv(u64);
