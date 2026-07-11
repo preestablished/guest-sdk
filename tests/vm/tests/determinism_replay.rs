@@ -30,6 +30,9 @@ use detguest_host::{
     Channel, DropCounters, FaultRule, GuestEvent, InjectResponder, LogFaultPlan, LoggedDecision,
     MockGuestMem, RecordingSink, SinkOp, TableFaultPlan,
 };
+use detguest_vmtest::evidence::{
+    unix_ms, EvidenceWriter, IterationRecord, RunIdentity, RunRange, SurfaceDigests, SCHEMA_VERSION,
+};
 use detguest_vmtest::harness::snapshot::VmSnapshot;
 use detguest_vmtest::harness::{HarnessFaultPlan, StopReason, VmConfig, VmHarness};
 use detguest_vmtest::replay::{
@@ -364,6 +367,30 @@ fn env_u32(name: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+fn required_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("{name} is required for replay evidence"))
+}
+
+fn file_digest(path: &Path) -> String {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+fn git_sha() -> String {
+    let output = Proc::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_root())
+        .output()
+        .expect("git rev-parse HEAD");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().into()
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -643,16 +670,48 @@ fn determinism_replay_seeded_iterations_are_bit_identical() {
     }
     let start = env_u32("DETGUEST_REPLAY_START_ITER", 0);
     let count = env_u32("DETGUEST_REPLAY_ITER_COUNT", 2);
+    let total = env_u32("DETGUEST_REPLAY_TOTAL_COUNT", count);
     let seed_base = env_u32("DETGUEST_REPLAY_SEED_BASE", 0);
     let end = start.checked_add(count).expect("iteration range overflow");
+    assert!(end <= total, "chunk exceeds total campaign range");
 
     let cfg = m5_config();
+    let evidence_root = PathBuf::from(required_env("DETGUEST_REPLAY_EVIDENCE_DIR"));
+    let run_id = required_env("DETGUEST_REPLAY_RUN_ID");
+    let identity = RunIdentity {
+        runner_id: required_env("DETGUEST_REPLAY_RUNNER_ID"),
+        guest_sdk_sha: git_sha(),
+        worker_sha: required_env("DETGUEST_REPLAY_WORKER_SHA"),
+        workload_sha: required_env("DETGUEST_REPLAY_WORKLOAD_SHA"),
+        image_digest: required_env("DETGUEST_REPLAY_IMAGE_DIGEST"),
+        initramfs_digest: file_digest(&artifacts().initramfs),
+        kernel_digest: file_digest(&artifacts().bzimage),
+        test_binary_digest: file_digest(&std::env::current_exe().expect("current test binary")),
+        seed_base,
+    };
+    let mut evidence = EvidenceWriter::open(
+        &evidence_root,
+        &run_id,
+        identity,
+        RunRange {
+            start: 0,
+            count: total,
+        },
+    )
+    .expect("open replay evidence manifest");
+    assert_eq!(
+        evidence.next_iteration(),
+        start,
+        "chunk start must equal manifest resume cursor"
+    );
+    let verify_replay_ref = required_env("DETGUEST_REPLAY_VERIFY_REF");
     let mut root = boot_to_ready();
     let snap = root.snapshot().expect("snapshot");
     drop(root);
 
     let campaign_start = Instant::now();
     for i in start..end {
+        let started_unix_ms = unix_ms();
         let iteration_start = Instant::now();
         let seed = seed_base.wrapping_add(i);
         let record = vm_leg(&cfg, &snap, seed, None);
@@ -664,12 +723,36 @@ fn determinism_replay_seeded_iterations_are_bit_identical() {
             replay.queries, record.queries,
             "iteration {i}: query sequence"
         );
-        assert_surfaces_equal(record.surfaces, replay.surfaces).unwrap_or_else(|surface| {
+        let mismatch = assert_surfaces_equal(record.surfaces, replay.surfaces).err();
+        let evidence_record = IterationRecord {
+            schema_version: SCHEMA_VERSION,
+            run_id: run_id.clone(),
+            iteration: i,
+            seed,
+            input_burst_count: 2,
+            fault_class_counts: record.fault_class_counts,
+            surfaces: SurfaceDigests {
+                final_guest_ram: format!("fnv1a64:{:016x}", record.surfaces.final_guest_ram),
+                drained_events: format!("fnv1a64:{:016x}", record.surfaces.drained_events),
+                drop_counters: format!("fnv1a64:{:016x}", record.surfaces.drop_counters),
+                inject_decisions: format!("fnv1a64:{:016x}", record.surfaces.inject_decisions),
+            },
+            verify_replay_ref: verify_replay_ref.clone(),
+            started_unix_ms,
+            duration_ms: iteration_start.elapsed().as_millis() as u64,
+            outcome: mismatch
+                .map(|surface| format!("divergence:{surface}"))
+                .unwrap_or_else(|| "pass".into()),
+        };
+        evidence
+            .append(&evidence_record)
+            .expect("append atomic iteration evidence");
+        if let Some(surface) = mismatch {
             panic!(
                 "iteration {i} seed {seed}: {surface} diverged; resume with \
                  DETGUEST_REPLAY_START_ITER={i} DETGUEST_REPLAY_ITER_COUNT=1"
-            )
-        });
+            );
+        }
         assert_digests_equal(&record.diagnostics, &replay.diagnostics)
             .unwrap_or_else(|m| panic!("iteration {i} diagnostic: {m}"));
         eprintln!(
@@ -679,8 +762,9 @@ fn determinism_replay_seeded_iterations_are_bit_identical() {
         );
     }
     eprintln!(
-        "determinism_replay: range [{start},{end}) completed in {:?}",
-        campaign_start.elapsed()
+        "determinism_replay: range [{start},{end}) completed in {:?}; summary {}",
+        campaign_start.elapsed(),
+        evidence.manifest().ordered_summary_digest
     );
 }
 
