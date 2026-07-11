@@ -116,6 +116,17 @@ a manifest cursor; identity drift, overlap, gaps, duplicates, or seed/range
 changes are rejected. CI uploads all named-gate logs and replay records on
 success or failure as `intel-vm-<run>-<attempt>` for 30 days.
 
+The named M3 input step checks out determinism-hypervisor at `6e348e5`, verifies
+the sealed `pad_echo_6s` DHILOG digest, and runs `tools/dh-padset-export` against
+the upstream decoder. `DETGUEST_DECODED_PADSET_FILE` is mandatory for the focused
+KVM body, so a missing decoder artifact cannot green-skip.
+
+The named M4 step includes two distinct budgets: 100 snapshot/restore children
+and `DETGUEST_M4_CHURN_SECS=600`. The latter continuously writes the published
+regions for exactly ten minutes, then requires a stable `RegionUpdate` echo for
+every live region, unchanged manifest generation/extents, and zero P0 agent logs.
+Its GNU timeout is 18 minutes, leaving setup and reverify margin.
+
 Preflight note: the host 2 MiB hugepage-pool check is **opt-in** via
 `./scripts/intel-preflight.sh --require-host-hugepages`. Nothing in `tests/vm`
 needs host hugepages (guest RAM is a plain anonymous mmap; the agent's

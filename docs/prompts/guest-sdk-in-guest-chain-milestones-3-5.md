@@ -254,6 +254,15 @@ After generating the script:
 
 ## Completeness Checklist
 
+As-built closeout (2026-07-11): M3 consumes five real PAD_SET values decoded by
+the pinned upstream `dh-inputlog` path and proves exact guest polls with no ring-I
+input. M4 automatically publishes the byte-pinned `detsdk.stats` region, validates
+the external capture fixture, passes 100 restore branches, and passes the full
+600-second write-churn/reverify gate with zero moved extents. M5 completed the
+one-time 1000/1000 campaign and the separate 10-iteration recurring push gate;
+guest-sdk consumes decoded decisions while determinism-hypervisor owns DHILOG and
+VerifyReplay serialization and services.
+
 Ensure your task graph includes:
 
 - [ ] Analysis of current implementation in affected areas

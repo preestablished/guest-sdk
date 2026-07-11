@@ -98,6 +98,12 @@ input-log record landed into the latch at the scheduled frame (`at_frame` → ic
 the FRAME_MARK table; hypervisor API.md). The emulator consumes the latch 1:1 with
 frames — one read per frame, by contract.
 
+The checked handoff uses determinism-hypervisor `6e348e5` and the sealed
+`pad_echo_6s/recording.dhilog` (BLAKE3
+`f6301f544ff1a0bc232688e232332e1d06a1e9d6cf3eac9d52b026bc1269718a`).
+The upstream `dh-inputlog::LogReader` produces the neutral decoded artifact; CI
+retains it next to the M3 log. guest-sdk neither parses nor writes DHILOG bytes.
+
 **Goal/progress signals** come from RAM, not events: `state-scorer` reads
 `wram` via the feature map. The emulator additionally calls
 `expect_reachable("credits_sequence_entered")` at the end-credits decoder as a
@@ -105,6 +111,12 @@ belt-and-braces terminal signal, and `assert_always(save_ram_checksum_ok, ...)` 
 emulator-integrity invariant.
 
 ## 3. state-scorer: feature map over published regions
+
+The guest-sdk receiving-side pin is
+`crates/detguest-host/tests/fixtures/capture-handoff-v1.txt`; its companion test
+checks the current hypervisor/refwork SHAs and artifact digests, request-order
+`feature_bytes`, `fb_lz4` transport ownership, loud layout-version mismatch, and
+the required/optional region and framebuffer geometry contract.
 
 The feature map is owned by `reference-workload` — its API.md §1 is the platform-wide
 canonical schema, and this excerpt is shown for shape only (do not parse against this

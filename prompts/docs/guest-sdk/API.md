@@ -677,8 +677,15 @@ manifest area with room for v2 growth).
 0x42040  { u32 name_id, u32 pass_lo, u32 fail_lo, u32 _pad }[1024] assert table
 ```
 
-Size: 0x46040 (~280 KiB), allocated by the SDK from a private hugetlbfs mapping at
-`init()`. `state-scorer` consumes `beacon_counts` directly as features.
+Size: exactly 0x46040 bytes, alignment 64. The as-built SDK allocates one boxed,
+non-relocating `StatsRegion` before publication, mlocks/prefaults it through the
+normal region path, and retains its `RegionHandle` for the `Sdk` lifetime. `init()`
+fails with `InitError::StatsRegion` if the agent cannot publish it; it never reports
+success with a missing stats region. `crates/detguest-sdk/src/stats_region.rs` pins
+every offset and the total size, while
+`m2_acceptance::testload_auto_registers_byte_pinned_sdk_stats` proves the host can
+`read_region("detsdk.stats")` and observe live counters/tables. `state-scorer`
+consumes `beacon_counts` directly as features.
 
 ---
 

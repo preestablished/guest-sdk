@@ -65,6 +65,11 @@ one — must pre-fill the 2 MiB pool: `hugepages=N` with N >= 1** (the image
 has no runtime sysctl path). The harness uses `hugepages=4`. Recorded on
 [issue #1](https://github.com/preestablished/guest-sdk/issues/1).
 
+This is a guest-internal requirement. Host-side `tests/vm` RAM is an anonymous
+mapping, including the 600-second region-churn and `detsdk.stats` publication
+gates; the host hugepage-pool probe remains an opt-in operator diagnostic and is
+not a canonical CI entry condition.
+
 The SDK/agent privilege path assumes the minimal image runs workloads as root
 with CAP_SYS_RAWIO available and `RLIMIT_MEMLOCK` raised to unlimited before
 exec. The config pins `CONFIG_MULTIUSER=y`, `CONFIG_X86_IOPL_IOPERM=y`,

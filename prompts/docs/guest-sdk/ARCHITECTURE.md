@@ -188,6 +188,14 @@ channel — including flow control and drops — bit-deterministic. `detguest-ho
 a `ChannelWriteSink` hook so the hypervisor can capture every write it performs (see
 API.md §6).
 
+The receiving-side PAD_SET proof does not decode DHILOG in this repository.
+`tools/dh-padset-export` links the pinned sibling `dh-inputlog`, iterates its sealed
+log through `LogReader::canonical`, and exports neutral `RecordBody::PadSet`
+`(frame_hint, port, buttons)` values. The Intel test then passes those values to
+`PvPad::apply_decoded`; `upstream_dhilog_pad_sets_drive_exact_guest_polls` proves
+one matching guest poll/log per record and no ring-I input. This preserves the
+serialization ownership boundary while testing the actual decoder output.
+
 ### detcall port map (summary; full register spec in API.md §5)
 
 | Port | Dir | Purpose |
