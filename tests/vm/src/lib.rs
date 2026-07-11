@@ -16,6 +16,7 @@
 //! memslot, pv-pad latch stub, retired-instruction counter, guest-time
 //! measurement) land here behind these gates.
 
+pub mod evidence;
 pub mod harness;
 pub mod replay;
 
