@@ -60,14 +60,28 @@ gh api repos/preestablished/guest-sdk/actions/runners \
 
 ## What the in-VM lane runs
 
-The `in_vm` job (push-only, `runs-on: [self-hosted, intel, kvm]`) runs
-`./scripts/intel-preflight.sh` and then the whole ignored VM tier in one sweep:
+The `in_vm` job is push-only on `main` and uses named, timeout-bounded gates:
 
 ```bash
-DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest -- --ignored --test-threads=1
+./scripts/intel-preflight.sh
+DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest --test refwork_ready_hold \
+  real_harness_reaches_and_holds_ready -- --exact --nocapture --test-threads=1
+DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest --test m2_acceptance \
+  testload_m3_event_stream_hash_matches_golden \
+  -- --ignored --exact --nocapture --test-threads=1
+DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest --test m4_snapshot \
+  decoded_pad_sets_land_at_frame_and_match_once_per_frame_polls \
+  -- --ignored --exact --nocapture --test-threads=1
+DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest --test m4_acceptance \
+  -- --ignored --nocapture --test-threads=1
+DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest --test m5_inject_roundtrip \
+  -- --ignored --nocapture --test-threads=1
+# plus the focused restored-channel sequence test and the replay command below
 ```
 
-That sweep includes, alongside the M2 acceptance:
+The real-workload step requires the pinned reference-workload checkout at
+`7b0c7b2434e71d8b3241bf78597be457b281292d` and fails before cargo when its
+image files are absent. The named steps cover:
 
 - **M4 snapshot/restore validation** (`tests/vm/tests/m4_snapshot.rs`): the
   KVM snapshot/restore/fork harness fidelity tests that de-risk the big loop.
@@ -86,12 +100,26 @@ root under `target/m4-acceptance-<UTC>Z/` containing `evidence.json`
 snapshot's region dumps) — same discipline as the hypervisor's M9 acceptance
 artifacts.
 
+The recurring Ms5 replay budget is exactly **10 iterations**. The production
+probe completed 10 in 65.74 seconds; the 1000-run campaign observed a
+1.885–14.047 second per-iteration range under varying host load. Ten fits the
+8-minute step timeout with substantial margin and every iteration structurally
+covers all three fault classes plus ten input updates. It is distinct from the
+one-time 1000/1000 acceptance recorded under
+`.agents/requests/phase3-ms5-execution-in-vm-closeout/evidence/`.
+
+Replay evidence uses explicit `START_ITER` + `ITER_COUNT` + `TOTAL_COUNT` and
+a manifest cursor; identity drift, overlap, gaps, duplicates, or seed/range
+changes are rejected. CI uploads all named-gate logs and replay records on
+success or failure as `intel-vm-<run>-<attempt>` for 30 days.
+
 Preflight note: the host 2 MiB hugepage-pool check is **opt-in** via
 `./scripts/intel-preflight.sh --require-host-hugepages`. Nothing in `tests/vm`
 needs host hugepages (guest RAM is a plain anonymous mmap; the agent's
 hugetlbfs channel page comes from the guest-internal `hugepages=4` cmdline
-pool) — the flag exists for the determinism-hypervisor repo's harness, which
-does map host hugepages. The default lane invocation passes no flag.
+pool). No current canonical sibling lane consumes host hugetlb pages; the flag
+is retained only as an explicit operator diagnostic. The default lane passes
+no flag.
 
 ## Removal
 

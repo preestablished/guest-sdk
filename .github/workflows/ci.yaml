@@ -141,16 +141,97 @@ jobs:
     # not gate returning contributors.)
     if: github.event_name == 'push'
     runs-on: [self-hosted, intel, kvm]
-    timeout-minutes: 30
+    timeout-minutes: 45
+    env:
+      DETGUEST_EVIDENCE_DIR: ${{ runner.temp }}/guest-sdk-evidence/${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
         with: { path: guest-sdk }
       - uses: actions/checkout@v4
         with: { repository: preestablished/control-plane, path: control-plane }
+      - uses: actions/checkout@v4
+        with:
+          repository: preestablished/reference-workload
+          ref: 7b0c7b2434e71d8b3241bf78597be457b281292d
+          path: reference-workload
       # The runner service env does not source the user profile; rustup's
       # bin dir must be added explicitly or the preflight cargo gate fails.
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - run: ./scripts/intel-preflight.sh
-      - run: >
-          DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest --
-          --ignored --test-threads=1
+      - name: Prepare evidence and pinned real image
+        run: |
+          set -euo pipefail
+          mkdir -p "$DETGUEST_EVIDENCE_DIR"
+          test -f ../reference-workload/dist/workload-image-0.1.0/initramfs.cpio.zst
+          test -f ../reference-workload/dist/workload-image-0.1.0/bzImage
+          zstd -d -f ../reference-workload/dist/workload-image-0.1.0/initramfs.cpio.zst \
+            -o "$DETGUEST_EVIDENCE_DIR/refwork-initramfs.cpio"
+      - name: Intel preflight
+        run: |
+          set -o pipefail
+          timeout 3m ./scripts/intel-preflight.sh 2>&1 | tee "$DETGUEST_EVIDENCE_DIR/preflight.log"
+      - name: Ms3 real-workload lifecycle
+        env:
+          DETGUEST_VM_TESTS: "1"
+          REFWORK_READY_INITRAMFS: ${{ runner.temp }}/guest-sdk-evidence/${{ github.run_id }}-${{ github.run_attempt }}/refwork-initramfs.cpio
+          REFWORK_READY_BZIMAGE: ${{ github.workspace }}/reference-workload/dist/workload-image-0.1.0/bzImage
+        run: |
+          set -o pipefail
+          timeout 5m cargo test -p detguest-vmtest --test refwork_ready_hold \
+            real_harness_reaches_and_holds_ready -- --exact --nocapture --test-threads=1 \
+            2>&1 | tee "$DETGUEST_EVIDENCE_DIR/m3-real-workload.log"
+          timeout 5m cargo test -p detguest-vmtest --test m2_acceptance \
+            testload_m3_event_stream_hash_matches_golden \
+            -- --ignored --exact --nocapture --test-threads=1 \
+            2>&1 | tee "$DETGUEST_EVIDENCE_DIR/m3-golden-events.log"
+      - name: Ms3 decoded PAD_SET path
+        run: |
+          set -o pipefail
+          timeout 5m env DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest \
+            --test m4_snapshot decoded_pad_sets_land_at_frame_and_match_once_per_frame_polls \
+            -- --ignored --exact --nocapture --test-threads=1 \
+            2>&1 | tee "$DETGUEST_EVIDENCE_DIR/m3-pad-set.log"
+      - name: Ms4 snapshot and readability gates
+        run: |
+          set -o pipefail
+          timeout 18m env DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest \
+            --test m4_acceptance -- --ignored --nocapture --test-threads=1 \
+            2>&1 | tee "$DETGUEST_EVIDENCE_DIR/m4-acceptance.log"
+      - name: Ms5 inject and reattach gates
+        run: |
+          set -o pipefail
+          timeout 8m env DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest \
+            --test m5_inject_roundtrip -- --ignored --nocapture --test-threads=1 \
+            2>&1 | tee "$DETGUEST_EVIDENCE_DIR/m5-inject.log"
+          timeout 5m env DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest \
+            --test m4_snapshot restored_branches_continue_channel_sequences_without_duplicates \
+            -- --ignored --exact --nocapture --test-threads=1 \
+            2>&1 | tee "$DETGUEST_EVIDENCE_DIR/m5-reattach.log"
+      - name: Ms5 recurring replay sample (10 iterations)
+        env:
+          DETGUEST_VM_TESTS: "1"
+          DETGUEST_REPLAY_START_ITER: "0"
+          DETGUEST_REPLAY_ITER_COUNT: "10"
+          DETGUEST_REPLAY_TOTAL_COUNT: "10"
+          DETGUEST_REPLAY_SEED_BASE: "0"
+          DETGUEST_REPLAY_EVIDENCE_DIR: ${{ runner.temp }}/guest-sdk-evidence/${{ github.run_id }}-${{ github.run_attempt }}/replay
+          DETGUEST_REPLAY_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
+          DETGUEST_REPLAY_RUNNER_ID: ${{ runner.name }}
+          DETGUEST_REPLAY_WORKER_SHA: f855dfb9800e969e8371016112aace7703ee402d
+          DETGUEST_REPLAY_WORKLOAD_SHA: 7b0c7b2434e71d8b3241bf78597be457b281292d
+          DETGUEST_REPLAY_IMAGE_DIGEST: af14040444db6f5e182f52193d71abdbbfb8085673b45da76c21dc541ac3dceb
+          DETGUEST_REPLAY_VERIFY_REF: determinism-hypervisor/docs/phase-2-exit-gate.md:190-192@f855dfb9800e969e8371016112aace7703ee402d
+        run: |
+          set -o pipefail
+          mkdir -p "$DETGUEST_REPLAY_EVIDENCE_DIR"
+          timeout 8m cargo test -p detguest-vmtest --test determinism_replay \
+            determinism_replay_seeded_iterations_are_bit_identical \
+            -- --ignored --exact --nocapture --test-threads=1 \
+            2>&1 | tee "$DETGUEST_EVIDENCE_DIR/../m5-replay.log"
+      - name: Upload Intel evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: intel-vm-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/guest-sdk-evidence/${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30

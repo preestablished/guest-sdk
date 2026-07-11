@@ -146,10 +146,10 @@ fi
 # backs guest RAM with a plain anonymous mmap, and the agent's hugetlbfs
 # channel page comes from the GUEST-internal pool (`hugepages=4` on the
 # guest cmdline, satisfied inside the VM). The check remains for the
-# determinism-hypervisor repo's harness, which does map host hugepages —
-# opt in with --require-host-hugepages when preflighting for that use.
+# No current canonical sibling lane was found to consume host hugetlb pages.
+# Keep the probe as an explicit operator diagnostic only.
 if [[ " ${*:-} " == *" --require-host-hugepages "* ]]; then
-  echo "[preflight] host hugepages (2 MiB pool for the hypervisor harness)"
+  echo "[preflight] optional host hugepages (2 MiB operator diagnostic)"
   HP_2M="/sys/kernel/mm/hugepages/hugepages-2048kB"
   if [[ -d "$HP_2M" ]]; then
     ok "2 MiB hugepage support present"
@@ -164,7 +164,7 @@ if [[ " ${*:-} " == *" --require-host-hugepages "* ]]; then
     fail "no 2 MiB hugepage support"
   fi
 else
-  note "host hugepage check skipped (guest-sdk tests need none; pass --require-host-hugepages for the hypervisor harness)"
+  note "host hugepage check skipped (no canonical lane requires it; pass --require-host-hugepages for an operator diagnostic)"
 fi
 
 echo "[preflight] Rust toolchain"
