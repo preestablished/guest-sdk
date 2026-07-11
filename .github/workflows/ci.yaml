@@ -220,6 +220,8 @@ jobs:
             -- --ignored --exact --nocapture --test-threads=1 \
             2>&1 | tee "$DETGUEST_EVIDENCE_DIR/m3-pad-set.log"
       - name: Ms4 snapshot and readability gates
+        env:
+          DETGUEST_M4_CHURN_SECS: "600"
         run: |
           set -o pipefail
           timeout 18m env DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest \

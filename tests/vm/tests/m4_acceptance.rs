@@ -74,6 +74,15 @@ fn child_count() -> usize {
         .unwrap_or(100)
 }
 
+fn churn_duration() -> Duration {
+    Duration::from_secs(
+        std::env::var("DETGUEST_M4_CHURN_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600),
+    )
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -495,6 +504,127 @@ fn regions_readable_and_stable_across_100_snapshot_restore_branches() {
 
     // Durable evidence (same discipline as the hypervisor's M9 acceptance).
     write_evidence(&baseline, &per_child, n, started.elapsed());
+}
+
+#[test]
+#[ignore = "10-minute KVM tier: Intel runner only (DETGUEST_VM_TESTS=1)"]
+fn ten_minute_write_churn_keeps_every_pinned_extent_stable() {
+    if !gated() {
+        return;
+    }
+    let duration = churn_duration();
+    assert!(!duration.is_zero(), "churn duration must be positive");
+    let cfg = m4_config();
+    let mut vm = VmHarness::new(&cfg).expect("churn harness");
+    let reason = vm
+        .run_until(Duration::from_secs(120), |o| {
+            o.frame_counter_writes
+                .last()
+                .is_some_and(|&v| v >= WARMUP_FRAME)
+        })
+        .expect("churn warm-up");
+    assert_eq!(
+        reason,
+        StopReason::Predicate,
+        "serial:\n{}",
+        vm.serial_text()
+    );
+
+    let before = vm
+        .channel
+        .as_ref()
+        .expect("channel attached")
+        .read_manifest()
+        .expect("baseline manifest");
+    let live_before: BTreeMap<u32, _> = before
+        .entries
+        .iter()
+        .take(before.header.region_count as usize)
+        .filter(|entry| entry.is_live())
+        .map(|entry| {
+            let name = std::str::from_utf8(entry.name_bytes()).expect("region name utf8");
+            let region = before.resolve(name).expect("resolve live entry");
+            (region.region_id, region)
+        })
+        .collect();
+    assert!(live_before.len() >= 4, "stats + wram + framebuffer + meta");
+    let initial_wram = read_region_bytes(&vm, "wram");
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        let slice = (deadline - Instant::now()).min(Duration::from_secs(2));
+        let reason = vm.run_until(slice, |_| false).expect("write churn slice");
+        assert_eq!(reason, StopReason::Timeout);
+    }
+    assert_ne!(
+        read_region_bytes(&vm, "wram"),
+        initial_wram,
+        "churn wrote wram"
+    );
+
+    let before_updates = region_update_count(&vm);
+    vm.push_command(&detguest_wire::Command::ReverifyRegions);
+    let expected = live_before.len();
+    let reason = vm
+        .run_until(Duration::from_secs(30), |o| {
+            o.events
+                .iter()
+                .filter(|e| matches!(e.payload, OwnedPayload::RegionUpdate(_)))
+                .count()
+                >= before_updates + expected
+        })
+        .expect("post-churn reverify");
+    assert_eq!(
+        reason,
+        StopReason::Predicate,
+        "serial:\n{}",
+        vm.serial_text()
+    );
+    assert!(
+        p0_agent_loglines(&vm).is_empty(),
+        "no moved/dead extent alarms"
+    );
+
+    let updates: BTreeMap<u32, _> = vm
+        .observed
+        .events
+        .iter()
+        .filter_map(|event| match event.payload {
+            OwnedPayload::RegionUpdate(region) => Some((region.region_id, region)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(updates.len(), expected, "one echo per live region");
+    for (id, baseline) in &live_before {
+        let update = updates.get(id).expect("region update by id");
+        assert_eq!(update.layout_version, baseline.layout_version);
+        assert_eq!(
+            u64::from(update.manifest_generation),
+            before.header.generation
+        );
+    }
+    let after = vm
+        .channel
+        .as_ref()
+        .unwrap()
+        .read_manifest()
+        .expect("post-churn manifest");
+    assert_eq!(
+        after.header.generation, before.header.generation,
+        "no manifest rewrite"
+    );
+    let live_after: BTreeMap<u32, _> = after
+        .entries
+        .iter()
+        .take(after.header.region_count as usize)
+        .filter(|entry| entry.is_live())
+        .map(|entry| {
+            let name = std::str::from_utf8(entry.name_bytes()).expect("region name utf8");
+            let region = after.resolve(name).expect("resolve live entry");
+            (region.region_id, region)
+        })
+        .collect();
+    assert_eq!(live_after, live_before, "all extents remain bit-identical");
+    eprintln!("[m4-churn] stable for {} seconds", duration.as_secs());
 }
 
 fn write_evidence(
