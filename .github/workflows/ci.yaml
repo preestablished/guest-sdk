@@ -162,9 +162,23 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$DETGUEST_EVIDENCE_DIR"
-          test -f ../reference-workload/dist/workload-image-0.1.0/initramfs.cpio.zst
-          test -f ../reference-workload/dist/workload-image-0.1.0/bzImage
-          zstd -d -f ../reference-workload/dist/workload-image-0.1.0/initramfs.cpio.zst \
+          printf 'run=%s attempt=%s sha=%s runner=%s\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" "$RUNNER_NAME" \
+            > "$DETGUEST_EVIDENCE_DIR/environment.txt"
+          test "$(git -C ../reference-workload rev-parse HEAD)" = \
+            7b0c7b2434e71d8b3241bf78597be457b281292d
+          dist=/home/infra-admin/git/preestablished/reference-workload/dist/workload-image-0.1.0
+          test -f "$dist/initramfs.cpio.zst"
+          test -f "$dist/bzImage"
+          grep -F 'reference_workload_git_rev: "7b0c7b2434e71d8b3241bf78597be457b281292d"' \
+            "$dist/determinism.last_green"
+          test "$(b3sum "$dist/workload-image.yaml" | cut -d' ' -f1)" = \
+            af14040444db6f5e182f52193d71abdbbfb8085673b45da76c21dc541ac3dceb
+          test "$(b3sum "$dist/initramfs.cpio.zst" | cut -d' ' -f1)" = \
+            67f1ed56769cd3f05b294c18068fb0c75d547da03ec2d6bc34bc127dd04c019b
+          test "$(b3sum "$dist/bzImage" | cut -d' ' -f1)" = \
+            595466463a37efac6822ffccf3e61d0a2230e7d223a94c0bce5eb78b2f43bee9
+          zstd -d -f "$dist/initramfs.cpio.zst" \
             -o "$DETGUEST_EVIDENCE_DIR/refwork-initramfs.cpio"
       - name: Intel preflight
         run: |
@@ -174,7 +188,7 @@ jobs:
         env:
           DETGUEST_VM_TESTS: "1"
           REFWORK_READY_INITRAMFS: ${{ runner.temp }}/guest-sdk-evidence/${{ github.run_id }}-${{ github.run_attempt }}/refwork-initramfs.cpio
-          REFWORK_READY_BZIMAGE: ${{ github.workspace }}/reference-workload/dist/workload-image-0.1.0/bzImage
+          REFWORK_READY_BZIMAGE: /home/infra-admin/git/preestablished/reference-workload/dist/workload-image-0.1.0/bzImage
         run: |
           set -o pipefail
           timeout 5m cargo test -p detguest-vmtest --test refwork_ready_hold \

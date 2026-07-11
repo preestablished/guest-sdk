@@ -81,7 +81,10 @@ DETGUEST_VM_TESTS=1 cargo test -p detguest-vmtest --test m5_inject_roundtrip \
 
 The real-workload step requires the pinned reference-workload checkout at
 `7b0c7b2434e71d8b3241bf78597be457b281292d` and fails before cargo when its
-image files are absent. The named steps cover:
+audited host handoff directory is absent or its green-stamp revision,
+manifest, initramfs, or kernel digest drifts. The distribution is intentionally
+untracked and is never silently replaced by a clean-checkout placeholder. The
+named steps cover:
 
 - **M4 snapshot/restore validation** (`tests/vm/tests/m4_snapshot.rs`): the
   KVM snapshot/restore/fork harness fidelity tests that de-risk the big loop.
