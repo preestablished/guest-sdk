@@ -180,6 +180,16 @@ jobs:
             595466463a37efac6822ffccf3e61d0a2230e7d223a94c0bce5eb78b2f43bee9
           zstd -d -f "$dist/initramfs.cpio.zst" \
             -o "$DETGUEST_EVIDENCE_DIR/refwork-initramfs.cpio"
+          kernel_cache=/home/infra-admin/git/preestablished/guest-sdk/image/build
+          test "$(b3sum "$kernel_cache/bzImage" | cut -d' ' -f1)" = \
+            595466463a37efac6822ffccf3e61d0a2230e7d223a94c0bce5eb78b2f43bee9
+          test "$(b3sum "$kernel_cache/kernel.final.config" | cut -d' ' -f1)" = \
+            07d7606f39e8f6faafc252737d51a7e67f75edbc1ab032f80a971babe06340fa
+          test "$(b3sum "$kernel_cache/kernel.provenance" | cut -d' ' -f1)" = \
+            d747b9e252504df3fd0d9eb97d6a9adab1e6bab1b5e2d33e79dc9b0f04819b0e
+          cp -f "$kernel_cache/bzImage" image/build/bzImage
+          cp -f "$kernel_cache/kernel.final.config" image/build/kernel.final.config
+          cp -f "$kernel_cache/kernel.provenance" image/build/kernel.provenance
       - name: Intel preflight
         run: |
           set -o pipefail
