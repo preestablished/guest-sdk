@@ -142,8 +142,6 @@ jobs:
     if: github.event_name == 'push'
     runs-on: [self-hosted, intel, kvm]
     timeout-minutes: 45
-    env:
-      DETGUEST_EVIDENCE_DIR: ${{ runner.temp }}/guest-sdk-evidence/${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
         with: { path: guest-sdk }
@@ -156,7 +154,10 @@ jobs:
           path: reference-workload
       # The runner service env does not source the user profile; rustup's
       # bin dir must be added explicitly or the preflight cargo gate fails.
-      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Configure runner paths
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "DETGUEST_EVIDENCE_DIR=$RUNNER_TEMP/guest-sdk-evidence/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
       - name: Prepare evidence and pinned real image
         run: |
           set -euo pipefail
