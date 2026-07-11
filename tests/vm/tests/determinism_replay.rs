@@ -683,3 +683,36 @@ fn determinism_replay_seeded_iterations_are_bit_identical() {
         campaign_start.elapsed()
     );
 }
+
+/// Real-path sensitivity control: alter one decoded decision before the
+/// synthesizer-free replay child. The outer test succeeds only when the
+/// authoritative comparator rejects the run and names the first affected
+/// surface.
+#[test]
+#[ignore = "KVM negative: Intel runner only (DETGUEST_VM_TESTS=1)"]
+fn determinism_replay_rejects_one_perturbed_recorded_decision() {
+    if !gated() {
+        return;
+    }
+    let cfg = m5_config();
+    let mut root = boot_to_ready();
+    let snap = root.snapshot().expect("snapshot");
+    drop(root);
+
+    let seed = 0x5eed_0001;
+    let record = vm_leg(&cfg, &snap, seed, None);
+    let mut corrupted = record.decisions.clone();
+    corrupted[0].decision = FaultDecision::Platform {
+        kind: 63,
+        arg: 0x00de_adbe,
+    };
+    let replay = vm_leg(&cfg, &snap, seed, Some(corrupted));
+    assert_eq!(replay.divergences, 0, "corrupt log is structurally valid");
+    let surface = assert_surfaces_equal(record.surfaces, replay.surfaces)
+        .expect_err("perturbed decoded decision must not compare equal");
+    assert_eq!(
+        surface, "final guest RAM",
+        "decision perturbation must first affect the authoritative RAM surface"
+    );
+    eprintln!("real-path negative rejected iteration at surface: {surface}");
+}
