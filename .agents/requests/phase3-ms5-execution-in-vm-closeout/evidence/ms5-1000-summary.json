@@ -1,0 +1,36 @@
+{
+  "run_id": "ms5-1000-1f5901e",
+  "result": "pass",
+  "iterations": {
+    "count": 1000,
+    "unique": 1000,
+    "consecutive": true,
+    "first": 0,
+    "last": 999
+  },
+  "seeds": {
+    "count": 1000,
+    "first": 0,
+    "last": 999
+  },
+  "outcomes": {
+    "pass": 1000,
+    "non_pass": 0
+  },
+  "fault_class_census": {
+    "proceed": 10000,
+    "platform": 10000,
+    "workload": 10000
+  },
+  "input_burst_count": 10000,
+  "surface_records_with_missing_digest": 0,
+  "iteration_duration_ms": {
+    "sum": 4003362,
+    "min": 1885,
+    "max": 14047
+  },
+  "ordered_summary_digest": "fnv1a64:51855535a968a662",
+  "manifest_blake3": "32ebed7b54c99d66415e010274332d95e58d6c686bbdbb2fe4f8228e9e73202d",
+  "ordered_record_checksum_stream_blake3": "be5a44c1f9f0c6f8215d44c4b42f940ebc034d8cd60e409daf99f60df9430b3c",
+  "verify_replay_reference": "../determinism-hypervisor/docs/phase-2-exit-gate.md:190-192@f855dfb9800e969e8371016112aace7703ee402d"
+}

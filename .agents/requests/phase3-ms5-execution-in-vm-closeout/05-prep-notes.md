@@ -105,3 +105,19 @@ Linear projection is about 1 hour 50 minutes for 1000 iterations before
 setup and margin. The lab campaign will use resumable chunks with at least one
 chunk of rerun margin. The recurring push lane must use a much smaller exact
 budget selected after the full campaign; it will not run 1000 on every push.
+
+## Flagship campaign completion
+
+Run `ms5-1000-1f5901e` completed after the probe in ten resumable chunks.
+The reducer proved exactly 1000 unique consecutive green records, iteration
+IDs and seeds 0–999, zero non-pass outcomes, 10,000 decisions in each of the
+Proceed/Platform/Workload classes, 10,000 seeded input updates, and no missing
+authoritative surface digest. Total measured iteration time was 4,003.362
+seconds; the per-iteration range was 1.885–14.047 seconds. Final ordered
+summary: `fnv1a64:51855535a968a662`.
+
+Committed reduced evidence and the exact manifest are under `evidence/` next
+to this file. Raw records/chunk logs remain at the durable local evidence root
+pending package-05 upload by the trusted push-only Intel workflow; the
+flagship Bead is intentionally not closed until that artifact URL and a green
+recurring workflow proof exist.
