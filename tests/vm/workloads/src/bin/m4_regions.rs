@@ -17,7 +17,7 @@
 
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 
-use detguest_sdk::{self as sdk, RegionFlags};
+use detguest_sdk::{self as sdk, FaultDecision, LogLevel, RegionFlags};
 
 const WRAM_LEN: usize = 8192;
 /// D7 layout_version 1 framebuffer: exactly 229,376 bytes (NOT a power of
@@ -80,10 +80,16 @@ fn run_frame_loop() -> ! {
     let mut acc = 0x4d34_0000_0000_0001u64;
     let mut input_hash = FNV_OFFSET_BASIS;
     loop {
+        log_inject(
+            frame,
+            "ms5.frame.begin",
+            sdk::inject_point("ms5.frame.begin"),
+        );
         // One pad poll per frame; every consumed input feeds both the
         // accumulator and the input-history hash (hosts recompute the hash
         // from the schedule, warm-up zeros included).
         let input = sdk::poll_input(0);
+        log_inject(frame, "ms5.io.read", sdk::inject_point("ms5.io.read"));
         for byte in input.to_le_bytes() {
             input_hash = (input_hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
         }
@@ -114,9 +120,22 @@ fn run_frame_loop() -> ! {
             }
         }
         write_frame_meta(frame, acc, input_hash);
+        log_inject(frame, "ms5.frame.end", sdk::inject_point("ms5.frame.end"));
         sdk::frame_mark();
         frame = frame.wrapping_add(1);
     }
+}
+
+fn log_inject(frame: u32, point: &str, decision: FaultDecision) {
+    let (class, kind, arg) = match decision {
+        FaultDecision::Proceed => ("proceed", 0, 0),
+        FaultDecision::Platform { kind, arg } => ("platform", kind, arg),
+        FaultDecision::Workload { kind, arg } => ("workload", kind, arg),
+    };
+    sdk::log_line(
+        LogLevel::Info,
+        &format!("ms5.inject.v1 frame={frame} point={point} class={class} kind={kind} arg={arg}"),
+    );
 }
 
 unsafe fn bump_byte(base: *mut u8, index: usize, value: u8) {

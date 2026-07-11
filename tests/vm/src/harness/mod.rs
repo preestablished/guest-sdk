@@ -83,7 +83,10 @@ impl VmConfig {
             // cmdline (issue #1) — this is the harness's own boot.
             // hugepages=N pre-fills the 2 MiB pool the agent's channel alloc
             // needs (tinyconfig has no runtime sysctl path configured).
-            cmdline: "console=ttyS0,115200 panic=-1 reboot=t 8250.nr_uarts=1 hugepages=4"
+            // lpj avoids a nondeterministic pre-userspace stall when quick
+            // TSC calibration fails and this tiny guest has no HPET/PM timer
+            // fallback. It does not disable normal PIT scheduling.
+            cmdline: "console=ttyS0,115200 panic=-1 reboot=t 8250.nr_uarts=1 hugepages=4 lpj=4096"
                 .to_string(),
             mem_size: 128 << 20,
             timer_interrupts: true,

@@ -348,6 +348,9 @@ fn same_seed_record_legs_are_bit_identical() {
 // the file header). Boot machinery follows m4_snapshot.rs.
 // ---------------------------------------------------------------------------
 
+const WARMUP_FRAME: u32 = 8;
+const CHILD_FRAMES: usize = 10;
+
 fn gated() -> bool {
     if !detguest_vmtest::vm_tests_enabled() {
         eprintln!("skipping: DETGUEST_VM_TESTS != 1");
@@ -405,8 +408,8 @@ struct Artifacts {
 
 static ARTIFACTS: OnceLock<Artifacts> = OnceLock::new();
 
-/// No-autostart image containing the canonical inject-calling workload. The
-/// root snapshot is taken at Ready; each child launches unit 0 independently.
+/// Continuous real SDK workload with regions, pv-pad, frames, and three
+/// stable inject sites per frame.
 fn artifacts() -> &'static Artifacts {
     ARTIFACTS.get_or_init(|| {
         let root = repo_root();
@@ -434,10 +437,10 @@ fn artifacts() -> &'static Artifacts {
         std::fs::create_dir_all(dir.join("opt")).unwrap();
         std::fs::create_dir_all(dir.join("etc/detguest")).unwrap();
         std::fs::copy(musl.join("detguest-agent"), dir.join("sbin/detguest-agent")).unwrap();
-        std::fs::copy(musl.join("testload"), dir.join("opt/testload")).unwrap();
-        std::fs::write(
+        std::fs::copy(musl.join("m4-regions"), dir.join("opt/m4-regions")).unwrap();
+        std::fs::copy(
+            root.join("image/boot.toml.m4-regions"),
             dir.join("etc/detguest/boot.toml"),
-            "boot_toml_version = 1\n\n[[unit]]\nid = 0\nexec = \"/opt/testload\"\nargs = [\"--inject-roundtrip\"]\n",
         )
         .unwrap();
         run(
@@ -471,7 +474,8 @@ fn m5_config() -> VmConfig {
     // userspace while calibrating delay loops. Pinning lpj skips that boot
     // calibration only; PIT delivery remains enabled for post-Ready
     // scheduling (the inject workload needs it).
-    cfg.cmdline.push_str(" lpj=4096");
+    cfg.timer_interrupts = false;
+    cfg.cmdline = cfg.timerless_cmdline();
     cfg
 }
 
@@ -480,18 +484,15 @@ fn boot_to_ready() -> VmHarness {
     let mut vm = VmHarness::new(&cfg).expect("harness build");
     let reason = vm
         .run_until(Duration::from_secs(120), |o| {
-            o.events.iter().any(|event| {
-                matches!(
-                    event.payload,
-                    detguest_host::OwnedPayload::Ready { unit: u32::MAX, .. }
-                )
-            })
+            o.frame_counter_writes
+                .last()
+                .is_some_and(|&frame| frame >= WARMUP_FRAME)
         })
         .expect("run to warm-up");
     assert_eq!(
         reason,
         StopReason::Predicate,
-        "expected no-autostart Ready before stop/timeout; serial:\n{}",
+        "expected frame {WARMUP_FRAME} before stop/timeout; serial:\n{}",
         vm.serial_text()
     );
     assert!(vm.channel.is_some(), "channel attached");
@@ -581,34 +582,23 @@ fn vm_leg(
 ) -> VmLeg {
     let mut child = VmHarness::from_snapshot(cfg, snap).expect("child build");
     let mut rng = Rng::new(seed);
-    child.pvpad().set_pad(0, rng.next());
-    child.pvpad().schedule(1, 0, rng.next());
+    let base = child.pvpad().frame_counter;
+    for offset in 1..=CHILD_FRAMES as u32 {
+        child.pvpad().schedule(base + offset, 0, rng.next());
+    }
     child.responder = match replay_log {
         Some(log) => InjectResponder::new(HarnessFaultPlan::Log(LogFaultPlan::new(log))),
         None => InjectResponder::new(HarnessFaultPlan::Table(seed_fault_plan(seed))),
     };
-    child.push_command(&Command::StartWorkload {
-        unit: 0,
-        log_mask: 0x1f,
-    });
     let reason = child
         .run_until(Duration::from_secs(60), |o| {
-            o.events.iter().any(|event| {
-                matches!(
-                    event.payload,
-                    detguest_host::OwnedPayload::WorkloadExited {
-                        exit_code: 0,
-                        term_signal: 0,
-                        ..
-                    }
-                )
-            })
+            o.frame_counter_writes.len() >= CHILD_FRAMES
         })
         .expect("child run");
     assert_eq!(
         reason,
         StopReason::Predicate,
-        "child workload must exit; serial:\n{}",
+        "child workload must advance {CHILD_FRAMES} frames; serial:\n{}",
         child.serial_text()
     );
     let drops = child.channel.as_ref().unwrap().drop_counters().unwrap();
@@ -647,7 +637,11 @@ fn vm_leg(
         }
         HarnessFaultPlan::Log(log) => (Vec::new(), log.divergences().len() + log.remaining()),
     };
-    assert_eq!(queries.len(), 6, "canonical fixture query count");
+    assert_eq!(
+        queries.len(),
+        CHILD_FRAMES * 3,
+        "three canonical queries per frame"
+    );
     let mut fault_class_counts = [0; 3];
     for op in &child.sink.ops {
         if let SinkOp::PioAnswer { value, .. } = op {
@@ -736,7 +730,7 @@ fn determinism_replay_seeded_iterations_are_bit_identical() {
             run_id: run_id.clone(),
             iteration: i,
             seed,
-            input_burst_count: 2,
+            input_burst_count: CHILD_FRAMES as u32,
             fault_class_counts: record.fault_class_counts,
             surfaces: SurfaceDigests {
                 final_guest_ram: format!("fnv1a64:{:016x}", record.surfaces.final_guest_ram),
