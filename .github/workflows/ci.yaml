@@ -187,6 +187,7 @@ jobs:
             07d7606f39e8f6faafc252737d51a7e67f75edbc1ab032f80a971babe06340fa
           test "$(b3sum "$kernel_cache/kernel.provenance" | cut -d' ' -f1)" = \
             d747b9e252504df3fd0d9eb97d6a9adab1e6bab1b5e2d33e79dc9b0f04819b0e
+          mkdir -p image/build
           cp -f "$kernel_cache/bzImage" image/build/bzImage
           cp -f "$kernel_cache/kernel.final.config" image/build/kernel.final.config
           cp -f "$kernel_cache/kernel.provenance" image/build/kernel.provenance
