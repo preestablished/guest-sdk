@@ -21,6 +21,7 @@ mod inject;
 mod intern;
 mod pio;
 mod regions;
+mod stats_region;
 
 pub use regions::{RegionError, RegionFlags, RegionHandle};
 
@@ -44,6 +45,8 @@ struct SdkState {
     intern: intern::InternTable,
     beacons: beacons::BeaconCounters,
     stats: StatsState,
+    stats_region: Box<stats_region::StatsRegion>,
+    _stats_region_handle: Option<RegionHandle>,
     frame_index: u32,
     /// Next `inject_point` query sequence number (see `inject::FIRST_ISEQ`).
     next_iseq: u32,
@@ -86,6 +89,8 @@ pub enum InitError {
     PioPermissionDenied,
     /// Agent IPC setup or another initialization syscall failed.
     AgentSocket(io::Error),
+    /// Automatic publication of `detsdk.stats` failed.
+    StatsRegion(RegionError),
 }
 
 impl fmt::Display for InitError {
@@ -101,6 +106,7 @@ impl fmt::Display for InitError {
             ),
             InitError::PioPermissionDenied => write!(f, "iopl(3) permission denied"),
             InitError::AgentSocket(err) => write!(f, "agent initialization failed: {err}"),
+            InitError::StatsRegion(err) => write!(f, "detsdk.stats publication failed: {err}"),
         }
     }
 }
@@ -109,6 +115,7 @@ impl std::error::Error for InitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             InitError::AgentSocket(err) => Some(err),
+            InitError::StatsRegion(err) => Some(err),
             _ => None,
         }
     }
@@ -147,16 +154,31 @@ fn init_from_channel_fd<'a>(
     let channel = channel::MappedChannel::map(fd)?;
     let pio = init_pio()?;
     channel.mark_workload_attached();
+    let mut state = SdkState {
+        _channel: channel,
+        _pio: pio,
+        intern: intern::InternTable::default(),
+        beacons: beacons::BeaconCounters::default(),
+        stats: StatsState::default(),
+        stats_region: Box::new(stats_region::StatsRegion::default()),
+        _stats_region_handle: None,
+        frame_index: 0,
+        next_iseq: inject::FIRST_ISEQ,
+    };
+    let ptr = (&*state.stats_region as *const stats_region::StatsRegion).cast::<u8>();
+    let handle = unsafe {
+        state.register_region(
+            "detsdk.stats",
+            1,
+            ptr,
+            stats_region::STATS_REGION_SIZE,
+            RegionFlags::HOT,
+        )
+    }
+    .map_err(InitError::StatsRegion)?;
+    state._stats_region_handle = Some(handle);
     let sdk = Sdk {
-        _state: std::sync::Mutex::new(SdkState {
-            _channel: channel,
-            _pio: pio,
-            intern: intern::InternTable::default(),
-            beacons: beacons::BeaconCounters::default(),
-            stats: StatsState::default(),
-            frame_index: 0,
-            next_iseq: inject::FIRST_ISEQ,
-        }),
+        _state: std::sync::Mutex::new(state),
     };
     match cell.set(sdk) {
         Ok(()) => Ok(cell.get().expect("SDK set succeeded")),
@@ -214,6 +236,7 @@ pub fn coverage_beacon(id: u32) {
 pub fn inject_point(name: &'static str) -> FaultDecision {
     with_sdk_state(|state| {
         state.stats.inject_queries_total = state.stats.inject_queries_total.saturating_add(1);
+        state.stats_region.inject_queries_total = state.stats.inject_queries_total;
         state.inject_point(name)
     })
     .unwrap_or(FaultDecision::Proceed)
@@ -411,7 +434,11 @@ impl SdkState {
         };
         if cond {
             self.stats.asserts_passed_total = self.stats.asserts_passed_total.saturating_add(1);
-            let _ = self.intern.record_assert(name_id, true);
+            if let Ok(counts) = self.intern.record_assert(name_id, true) {
+                self.stats_region.asserts_passed_total = self.stats.asserts_passed_total;
+                self.stats_region
+                    .record_assert(name_id, counts.pass_count, counts.fail_count);
+            }
             return;
         }
 
@@ -419,6 +446,9 @@ impl SdkState {
         let Ok(counts) = self.intern.record_assert(name_id, false) else {
             return;
         };
+        self.stats_region.asserts_failed_total = self.stats.asserts_failed_total;
+        self.stats_region
+            .record_assert(name_id, counts.pass_count, counts.fail_count);
         let details = if counts.fail_count > ASSERT_REPEAT_LIMIT {
             if counts.fail_count != ASSERT_REPEAT_LIMIT + 1 {
                 return;
@@ -444,8 +474,10 @@ impl SdkState {
         let Ok(hits) = self.intern.record_reachable(name_id) else {
             return;
         };
+        self.stats_region.record_reachable(name_id, hits);
         if hits == 1 {
             self.stats.reachable_names = self.stats.reachable_names.saturating_add(1);
+            self.stats_region.reachable_names = self.stats.reachable_names;
             let ev = detguest_wire::events::EventPayload::Reachable { name_id };
             let _ = self
                 ._channel
@@ -459,6 +491,7 @@ impl SdkState {
 
     fn coverage_beacon(&mut self, id: u32) {
         let hit = self.beacons.hit(id);
+        self.stats_region.record_beacon(hit.id);
         if hit.first_hit {
             let ev = detguest_wire::events::EventPayload::Beacon { beacon_id: hit.id };
             let _ = self
@@ -582,6 +615,8 @@ mod tests {
             intern: intern::InternTable::default(),
             beacons: beacons::BeaconCounters::default(),
             stats: StatsState::default(),
+            stats_region: Box::new(stats_region::StatsRegion::default()),
+            _stats_region_handle: None,
             frame_index: 0,
             next_iseq: inject::FIRST_ISEQ,
         }
@@ -694,8 +729,18 @@ mod tests {
 
     #[test]
     fn valid_init_sets_workload_attached_and_is_idempotent() {
+        let _serial = crate::agent_client::TEST_SERIAL.lock().unwrap();
         let file = test_channel_file(ChannelHeader::canonical());
         let cell = OnceLock::new();
+        let path = format!("/tmp/detguest-sdk-init-test-{}.sock", std::process::id());
+        let reply = detguest_wire::regionipc::Reply {
+            status: detguest_wire::regionipc::STATUS_OK,
+            region_id: 0,
+            name_id: 1,
+            manifest_generation: 2,
+        };
+        let server = crate::agent_client::tests::spawn_test_server(&path, reply);
+        std::env::set_var("DETGUEST_AGENT_SOCK", &path);
         let first = init_for_test(&file, &cell).unwrap() as *const Sdk;
         let second = init_from_channel_fd(None, &cell, fake_pio).unwrap() as *const Sdk;
         assert_eq!(first, second);
@@ -705,6 +750,25 @@ mod tests {
             .unwrap();
         let flags = u32::from_le_bytes(flags);
         assert_eq!(flags & FLAG_WORKLOAD_ATTACHED, FLAG_WORKLOAD_ATTACHED);
+
+        drop(cell);
+        crate::agent_client::drop_cached_client_for_test();
+        std::env::remove_var("DETGUEST_AGENT_SOCK");
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 2, "register followed by handle-drop unregister");
+        match detguest_wire::regionipc::decode_request(&seen[0]).unwrap() {
+            detguest_wire::regionipc::Request::Register {
+                layout_version,
+                len,
+                name,
+                ..
+            } => {
+                assert_eq!(layout_version, 1);
+                assert_eq!(len as usize, stats_region::STATS_REGION_SIZE);
+                assert_eq!(name, b"detsdk.stats");
+            }
+            other => panic!("unexpected init request: {other:?}"),
+        }
     }
 
     #[test]

@@ -34,7 +34,7 @@ use detguest_wire::events::log_stream;
 use detguest_wire::events::{Command, ShutdownMode};
 use detguest_wire::record::EventKind;
 
-const M3_TESTLOAD_EVENT_HASH: u64 = 0x3b0d_3ebc_93e4_ba51;
+const M3_TESTLOAD_EVENT_HASH: u64 = 0xe805_e0ea_56e1_d753;
 
 fn gated() -> bool {
     if !detguest_vmtest::vm_tests_enabled() {
@@ -514,6 +514,43 @@ fn testload_m3_event_stream_hash_matches_golden() {
         M3_TESTLOAD_EVENT_HASH,
         "normalized M3 stream:\n{}",
         lines.join("\n")
+    );
+}
+
+#[test]
+#[ignore = "KVM tier: Intel runner only (DETGUEST_VM_TESTS=1)"]
+fn testload_auto_registers_byte_pinned_sdk_stats() {
+    if !gated() {
+        return;
+    }
+    let mut vm = boot_noauto_to_ready();
+    start_unit_and_wait_exit(&mut vm, 2, Duration::from_secs(60));
+
+    let channel = vm.channel.as_ref().expect("channel attached");
+    let manifest = channel.read_manifest().expect("manifest read");
+    let region = manifest.resolve("detsdk.stats").expect("stats region live");
+    assert_eq!(region.layout_version, 1);
+    assert_eq!(region.len, 0x46040);
+    let mut bytes = vec![0u8; region.len as usize];
+    channel
+        .read_region("detsdk.stats", 0, &mut bytes)
+        .expect("host reads stats region");
+    let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    assert_eq!(u32_at(0x00000), 1, "stats_version");
+    assert_eq!(u64_at(0x00008), 1, "assert pass total");
+    assert_eq!(u64_at(0x00010), 1, "assert fail total");
+    assert_eq!(u64_at(0x00018), 1, "distinct reachable names");
+    assert_eq!(u64_at(0x00020), 0, "inject queries in exercise_once");
+    assert_eq!(u32_at(0x00040 + 4), 1, "beacon id 1");
+    assert_eq!((u32_at(0x40040), u32_at(0x40044)), (3, 1));
+    assert_eq!(
+        (u32_at(0x42040), u32_at(0x42044), u32_at(0x42048)),
+        (4, 1, 0)
+    );
+    assert_eq!(
+        (u32_at(0x42050), u32_at(0x42054), u32_at(0x42058)),
+        (5, 0, 1)
     );
 }
 
