@@ -187,10 +187,13 @@ jobs:
             07d7606f39e8f6faafc252737d51a7e67f75edbc1ab032f80a971babe06340fa
           test "$(b3sum "$kernel_cache/kernel.provenance" | cut -d' ' -f1)" = \
             d747b9e252504df3fd0d9eb97d6a9adab1e6bab1b5e2d33e79dc9b0f04819b0e
+          test "$(cat "$kernel_cache/.kernel-build-key")" = \
+            16d7cbc8ab16f4a83510bfb1f969fc1626183e2504aa95c79378b90e4ac54783
           mkdir -p image/build
           cp -f "$kernel_cache/bzImage" image/build/bzImage
           cp -f "$kernel_cache/kernel.final.config" image/build/kernel.final.config
           cp -f "$kernel_cache/kernel.provenance" image/build/kernel.provenance
+          cp -f "$kernel_cache/.kernel-build-key" image/build/.kernel-build-key
       - name: Intel preflight
         run: |
           set -o pipefail
